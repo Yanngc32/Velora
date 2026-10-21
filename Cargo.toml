@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = ["crates/protocol", "crates/host", "crates/client-core", "crates/client"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/yanngc32/screen_mirroring"
+rust-version = "1.88"
+
+[workspace.dependencies]
+sm-protocol = { path = "crates/protocol" }
+sm-client-core = { path = "crates/client-core" }
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
+rcgen = "0.14"
+ring = "0.17"
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+directories = "6"
+clap = { version = "4", features = ["derive"] }
+openh264 = "0.9"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
