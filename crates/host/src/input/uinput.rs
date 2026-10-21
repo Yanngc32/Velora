@@ -11,7 +11,7 @@ use evdev::{
 };
 use sm_protocol::wire::{KeyState, MouseButton};
 
-use super::Backend;
+use super::{x11_keymap::Keymap, Backend};
 
 /// Highest regular key code (`KEY_MICMUTE`); button codes start at 0x100.
 const MAX_KEY: u16 = 248;
@@ -97,6 +97,39 @@ impl Backend for Uinput {
             KeyState::Repeat => return Ok(()),
         };
         self.keyboard.emit(&[ev(EventType::KEY, code, value)])?;
+        Ok(())
+    }
+
+    fn text(&mut self, text: &str) -> Result<()> {
+        // Reloaded each time: the user may switch layouts while connected.
+        let keymap = Keymap::load()?;
+        let mut missing = String::new();
+        for c in text.chars() {
+            let Some(strokes) = keymap.strokes(c) else {
+                missing.push(c);
+                continue;
+            };
+            for stroke in strokes {
+                let mut mods = Vec::new();
+                if stroke.shift {
+                    mods.push(super::x11_keymap::SHIFT);
+                }
+                if let (true, Some(altgr)) = (stroke.altgr, keymap.altgr) {
+                    mods.push(altgr);
+                }
+                for &m in &mods {
+                    self.keyboard.emit(&[ev(EventType::KEY, m, 1)])?;
+                }
+                self.keyboard.emit(&[ev(EventType::KEY, stroke.code, 1)])?;
+                self.keyboard.emit(&[ev(EventType::KEY, stroke.code, 0)])?;
+                for &m in mods.iter().rev() {
+                    self.keyboard.emit(&[ev(EventType::KEY, m, 0)])?;
+                }
+            }
+        }
+        if !missing.is_empty() {
+            tracing::warn!("the host keyboard layout cannot type {missing:?}");
+        }
         Ok(())
     }
 

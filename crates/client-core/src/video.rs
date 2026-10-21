@@ -1,28 +1,21 @@
-//! Video decoding thread and the frame hand-off to the UI.
+//! Software video decoding thread and the frame hand-off to the UI.
 //!
-//! Frames arrive on independent QUIC streams and may complete out of order; they are decoded
-//! strictly in `frame_id` order. Each frame is acknowledged only after it has been decoded, so
-//! the host's in-flight limit also throttles to the client's decode speed and no queue can
-//! build up anywhere between capture and display.
+//! Each frame is acknowledged only after it has been decoded, so the host's in-flight limit
+//! also throttles to the client's decode speed and no queue can build up anywhere between
+//! capture and display.
 
 use std::{
-    collections::BTreeMap,
     sync::{mpsc, Arc, Mutex},
     time::{Duration, Instant},
 };
 
 use openh264::{decoder::Decoder, formats::YUVSource, OpenH264API};
-use sm_protocol::wire::{ClientMsg, FrameHeader};
+use sm_protocol::wire::ClientMsg;
 use tokio::sync::mpsc::UnboundedSender;
 
-/// Frames buffered while waiting for a missing earlier frame before giving up on it.
-const MAX_REORDER: usize = 64;
-const STATS_INTERVAL: Duration = Duration::from_secs(5);
+use crate::reorder::{Packet, Reorder};
 
-pub struct Packet {
-    pub header: FrameHeader,
-    pub data: Vec<u8>,
-}
+const STATS_INTERVAL: Duration = Duration::from_secs(5);
 
 /// A decoded picture as `0x00RRGGBB` pixels.
 pub struct VideoFrame {
@@ -88,21 +81,15 @@ fn decode_loop(
     on_frame: &(dyn Fn() + Send + Sync),
 ) -> anyhow::Result<()> {
     let mut decoder = Decoder::with_api_config(OpenH264API::from_source(), Default::default())?;
-    let mut pending: BTreeMap<u32, Packet> = BTreeMap::new();
-    let mut next_id = 0u32;
+    let mut reorder = Reorder::default();
     let mut need_keyframe = false;
     let mut stats = Stats::new();
 
     for packet in rx {
-        pending.insert(packet.header.frame_id, packet);
-        if pending.len() > MAX_REORDER {
-            // Should not happen on a reliable transport; resynchronize on the oldest frame.
-            next_id = *pending.keys().next().unwrap();
-            need_keyframe = true;
-        }
+        let (ready, resynced) = reorder.push(packet);
+        need_keyframe |= resynced;
 
-        while let Some(packet) = pending.remove(&next_id) {
-            next_id = next_id.wrapping_add(1);
+        for packet in ready {
             let id = packet.header.frame_id;
 
             if need_keyframe && !packet.header.keyframe {

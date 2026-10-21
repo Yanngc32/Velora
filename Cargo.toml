@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/protocol", "crates/host", "crates/client-core", "crates/client", "crates/update", "crates/release"]
+members = ["crates/protocol", "crates/host", "crates/client-core", "crates/client", "crates/update", "crates/release", "crates/mobile", "crates/uniffi-bindgen"]
 
 [workspace.package]
 version = "0.1.0"
@@ -11,7 +11,7 @@ rust-version = "1.89"
 
 [workspace.dependencies]
 sm-protocol = { path = "crates/protocol" }
-sm-client-core = { path = "crates/client-core" }
+sm-client-core = { path = "crates/client-core", default-features = false }
 sm-update = { path = "crates/update" }
 anyhow = "1"
 thiserror = "2"
@@ -27,6 +27,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 directories = "6"
 clap = { version = "4", features = ["derive"] }
+uniffi = { version = "0.32", default-features = false }
 openh264 = "0.9"
 
 [profile.release]

@@ -11,10 +11,10 @@ use sm_protocol::wire::{KeyState, MouseButton};
 use windows::Win32::UI::{
     Input::KeyboardAndMouse::{
         SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY,
-        KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN,
-        MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN,
-        MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP,
-        MOUSEINPUT, MOUSE_EVENT_FLAGS, VIRTUAL_KEY, VK_NUMLOCK, VK_PAUSE,
+        KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL,
+        MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
+        MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN,
+        MOUSEEVENTF_XUP, MOUSEINPUT, MOUSE_EVENT_FLAGS, VIRTUAL_KEY, VK_NUMLOCK, VK_PAUSE,
     },
     WindowsAndMessaging::{
         GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, XBUTTON1,
@@ -123,6 +123,33 @@ impl Backend for SendInputBackend {
             }
         };
         send(&[input])
+    }
+
+    fn text(&mut self, text: &str) -> Result<()> {
+        // KEYEVENTF_UNICODE types any character regardless of the host's keyboard layout.
+        let mut inputs = Vec::with_capacity(text.len() * 2);
+        for c in text.chars() {
+            match c {
+                '\r' => continue,
+                '\n' => {
+                    for up in [KEYBD_EVENT_FLAGS(0), KEYEVENTF_KEYUP] {
+                        inputs.push(keyboard(VIRTUAL_KEY(0), 0x1C, KEYEVENTF_SCANCODE | up));
+                    }
+                }
+                _ => {
+                    let mut units = [0u16; 2];
+                    for &unit in c.encode_utf16(&mut units).iter() {
+                        for up in [KEYBD_EVENT_FLAGS(0), KEYEVENTF_KEYUP] {
+                            inputs.push(keyboard(VIRTUAL_KEY(0), unit, KEYEVENTF_UNICODE | up));
+                        }
+                    }
+                }
+            }
+        }
+        if inputs.is_empty() {
+            return Ok(());
+        }
+        send(&inputs)
     }
 
     fn scroll(&mut self, dx: i16, dy: i16) -> Result<()> {

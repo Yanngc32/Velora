@@ -1,12 +1,12 @@
 # Screen Mirroring
 
 Open-source, low-latency remote control for your own computers: view and drive a Windows or
-Linux PC from another PC (and, later, from your phone). It is designed around input
+Linux PC from another PC or from your Android phone. It is designed around input
 responsiveness and a picture that is always current, not around maximum image quality.
 
-> **Status: early MVP.** Desktop host (Windows, Linux/X11) and desktop client work end to end:
-> pairing, encrypted streaming, keyboard/mouse/scroll, hardware encoding through FFmpeg.
-> Mobile clients and NAT traversal are next (see [Roadmap](#roadmap)).
+> **Status: early MVP.** Desktop host (Windows, Linux/X11), desktop client and Android app:
+> pairing (QR code on phones), encrypted streaming, keyboard/mouse/touch, hardware encoding
+> and decoding, signed auto-updates. iOS and NAT traversal are next (see [Roadmap](#roadmap)).
 
 ## How it works
 
@@ -52,6 +52,9 @@ project yet (no GPU in CI).
 | `crates/host` (`sm-host`) | Capture, color conversion and encoding, input injection, sessions |
 | `crates/client-core` | UI-independent client: connection, input API, decoding. Mobile apps will reuse it through FFI |
 | `crates/client` (`sm-client`) | Desktop client (winit + softbuffer) |
+| `crates/mobile` (`sm-mobile`) | Client core exported to the mobile apps through [UniFFI](https://mozilla.github.io/uniffi-rs/) |
+| `crates/uniffi-bindgen` | Generates the Kotlin (later Swift) bindings for `sm-mobile` |
+| `android/` | Android app (Kotlin): MediaCodec hardware decoding, trackpad, soft and physical keyboards |
 | `crates/update` | Signed self-updates from GitHub Releases |
 | `crates/release` (`sm-release`) | Release tooling used by CI: signing key, packaging, manifest signing |
 
@@ -166,6 +169,38 @@ sm-host run --fps 60 --bitrate 12000 --bind 0.0.0.0:7420 --encoder auto
 When a second paired device connects, it takes over the session. Switching from the phone to
 the laptop just works.
 
+### Android
+
+Until the app is published, install the APK built by the **Android** workflow: open the latest
+run in the repository's Actions tab, download the `screen-mirroring-debug-apk` artifact, and
+install it (allow installing from unknown sources).
+
+1. On the computer, run `sm-host run --pair`. It prints a QR code.
+2. In the app, tap **Scan QR code**. You can also type the address and code.
+3. Next time, tap the computer in the list. Long-press it to forget it.
+
+The screen works like a laptop trackpad, and the cursor is drawn on the phone, so it follows
+your finger with no network delay:
+
+| Gesture | Action |
+|---|---|
+| Drag one finger | Move the cursor |
+| Tap | Left click |
+| Tap, then touch again and drag | Hold the left button (drag and drop, select text) |
+| Two-finger tap | Right click |
+| Two-finger drag | Scroll |
+
+The toolbar shows or hides the keyboard and has Esc, Tab, the arrows and Del. Ctrl, Alt, Win
+and Shift latch: tap Ctrl, then `c`, to send Ctrl+C. Text from the soft keyboard is typed in
+whatever layout the host uses, including accents through dead keys on Linux (`á`, `ã`, `ç`).
+USB and Bluetooth keyboards send physical keys. The video is decoded in hardware by
+MediaCodec, straight to the screen.
+
+Building the app yourself needs the Android SDK and NDK, Rust with the
+`aarch64-linux-android` and `x86_64-linux-android` targets, and
+`cargo install cargo-ndk`. Then run `cd android && ./gradlew assembleDebug`. Gradle compiles
+the Rust core and generates its Kotlin bindings.
+
 ### Access over the internet
 
 Built-in NAT traversal is not implemented yet. Until then, either:
@@ -198,8 +233,8 @@ secure desktop (UAC prompts, lock screen) needs the host to run as a service (pl
    and hand the DXGI texture straight to the encoder.
 2. **GPU presentation on the client.** YUV textures and shader conversion/scaling instead of the
    CPU path, plus hardware decoding.
-3. **Mobile clients** (Android: Kotlin + MediaCodec, iOS: Swift + VideoToolbox) on top of
-   `client-core` via UniFFI. Touch input with trackpad and direct modes.
+3. **Mobile:** an iOS app (Swift + VideoToolbox) on the same `sm-mobile` core. On Android:
+   pinch to zoom, a direct-touch mode, and publishing (signed APK in releases).
 4. **NAT traversal.** A self-hostable rendezvous server, UDP hole punching, and a relay fallback.
 5. Wayland capture (xdg-desktop-portal + PipeWire), multi-monitor selection, cursor shape sync,
    clipboard, audio, relative mouse mode for games, adaptive bitrate.

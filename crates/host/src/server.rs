@@ -348,6 +348,8 @@ async fn run_session(
                     *session.last_ack.lock().unwrap() = Instant::now();
                     session.stats.lock().unwrap().acked(frame_id);
                 }
+                ClientMsg::Text { text } => shared.input.send(InputCmd::Text(text)),
+                ClientMsg::Unsupported { tag } => tracing::debug!("ignoring unsupported message {tag}"),
                 ClientMsg::Hello { .. } => bail!("unexpected hello"),
             }
         }

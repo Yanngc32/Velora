@@ -146,7 +146,20 @@ fn print_pairing(code: &PairingCode, port: u16) {
     println!();
     println!("    {}", code.encode());
     println!();
-    println!("On the new device run:");
+    println!("On a phone, scan this with the Screen Mirroring app:");
+    let link = sm_protocol::pairing::pairing_uri(&addr, code);
+    match qrcode::QrCode::new(link.as_bytes()) {
+        // Light modules drawn as blocks: reads correctly on the usual dark terminal background.
+        Ok(qr) => println!(
+            "{}",
+            qr.render::<qrcode::render::unicode::Dense1x2>()
+                .dark_color(qrcode::render::unicode::Dense1x2::Light)
+                .light_color(qrcode::render::unicode::Dense1x2::Dark)
+                .build()
+        ),
+        Err(e) => println!("    (cannot render QR code: {e})"),
+    }
+    println!("On a computer run:");
     println!("    sm-client pair {addr} {}", code.encode());
     println!();
     println!("Host fingerprint: {}", code.host.short());

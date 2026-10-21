@@ -23,6 +23,8 @@ pub const MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;
 pub const PAIRING_SECRET_LEN: usize = 16;
 /// Device names longer than this are truncated on encode.
 pub const MAX_NAME_LEN: usize = 256;
+/// Longest text carried by one [`ClientMsg::Text`]; longer input is split by [`split_text`].
+pub const MAX_TEXT_LEN: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
@@ -118,6 +120,14 @@ pub enum ClientMsg {
     RequestKeyframe,
     /// Release every key and button currently held (e.g. the client window lost focus).
     ReleaseAll,
+    /// Characters to type on the host, independent of its keyboard layout (soft keyboards).
+    Text {
+        text: String,
+    },
+    /// A message from a newer client that this version does not know; ignored.
+    Unsupported {
+        tag: u8,
+    },
 }
 
 /// Messages sent by the host on the control stream.
@@ -226,7 +236,10 @@ impl Writer {
         self.0.extend_from_slice(v);
     }
     fn str(&mut self, s: &str) {
-        let s = truncate_utf8(s, MAX_NAME_LEN);
+        self.str_max(s, MAX_NAME_LEN);
+    }
+    fn str_max(&mut self, s: &str, max: usize) {
+        let s = truncate_utf8(s, max);
         self.u16(s.len() as u16);
         self.bytes(s.as_bytes());
     }
@@ -235,6 +248,18 @@ impl Writer {
         self.0[0..4].copy_from_slice(&len.to_le_bytes());
         self.0
     }
+}
+
+/// Splits text into pieces that fit in one [`ClientMsg::Text`], on character boundaries.
+pub fn split_text(mut text: &str) -> impl Iterator<Item = &str> {
+    std::iter::from_fn(move || {
+        if text.is_empty() {
+            return None;
+        }
+        let head = truncate_utf8(text, MAX_TEXT_LEN);
+        text = &text[head.len()..];
+        Some(head)
+    })
 }
 
 fn truncate_utf8(s: &str, max: usize) -> &str {
@@ -330,6 +355,12 @@ impl ClientMsg {
             }
             Self::RequestKeyframe => Writer::new(6).finish(),
             Self::ReleaseAll => Writer::new(7).finish(),
+            Self::Text { text } => {
+                let mut w = Writer::new(8);
+                w.str_max(text, MAX_TEXT_LEN);
+                w.finish()
+            }
+            Self::Unsupported { tag } => Writer::new(*tag).finish(),
         }
     }
 
@@ -352,7 +383,9 @@ impl ClientMsg {
             5 => Self::FrameAck { frame_id: r.u32()? },
             6 => Self::RequestKeyframe,
             7 => Self::ReleaseAll,
-            t => bail!("unknown client message tag {t}"),
+            8 => Self::Text { text: r.str()? },
+            // Forward compatibility: skip messages added by newer clients.
+            tag => return Ok(Self::Unsupported { tag }),
         };
         r.end()?;
         Ok(msg)
@@ -445,6 +478,21 @@ mod tests {
         roundtrip_client(ClientMsg::FrameAck { frame_id: u32::MAX });
         roundtrip_client(ClientMsg::RequestKeyframe);
         roundtrip_client(ClientMsg::ReleaseAll);
+        roundtrip_client(ClientMsg::Text { text: "olá, ação ✓".into() });
+    }
+
+    #[test]
+    fn unknown_messages_are_skipped_not_fatal() {
+        assert_eq!(ClientMsg::decode(&[200, 1, 2, 3]).unwrap(), ClientMsg::Unsupported { tag: 200 });
+    }
+
+    #[test]
+    fn long_text_is_split_on_char_boundaries() {
+        let text = "ç".repeat(MAX_TEXT_LEN); // 2 bytes each
+        let parts: Vec<&str> = split_text(&text).collect();
+        assert_eq!(parts.len(), 2);
+        assert!(parts.iter().all(|p| p.len() <= MAX_TEXT_LEN));
+        assert_eq!(parts.concat(), text);
     }
 
     #[test]
@@ -463,7 +511,6 @@ mod tests {
     #[test]
     fn rejects_malformed_messages() {
         assert!(ClientMsg::decode(&[]).is_err());
-        assert!(ClientMsg::decode(&[99]).is_err());
         assert!(ClientMsg::decode(&[2, 30]).is_err()); // truncated
         assert!(ClientMsg::decode(&[7, 0]).is_err()); // trailing byte
         assert!(ClientMsg::decode(&[3, 9, 1, 0, 0, 0, 0]).is_err()); // bad button

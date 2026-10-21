@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="no_hosts">Nenhum computador pareado ainda. No computador, rode `sm-host run --pair` e escaneie o QR code que aparecer.</string>
+    <string name="scan_qr">Escanear QR code</string>
+    <string name="enter_code">Digitar código</string>
+    <string name="pair_title">Parear um computador</string>
+    <string name="pair_hint">Endereço e código exibidos por `sm-host run --pair`.</string>
+    <string name="address">Endereço (IP:porta)</string>
+    <string name="code">Código de pareamento (SM1-…)</string>
+    <string name="pair">Parear</string>
+    <string name="cancel">Cancelar</string>
+    <string name="forget">Esquecer</string>
+    <string name="forget_title">Esquecer %1$s?</string>
+    <string name="connecting">Conectando…</string>
+    <string name="disconnected">Desconectado: %1$s</string>
+    <string name="not_a_pairing_code">Esse QR code não é um código de pareamento do Screen Mirroring.</string>
+    <string name="scanner_unavailable">O leitor de QR não está disponível neste aparelho; digite o código.</string>
+</resources>

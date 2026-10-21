@@ -8,7 +8,7 @@ repository.workspace = true
 
 [dependencies]
 sm-protocol.workspace = true
-sm-client-core.workspace = true
+sm-client-core = { workspace = true, features = ["decode"] }
 sm-update.workspace = true
 anyhow.workspace = true
 tracing.workspace = true

@@ -2,7 +2,6 @@ mod keymap;
 mod render;
 
 use std::{
-    net::SocketAddr,
     num::NonZeroU32,
     path::PathBuf,
     rc::Rc,
@@ -13,14 +12,12 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::{Parser, Subcommand};
-use sm_client_core::{ConnectParams, FrameSlot, InputSender, Session, VideoFrame};
+use sm_client_core::{hosts, FrameSlot, InputSender, Session, VideoFrame, VideoOutput};
 use sm_protocol::{
-    identity::{KnownHost, StateDir},
-    pairing::PairingCode,
-    tls::Fingerprint,
-    wire::{KeyState, MouseButton, DEFAULT_PORT},
+    identity::StateDir,
+    wire::{KeyState, MouseButton},
 };
 use winit::{
     application::ApplicationHandler,
@@ -99,7 +96,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::List => {
-            let hosts: Vec<KnownHost> = state.load(StateDir::KNOWN_HOSTS)?;
+            let hosts = hosts::list(&state)?;
             if hosts.is_empty() {
                 println!("No paired hosts. Use `sm-client pair <address> <code>`.");
             }
@@ -109,39 +106,29 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Pair { address, code, name } => {
-            let code = PairingCode::parse(&code)?;
-            let addr = runtime.block_on(resolve(&address))?;
             let (proxy, event_loop) = new_event_loop()?;
-            let session = runtime.block_on(sm_client_core::connect(
-                ConnectParams {
-                    addr,
-                    host_fingerprint: code.host,
-                    identity: state.load_or_create_identity()?,
-                    device_name: name.unwrap_or_else(device_name),
-                    pairing_secret: Some(code.secret),
-                },
-                redraw_callback(proxy),
-            ))?;
-            remember_host(&state, &session.host_name, &address, code.host)?;
+            let slot = Arc::new(FrameSlot::default());
+            let output = VideoOutput::Decoded { slot: slot.clone(), on_frame: redraw_callback(proxy) };
+            let name = name.unwrap_or_else(device_name);
+            let session = runtime.block_on(hosts::pair(&state, &address, &code, &name, output))?;
             println!("Paired with '{}'. Next time: sm-client connect {}", session.host_name, session.host_name);
-            run_window(&runtime, event_loop, session)
+            run_window(&runtime, event_loop, session, slot)
         }
         Command::Connect { host } => {
             let (proxy, event_loop) = new_event_loop()?;
-            let session = runtime.block_on(connect_known(&state, &host, redraw_callback(proxy)))?;
-            run_window(&runtime, event_loop, session)
+            let slot = Arc::new(FrameSlot::default());
+            let output = VideoOutput::Decoded { slot: slot.clone(), on_frame: redraw_callback(proxy) };
+            let session = runtime.block_on(hosts::connect(&state, &host, &device_name(), output))?;
+            run_window(&runtime, event_loop, session, slot)
         }
         Command::Bench { host, seconds } => runtime.block_on(async {
             let frames = Arc::new(AtomicU32::new(0));
             let counter = frames.clone();
-            let session = connect_known(
-                &state,
-                &host,
-                Arc::new(move || {
-                    counter.fetch_add(1, Ordering::Relaxed);
-                }),
-            )
-            .await?;
+            let on_frame = Arc::new(move || {
+                counter.fetch_add(1, Ordering::Relaxed);
+            });
+            let output = VideoOutput::Decoded { slot: Arc::new(FrameSlot::default()), on_frame };
+            let session = hosts::connect(&state, &host, &device_name(), output).await?;
             println!("connected to '{}' ({}x{})", session.host_name, session.width, session.height);
             tokio::time::sleep(Duration::from_secs(seconds)).await;
             let n = frames.load(Ordering::Relaxed);
@@ -153,53 +140,6 @@ fn main() -> Result<()> {
             session.close();
             Ok(())
         }),
-    }
-}
-
-async fn connect_known(state: &StateDir, host: &str, on_frame: Arc<dyn Fn() + Send + Sync>) -> Result<Session> {
-    let hosts: Vec<KnownHost> = state.load(StateDir::KNOWN_HOSTS)?;
-    let known = hosts
-        .iter()
-        .find(|h| h.name == host || h.address == host)
-        .with_context(|| format!("'{host}' is not paired; use `sm-client pair` first"))?;
-    let addr = resolve(&known.address).await?;
-    sm_client_core::connect(
-        ConnectParams {
-            addr,
-            host_fingerprint: Fingerprint::from_base64(&known.fingerprint)?,
-            identity: state.load_or_create_identity()?,
-            device_name: device_name(),
-            pairing_secret: None,
-        },
-        on_frame,
-    )
-    .await
-}
-
-fn remember_host(state: &StateDir, name: &str, address: &str, fingerprint: Fingerprint) -> Result<()> {
-    let mut hosts: Vec<KnownHost> = state.load(StateDir::KNOWN_HOSTS)?;
-    let fp = fingerprint.to_base64();
-    hosts.retain(|h| h.fingerprint != fp && h.name != name);
-    hosts.push(KnownHost { name: name.to_string(), address: address.to_string(), fingerprint: fp });
-    state.save(StateDir::KNOWN_HOSTS, &hosts)
-}
-
-async fn resolve(address: &str) -> Result<SocketAddr> {
-    let target = with_default_port(address);
-    let mut addrs = tokio::net::lookup_host(&target).await.with_context(|| format!("resolving {target}"))?;
-    addrs.next().with_context(|| format!("no address for {target}"))
-}
-
-fn with_default_port(address: &str) -> String {
-    if address.parse::<SocketAddr>().is_ok() {
-        return address.to_string();
-    }
-    if let Ok(ip) = address.parse::<std::net::IpAddr>() {
-        return SocketAddr::new(ip, DEFAULT_PORT).to_string();
-    }
-    match address.rsplit_once(':') {
-        Some((_, port)) if port.parse::<u16>().is_ok() => address.to_string(),
-        _ => format!("{address}:{DEFAULT_PORT}"),
     }
 }
 
@@ -224,7 +164,12 @@ fn redraw_callback(proxy: EventLoopProxy<()>) -> Arc<dyn Fn() + Send + Sync> {
     })
 }
 
-fn run_window(runtime: &tokio::runtime::Runtime, event_loop: EventLoop<()>, session: Session) -> Result<()> {
+fn run_window(
+    runtime: &tokio::runtime::Runtime,
+    event_loop: EventLoop<()>,
+    session: Session,
+    frames: Arc<FrameSlot>,
+) -> Result<()> {
     let session = Arc::new(session);
     {
         // Exit the UI when the host goes away.
@@ -238,7 +183,7 @@ fn run_window(runtime: &tokio::runtime::Runtime, event_loop: EventLoop<()>, sess
     println!("Shortcuts: Ctrl+Alt+Shift+F fullscreen, Ctrl+Alt+Shift+Q quit");
     let mut app = App {
         input: session.input.clone(),
-        frames: session.frames.clone(),
+        frames,
         title: format!("{} — Screen Mirroring", session.host_name),
         remote_size: (session.width as u32, session.height as u32),
         session,
@@ -419,18 +364,5 @@ impl ApplicationHandler for App {
             }
             _ => {}
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    #[tokio::test]
-    async fn resolves_addresses() {
-        use super::resolve;
-        assert_eq!(resolve("127.0.0.1").await.unwrap().port(), sm_protocol::wire::DEFAULT_PORT);
-        assert_eq!(resolve("127.0.0.1:9000").await.unwrap().port(), 9000);
-        assert_eq!(resolve("::1").await.unwrap().port(), sm_protocol::wire::DEFAULT_PORT);
-        assert_eq!(resolve("[::1]:9000").await.unwrap().port(), 9000);
-        assert_eq!(resolve("localhost:9000").await.unwrap().port(), 9000);
     }
 }

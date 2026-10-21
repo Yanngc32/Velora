@@ -16,6 +16,7 @@ tokio.workspace = true
 quinn.workspace = true
 clap.workspace = true
 openh264.workspace = true
+qrcode = { version = "0.14", default-features = false }
 ffmpeg-sys-next = { version = "9", default-features = false, features = ["avcodec"], optional = true }
 
 [features]
