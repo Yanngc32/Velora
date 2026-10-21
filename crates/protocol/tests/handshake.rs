@@ -1,6 +1,6 @@
 //! Certificate pinning and client identification over a real QUIC handshake.
 
-use sm_protocol::{
+use velora_protocol::{
     identity::Identity,
     tls::{self, Fingerprint},
 };

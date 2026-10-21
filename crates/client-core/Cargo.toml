@@ -1,5 +1,5 @@
 [package]
-name = "sm-client-core"
+name = "velora-client-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -7,10 +7,18 @@ rust-version.workspace = true
 repository.workspace = true
 
 [dependencies]
-sm-protocol.workspace = true
+velora-protocol.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tokio.workspace = true
 quinn.workspace = true
-openh264.workspace = true
+openh264 = { workspace = true, optional = true }
 bytes = "1"
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[features]
+default = ["decode"]
+# Software H.264 decoding to RGB (desktop). Mobile apps decode in hardware and leave it off.
+decode = ["dep:openh264"]

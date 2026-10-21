@@ -7,7 +7,7 @@
 use std::{collections::HashSet, sync::mpsc};
 
 use anyhow::Result;
-use sm_protocol::wire::{KeyState, MouseButton};
+use velora_protocol::wire::{KeyState, MouseButton};
 
 use crate::capture::DisplayRect;
 
@@ -15,8 +15,10 @@ use crate::capture::DisplayRect;
 mod uinput;
 #[cfg(windows)]
 mod windows;
+#[cfg(target_os = "linux")]
+mod x11_keymap;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum InputCmd {
     Move { x: u16, y: u16 },
     Button { button: MouseButton, down: bool, x: u16, y: u16 },
@@ -24,6 +26,7 @@ pub enum InputCmd {
     Scroll { dx: i16, dy: i16 },
     ReleaseAll,
     SetDisplay(DisplayRect),
+    Text(String),
 }
 
 /// Platform injector. Coordinates are normalized to `0..=65535` over the captured display.
@@ -32,6 +35,8 @@ trait Backend {
     fn button(&mut self, button: MouseButton, down: bool) -> Result<()>;
     fn key(&mut self, code: u16, state: KeyState) -> Result<()>;
     fn scroll(&mut self, dx: i16, dy: i16) -> Result<()>;
+    /// Types characters independently of physical keys.
+    fn text(&mut self, text: &str) -> Result<()>;
     fn set_display(&mut self, _rect: DisplayRect) {}
 }
 
@@ -104,6 +109,7 @@ impl Injector {
                 backend.key(code, state)
             }
             InputCmd::Scroll { dx, dy } => backend.scroll(dx, dy),
+            InputCmd::Text(text) => backend.text(&text),
             InputCmd::SetDisplay(rect) => {
                 backend.set_display(rect);
                 Ok(())

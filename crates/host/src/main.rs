@@ -8,7 +8,7 @@ use std::{net::SocketAddr, path::PathBuf, time::Duration};
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 use encode::EncoderChoice;
-use sm_protocol::{
+use velora_protocol::{
     identity::{AuthorizedClient, StateDir},
     pairing::PairingCode,
     tls::Fingerprint,
@@ -18,11 +18,14 @@ use sm_protocol::{
 const PAIRING_TTL: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Parser)]
-#[command(name = "sm-host", version, about = "Share this computer's screen and accept remote input")]
+#[command(name = "velora-host", version, about = "Share this computer's screen and accept remote input")]
 struct Cli {
     /// Directory for identity and paired devices (defaults to the OS config directory).
     #[arg(long, global = true)]
     config_dir: Option<PathBuf>,
+    /// Don't install updates in the background (release builds update themselves by default).
+    #[arg(long, global = true)]
+    no_update: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -54,6 +57,8 @@ enum Command {
     Clients,
     /// Remove a paired device by name or fingerprint.
     Revoke { device: String },
+    /// Install the latest release now (restart a running host to use it).
+    Update,
 }
 
 #[tokio::main]
@@ -71,15 +76,18 @@ async fn main() -> Result<()> {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
 
+    // Captured before an update renames the running file.
+    let exe = std::env::current_exe()?;
     let cli = Cli::parse();
     let state = StateDir::open(cli.config_dir, "host")?;
+    velora_update::cleanup_current_exe();
 
     match cli.command {
         Command::Run { bind, name, fps, bitrate, pair, encoder } => {
             let identity = state.load_or_create_identity()?;
             let pairing = if pair {
                 let code = PairingCode::generate(identity.fingerprint())?;
-                print_pairing(&code, bind.port());
+                print_pairing(&code, bind);
                 Some((code, PAIRING_TTL))
             } else {
                 None
@@ -91,12 +99,22 @@ async fn main() -> Result<()> {
                 bitrate_kbps: bitrate.max(100),
                 encoder,
             };
-            server::run(options, state, pairing).await
+            if server::run(options, state, pairing, velora_update::auto_update_enabled(cli.no_update)).await? {
+                velora_update::restart(&exe);
+            }
+            Ok(())
+        }
+        Command::Update => {
+            match velora_update::update_now()? {
+                Some(v) => println!("Updated to {v}. Restart velora-host to use it."),
+                None => println!("Already up to date ({}).", velora_update::Version::current()),
+            }
+            Ok(())
         }
         Command::Clients => {
             let clients: Vec<AuthorizedClient> = state.load(StateDir::AUTHORIZED_CLIENTS)?;
             if clients.is_empty() {
-                println!("No paired devices. Run `sm-host run --pair` to add one.");
+                println!("No paired devices. Run `velora-host run --pair` to add one.");
             }
             for c in clients {
                 let fp = Fingerprint::from_base64(&c.fingerprint).map(|f| f.short()).unwrap_or(c.fingerprint);
@@ -121,15 +139,34 @@ async fn main() -> Result<()> {
     }
 }
 
-fn print_pairing(code: &PairingCode, port: u16) {
-    let addr = local_ip().map(|ip| format!("{ip}:{port}")).unwrap_or_else(|| format!("<this-pc-address>:{port}"));
+fn print_pairing(code: &PairingCode, bind: SocketAddr) {
+    // Advertise the address clients can actually reach: the bound one, or the LAN address
+    // when listening on every interface.
+    let ip = if bind.ip().is_unspecified() { local_ip() } else { Some(bind.ip()) };
+    let addr = match ip {
+        Some(ip) => SocketAddr::new(ip, bind.port()).to_string(),
+        None => format!("<this-pc-address>:{}", bind.port()),
+    };
     println!();
     println!("Pairing code (single use, valid for 10 minutes):");
     println!();
     println!("    {}", code.encode());
     println!();
-    println!("On the new device run:");
-    println!("    sm-client pair {addr} {}", code.encode());
+    println!("On a phone, scan this with the Velora app:");
+    let link = velora_protocol::pairing::pairing_uri(&addr, code);
+    match qrcode::QrCode::new(link.as_bytes()) {
+        // Light modules drawn as blocks: reads correctly on the usual dark terminal background.
+        Ok(qr) => println!(
+            "{}",
+            qr.render::<qrcode::render::unicode::Dense1x2>()
+                .dark_color(qrcode::render::unicode::Dense1x2::Light)
+                .light_color(qrcode::render::unicode::Dense1x2::Dark)
+                .build()
+        ),
+        Err(e) => println!("    (cannot render QR code: {e})"),
+    }
+    println!("On a computer run:");
+    println!("    velora pair {addr} {}", code.encode());
     println!();
     println!("Host fingerprint: {}", code.host.short());
     println!();

@@ -1,0 +1,30 @@
+[package]
+name = "velora-mobile"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish = false
+description = "Client core exported to the mobile apps through UniFFI."
+
+[lib]
+name = "velora_mobile"
+# cdylib for the apps; lib for tests and binding generation.
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+velora-protocol.workspace = true
+velora-client-core.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+uniffi.workspace = true
+
+[target.'cfg(target_os = "android")'.dependencies]
+paranoid-android = "0.2"
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+openh264.workspace = true

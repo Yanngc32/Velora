@@ -25,7 +25,7 @@ use rustls::{
 use crate::{identity::Identity, wire::ALPN};
 
 /// TLS server name used by clients; ignored by the pinning verifier.
-pub const SERVER_NAME: &str = "sm-host";
+pub const SERVER_NAME: &str = "velora-host";
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Fingerprint(pub [u8; 32]);

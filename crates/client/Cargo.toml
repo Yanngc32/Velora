@@ -1,5 +1,5 @@
 [package]
-name = "sm-client"
+name = "velora"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -7,8 +7,9 @@ rust-version.workspace = true
 repository.workspace = true
 
 [dependencies]
-sm-protocol.workspace = true
-sm-client-core.workspace = true
+velora-protocol.workspace = true
+velora-client-core = { workspace = true, features = ["decode"] }
+velora-update.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -16,3 +17,10 @@ tokio.workspace = true
 clap.workspace = true
 winit = "0.30"
 softbuffer = "0.4"
+serde.workspace = true
+eframe = { version = "0.37", default-features = false, features = ["accesskit", "clipboard", "default_fonts", "glow", "links", "wayland", "x11"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+sys-locale = "0.3"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = ["Win32_System_Console"] }

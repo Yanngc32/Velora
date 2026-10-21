@@ -1,0 +1,39 @@
+name: Android
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - android/**
+      - crates/**
+      - Cargo.lock
+      - .github/workflows/android.yml
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android, x86_64-linux-android
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+      - name: Unit tests and debug APK
+        working-directory: android
+        # The runner image ships the Android SDK and NDK (ANDROID_HOME, ANDROID_NDK_HOME).
+        run: ./gradlew --no-daemon testDebugUnitTest assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: velora-debug-apk
+          path: android/app/build/outputs/apk/debug/*.apk

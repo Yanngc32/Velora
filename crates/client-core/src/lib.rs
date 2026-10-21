@@ -1,6 +1,10 @@
 //! Platform-independent client: connection, authentication, input sending and video
-//! decoding. UIs (desktop now, mobile later through FFI) only draw frames and feed input.
+//! delivery. UIs only draw frames and feed input: the desktop gets decoded RGB pictures,
+//! mobile apps get the H.264 stream in order and decode it in hardware.
 
+pub mod hosts;
+mod reorder;
+#[cfg(feature = "decode")]
 mod video;
 
 use std::{
@@ -12,14 +16,35 @@ use std::{
 };
 
 use anyhow::{bail, Context, Result};
-use sm_protocol::{
+use tokio::sync::mpsc;
+use velora_protocol::{
     identity::Identity,
     tls::{self, Fingerprint},
     wire::{self, ClientMsg, FrameHeader, HostMsg, KeyState, MouseButton, MouseMove, PROTOCOL_VERSION},
 };
-use tokio::sync::mpsc;
 
+#[cfg(feature = "decode")]
 pub use video::{FrameSlot, VideoFrame};
+
+/// An encoded frame, delivered in order. Acknowledge it with [`InputSender::frame_done`] once
+/// it has been displayed: that is what paces the host.
+pub struct EncodedFrame {
+    pub frame_id: u32,
+    pub keyframe: bool,
+    pub width: u16,
+    pub height: u16,
+    /// H.264 Annex-B access unit.
+    pub data: Vec<u8>,
+}
+
+pub enum VideoOutput {
+    /// Decode in software into `slot`; `on_frame` runs (on the decoder thread) after each new
+    /// picture, e.g. to request a redraw. Frames are acknowledged automatically.
+    #[cfg(feature = "decode")]
+    Decoded { slot: Arc<FrameSlot>, on_frame: Arc<dyn Fn() + Send + Sync> },
+    /// Hand encoded frames, in order, to the caller's decoder.
+    Encoded(Arc<dyn Fn(EncodedFrame) + Send + Sync>),
+}
 
 pub struct ConnectParams {
     pub addr: SocketAddr,
@@ -36,7 +61,6 @@ pub struct Session {
     pub newly_paired: bool,
     pub width: u16,
     pub height: u16,
-    pub frames: Arc<FrameSlot>,
     pub input: InputSender,
     conn: quinn::Connection,
     _endpoint: quinn::Endpoint,
@@ -60,9 +84,8 @@ impl Session {
     }
 }
 
-/// Connects and authenticates. `on_frame` is called from the decoder thread whenever a new
-/// picture is available in [`Session::frames`] (e.g. to request a redraw).
-pub async fn connect(params: ConnectParams, on_frame: Arc<dyn Fn() + Send + Sync>) -> Result<Session> {
+/// Connects, authenticates and starts delivering video to `output`.
+pub async fn connect(params: ConnectParams, output: VideoOutput) -> Result<Session> {
     let bind: SocketAddr = if params.addr.is_ipv6() { "[::]:0".parse()? } else { "0.0.0.0:0".parse()? };
     let mut endpoint = quinn::Endpoint::client(bind)?;
     endpoint.set_default_client_config(tls::client_config(&params.identity, params.host_fingerprint)?);
@@ -109,8 +132,11 @@ pub async fn connect(params: ConnectParams, on_frame: Arc<dyn Fn() + Send + Sync
     // Keep reading so a host-side close is noticed; no further host messages are defined yet.
     tokio::spawn(async move { while let Ok(Some(_)) = wire::read_msg(&mut recv).await {} });
 
-    let frames = Arc::new(FrameSlot::default());
-    let decoder = video::spawn_decoder(frames.clone(), control_tx.clone(), on_frame);
+    let decoder = match output {
+        #[cfg(feature = "decode")]
+        VideoOutput::Decoded { slot, on_frame } => video::spawn_decoder(slot, control_tx.clone(), on_frame),
+        VideoOutput::Encoded(sink) => spawn_encoded(sink, control_tx.clone()),
+    };
     {
         let conn = conn.clone();
         tokio::spawn(async move {
@@ -122,7 +148,7 @@ pub async fn connect(params: ConnectParams, on_frame: Arc<dyn Fn() + Send + Sync
                         return;
                     }
                     let Ok(data) = stream.read_to_end(wire::MAX_FRAME_BYTES).await else { return };
-                    let _ = decoder.send(video::Packet { header: FrameHeader::decode(&header), data });
+                    let _ = decoder.send(reorder::Packet { header: FrameHeader::decode(&header), data });
                 });
             }
         });
@@ -133,7 +159,6 @@ pub async fn connect(params: ConnectParams, on_frame: Arc<dyn Fn() + Send + Sync
         newly_paired,
         width,
         height,
-        frames,
         input: InputSender { conn: conn.clone(), control: control_tx, seq: Arc::new(AtomicU32::new(0)) },
         conn,
         _endpoint: endpoint,
@@ -179,7 +204,59 @@ impl InputSender {
         self.send(ClientMsg::RequestKeyframe);
     }
 
+    /// Types text on the host (layout-independent), for soft keyboards that produce
+    /// characters rather than key presses.
+    pub fn text(&self, text: &str) {
+        for chunk in wire::split_text(text) {
+            self.send(ClientMsg::Text { text: chunk.to_string() });
+        }
+    }
+
+    /// Acknowledges a frame delivered through [`VideoOutput::Encoded`] once it is on screen.
+    pub fn frame_done(&self, frame_id: u32) {
+        self.send(ClientMsg::FrameAck { frame_id });
+    }
+
     fn send(&self, msg: ClientMsg) {
         let _ = self.control.send(msg);
     }
+}
+
+/// Delivers encoded frames in order. After a gap (only possible if frames were lost), frames
+/// are dropped and acknowledged until the next keyframe, which is requested.
+fn spawn_encoded(
+    sink: Arc<dyn Fn(EncodedFrame) + Send + Sync>,
+    control: mpsc::UnboundedSender<ClientMsg>,
+) -> std::sync::mpsc::Sender<reorder::Packet> {
+    let (tx, rx) = std::sync::mpsc::channel::<reorder::Packet>();
+    std::thread::Builder::new()
+        .name("video".into())
+        .spawn(move || {
+            let mut reorder = reorder::Reorder::default();
+            let mut need_keyframe = false;
+            for packet in rx {
+                let (ready, resynced) = reorder.push(packet);
+                if resynced {
+                    need_keyframe = true;
+                    let _ = control.send(ClientMsg::RequestKeyframe);
+                }
+                for p in ready {
+                    let h = p.header;
+                    if need_keyframe && !h.keyframe {
+                        let _ = control.send(ClientMsg::FrameAck { frame_id: h.frame_id });
+                        continue;
+                    }
+                    need_keyframe = false;
+                    sink(EncodedFrame {
+                        frame_id: h.frame_id,
+                        keyframe: h.keyframe,
+                        width: h.width,
+                        height: h.height,
+                        data: p.data,
+                    });
+                }
+            }
+        })
+        .expect("spawning video thread");
+    tx
 }

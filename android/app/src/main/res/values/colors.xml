@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Velora palette. -->
+<resources>
+    <color name="velora_lime">#B8FF6A</color>
+    <color name="velora_teal">#4EE1C3</color>
+    <color name="velora_lavender">#B388FF</color>
+    <color name="velora_indigo">#3B2A6F</color>
+    <color name="velora_ink">#0B0B0F</color>
+</resources>

@@ -63,7 +63,7 @@ impl StateDir {
     pub fn open(base: Option<PathBuf>, role: &str) -> Result<Self> {
         let base = match base {
             Some(b) => b,
-            None => directories::ProjectDirs::from("", "", "screen-mirroring")
+            None => directories::ProjectDirs::from("", "", "velora")
                 .context("could not determine the config directory")?
                 .config_dir()
                 .to_path_buf(),
@@ -71,6 +71,10 @@ impl StateDir {
         let dir = base.join(role);
         fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         Ok(Self(dir))
+    }
+
+    pub fn dir(&self) -> &Path {
+        &self.0
     }
 
     pub fn path(&self, file: &str) -> PathBuf {

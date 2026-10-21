@@ -9,9 +9,9 @@ use evdev::{
     uinput::VirtualDevice, AbsInfo, AbsoluteAxisCode, AttributeSet, EventType, InputEvent, KeyCode, RelativeAxisCode,
     UinputAbsSetup,
 };
-use sm_protocol::wire::{KeyState, MouseButton};
+use velora_protocol::wire::{KeyState, MouseButton};
 
-use super::Backend;
+use super::{x11_keymap::Keymap, Backend};
 
 /// Highest regular key code (`KEY_MICMUTE`); button codes start at 0x100.
 const MAX_KEY: u16 = 248;
@@ -31,7 +31,7 @@ impl Uinput {
         }
         let keyboard = VirtualDevice::builder()
             .context("cannot open /dev/uinput")?
-            .name("Screen Mirroring Keyboard")
+            .name("Velora Keyboard")
             .with_keys(&keys)?
             .build()?;
 
@@ -50,7 +50,7 @@ impl Uinput {
         }
         let axis = |code| UinputAbsSetup::new(code, AbsInfo::new(0, 0, u16::MAX as i32, 0, 0, 0));
         let pointer = VirtualDevice::builder()?
-            .name("Screen Mirroring Pointer")
+            .name("Velora Pointer")
             .with_keys(&buttons)?
             .with_relative_axes(&wheels)?
             .with_absolute_axis(&axis(AbsoluteAxisCode::ABS_X))?
@@ -97,6 +97,39 @@ impl Backend for Uinput {
             KeyState::Repeat => return Ok(()),
         };
         self.keyboard.emit(&[ev(EventType::KEY, code, value)])?;
+        Ok(())
+    }
+
+    fn text(&mut self, text: &str) -> Result<()> {
+        // Reloaded each time: the user may switch layouts while connected.
+        let keymap = Keymap::load()?;
+        let mut missing = String::new();
+        for c in text.chars() {
+            let Some(strokes) = keymap.strokes(c) else {
+                missing.push(c);
+                continue;
+            };
+            for stroke in strokes {
+                let mut mods = Vec::new();
+                if stroke.shift {
+                    mods.push(super::x11_keymap::SHIFT);
+                }
+                if let (true, Some(altgr)) = (stroke.altgr, keymap.altgr) {
+                    mods.push(altgr);
+                }
+                for &m in &mods {
+                    self.keyboard.emit(&[ev(EventType::KEY, m, 1)])?;
+                }
+                self.keyboard.emit(&[ev(EventType::KEY, stroke.code, 1)])?;
+                self.keyboard.emit(&[ev(EventType::KEY, stroke.code, 0)])?;
+                for &m in mods.iter().rev() {
+                    self.keyboard.emit(&[ev(EventType::KEY, m, 0)])?;
+                }
+            }
+        }
+        if !missing.is_empty() {
+            tracing::warn!("the host keyboard layout cannot type {missing:?}");
+        }
         Ok(())
     }
 

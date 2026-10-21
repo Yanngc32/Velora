@@ -1,8 +1,12 @@
+// The launcher is a GUI app: no console window on Windows (see `attach_console`).
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
+mod gui;
 mod keymap;
 mod render;
+mod settings;
 
 use std::{
-    net::SocketAddr,
     num::NonZeroU32,
     path::PathBuf,
     rc::Rc,
@@ -13,14 +17,13 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::{Parser, Subcommand};
-use sm_client_core::{ConnectParams, FrameSlot, InputSender, Session, VideoFrame};
-use sm_protocol::{
-    identity::{KnownHost, StateDir},
-    pairing::PairingCode,
-    tls::Fingerprint,
-    wire::{KeyState, MouseButton, DEFAULT_PORT},
+use settings::Settings;
+use velora_client_core::{hosts, FrameSlot, InputSender, Session, VideoFrame, VideoOutput};
+use velora_protocol::{
+    identity::StateDir,
+    wire::{KeyState, MouseButton},
 };
 use winit::{
     application::ApplicationHandler,
@@ -32,18 +35,25 @@ use winit::{
 };
 
 #[derive(Parser)]
-#[command(name = "sm-client", version, about = "Control a remote computer running sm-host")]
+#[command(
+    name = "velora",
+    version,
+    about = "Control a remote computer running velora-host. Without a command, opens the Velora app."
+)]
 struct Cli {
     /// Directory for identity and known hosts (defaults to the OS config directory).
     #[arg(long, global = true)]
     config_dir: Option<PathBuf>,
+    /// Don't install updates in the background (release builds update themselves by default).
+    #[arg(long, global = true)]
+    no_update: bool,
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
 enum Command {
-    /// Pair with a host using the code printed by `sm-host run --pair`, then connect.
+    /// Pair with a host using the code printed by `velora-host run --pair`, then connect.
     Pair {
         /// Host address, `ip[:port]` or `hostname[:port]`.
         address: String,
@@ -62,23 +72,51 @@ enum Command {
         #[arg(long, default_value_t = 10)]
         seconds: u64,
     },
+    /// Install the latest release now.
+    Update,
 }
 
 fn main() -> Result<()> {
+    #[cfg(windows)]
+    attach_console();
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .with_writer(std::io::stderr)
         .init();
 
     let cli = Cli::parse();
-    let state = StateDir::open(cli.config_dir, "client")?;
+    let state = StateDir::open(cli.config_dir.clone(), "client")?;
+    velora_update::cleanup_current_exe();
+    let settings = Settings::load(&state);
+    let no_update = cli.no_update || !settings.auto_update;
+    let Some(command) = cli.command else {
+        return gui::run(state, cli.config_dir, no_update);
+    };
     let runtime = tokio::runtime::Runtime::new()?;
+    if matches!(command, Command::Pair { .. } | Command::Connect { .. })
+        && velora_update::auto_update_enabled(no_update)
+    {
+        // A session runs for a long time: update in the background, effective next start.
+        std::thread::spawn(|| match velora_update::update_now() {
+            Ok(Some(v)) => eprintln!("Updated to {v}; it takes effect the next time velora starts."),
+            Ok(None) => {}
+            Err(e) => tracing::warn!("update check failed: {e:#}"),
+        });
+    }
 
-    match cli.command {
+    let device_name = settings.device_name;
+    match command {
+        Command::Update => {
+            match velora_update::update_now()? {
+                Some(v) => println!("Updated to {v}."),
+                None => println!("Already up to date ({}).", velora_update::Version::current()),
+            }
+            Ok(())
+        }
         Command::List => {
-            let hosts: Vec<KnownHost> = state.load(StateDir::KNOWN_HOSTS)?;
+            let hosts = hosts::list(&state)?;
             if hosts.is_empty() {
-                println!("No paired hosts. Use `sm-client pair <address> <code>`.");
+                println!("No paired hosts. Use `velora pair <address> <code>`.");
             }
             for h in hosts {
                 println!("{:<24} {}", h.name, h.address);
@@ -86,39 +124,29 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Pair { address, code, name } => {
-            let code = PairingCode::parse(&code)?;
-            let addr = runtime.block_on(resolve(&address))?;
             let (proxy, event_loop) = new_event_loop()?;
-            let session = runtime.block_on(sm_client_core::connect(
-                ConnectParams {
-                    addr,
-                    host_fingerprint: code.host,
-                    identity: state.load_or_create_identity()?,
-                    device_name: name.unwrap_or_else(device_name),
-                    pairing_secret: Some(code.secret),
-                },
-                redraw_callback(proxy),
-            ))?;
-            remember_host(&state, &session.host_name, &address, code.host)?;
-            println!("Paired with '{}'. Next time: sm-client connect {}", session.host_name, session.host_name);
-            run_window(&runtime, event_loop, session)
+            let slot = Arc::new(FrameSlot::default());
+            let output = VideoOutput::Decoded { slot: slot.clone(), on_frame: redraw_callback(proxy) };
+            let name = name.unwrap_or(device_name);
+            let session = runtime.block_on(hosts::pair(&state, &address, &code, &name, output))?;
+            println!("Paired with '{}'. Next time: velora connect {}", session.host_name, session.host_name);
+            run_window(&runtime, event_loop, session, slot)
         }
         Command::Connect { host } => {
             let (proxy, event_loop) = new_event_loop()?;
-            let session = runtime.block_on(connect_known(&state, &host, redraw_callback(proxy)))?;
-            run_window(&runtime, event_loop, session)
+            let slot = Arc::new(FrameSlot::default());
+            let output = VideoOutput::Decoded { slot: slot.clone(), on_frame: redraw_callback(proxy) };
+            let session = runtime.block_on(hosts::connect(&state, &host, &device_name, output))?;
+            run_window(&runtime, event_loop, session, slot)
         }
         Command::Bench { host, seconds } => runtime.block_on(async {
             let frames = Arc::new(AtomicU32::new(0));
             let counter = frames.clone();
-            let session = connect_known(
-                &state,
-                &host,
-                Arc::new(move || {
-                    counter.fetch_add(1, Ordering::Relaxed);
-                }),
-            )
-            .await?;
+            let on_frame = Arc::new(move || {
+                counter.fetch_add(1, Ordering::Relaxed);
+            });
+            let output = VideoOutput::Decoded { slot: Arc::new(FrameSlot::default()), on_frame };
+            let session = hosts::connect(&state, &host, &device_name, output).await?;
             println!("connected to '{}' ({}x{})", session.host_name, session.width, session.height);
             tokio::time::sleep(Duration::from_secs(seconds)).await;
             let n = frames.load(Ordering::Relaxed);
@@ -133,61 +161,15 @@ fn main() -> Result<()> {
     }
 }
 
-async fn connect_known(state: &StateDir, host: &str, on_frame: Arc<dyn Fn() + Send + Sync>) -> Result<Session> {
-    let hosts: Vec<KnownHost> = state.load(StateDir::KNOWN_HOSTS)?;
-    let known = hosts
-        .iter()
-        .find(|h| h.name == host || h.address == host)
-        .with_context(|| format!("'{host}' is not paired; use `sm-client pair` first"))?;
-    let addr = resolve(&known.address).await?;
-    sm_client_core::connect(
-        ConnectParams {
-            addr,
-            host_fingerprint: Fingerprint::from_base64(&known.fingerprint)?,
-            identity: state.load_or_create_identity()?,
-            device_name: device_name(),
-            pairing_secret: None,
-        },
-        on_frame,
-    )
-    .await
-}
-
-fn remember_host(state: &StateDir, name: &str, address: &str, fingerprint: Fingerprint) -> Result<()> {
-    let mut hosts: Vec<KnownHost> = state.load(StateDir::KNOWN_HOSTS)?;
-    let fp = fingerprint.to_base64();
-    hosts.retain(|h| h.fingerprint != fp && h.name != name);
-    hosts.push(KnownHost { name: name.to_string(), address: address.to_string(), fingerprint: fp });
-    state.save(StateDir::KNOWN_HOSTS, &hosts)
-}
-
-async fn resolve(address: &str) -> Result<SocketAddr> {
-    let target = with_default_port(address);
-    let mut addrs = tokio::net::lookup_host(&target).await.with_context(|| format!("resolving {target}"))?;
-    addrs.next().with_context(|| format!("no address for {target}"))
-}
-
-fn with_default_port(address: &str) -> String {
-    if address.parse::<SocketAddr>().is_ok() {
-        return address.to_string();
+/// A GUI-subsystem program has no console; reuse the terminal it was started from, if any,
+/// so the command line still prints.
+#[cfg(windows)]
+fn attach_console() {
+    use windows::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
+    // SAFETY: no preconditions; fails harmlessly when there is no parent console.
+    unsafe {
+        let _ = AttachConsole(ATTACH_PARENT_PROCESS);
     }
-    if let Ok(ip) = address.parse::<std::net::IpAddr>() {
-        return SocketAddr::new(ip, DEFAULT_PORT).to_string();
-    }
-    match address.rsplit_once(':') {
-        Some((_, port)) if port.parse::<u16>().is_ok() => address.to_string(),
-        _ => format!("{address}:{DEFAULT_PORT}"),
-    }
-}
-
-fn device_name() -> String {
-    std::env::var("COMPUTERNAME")
-        .or_else(|_| std::env::var("HOSTNAME"))
-        .ok()
-        .or_else(|| std::fs::read_to_string("/etc/hostname").ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "client".into())
 }
 
 fn new_event_loop() -> Result<(EventLoopProxy<()>, EventLoop<()>)> {
@@ -201,7 +183,12 @@ fn redraw_callback(proxy: EventLoopProxy<()>) -> Arc<dyn Fn() + Send + Sync> {
     })
 }
 
-fn run_window(runtime: &tokio::runtime::Runtime, event_loop: EventLoop<()>, session: Session) -> Result<()> {
+fn run_window(
+    runtime: &tokio::runtime::Runtime,
+    event_loop: EventLoop<()>,
+    session: Session,
+    frames: Arc<FrameSlot>,
+) -> Result<()> {
     let session = Arc::new(session);
     {
         // Exit the UI when the host goes away.
@@ -215,8 +202,8 @@ fn run_window(runtime: &tokio::runtime::Runtime, event_loop: EventLoop<()>, sess
     println!("Shortcuts: Ctrl+Alt+Shift+F fullscreen, Ctrl+Alt+Shift+Q quit");
     let mut app = App {
         input: session.input.clone(),
-        frames: session.frames.clone(),
-        title: format!("{} — Screen Mirroring", session.host_name),
+        frames,
+        title: format!("{} — Velora", session.host_name),
         remote_size: (session.width as u32, session.height as u32),
         session,
         window: None,
@@ -396,18 +383,5 @@ impl ApplicationHandler for App {
             }
             _ => {}
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    #[tokio::test]
-    async fn resolves_addresses() {
-        use super::resolve;
-        assert_eq!(resolve("127.0.0.1").await.unwrap().port(), sm_protocol::wire::DEFAULT_PORT);
-        assert_eq!(resolve("127.0.0.1:9000").await.unwrap().port(), 9000);
-        assert_eq!(resolve("::1").await.unwrap().port(), sm_protocol::wire::DEFAULT_PORT);
-        assert_eq!(resolve("[::1]:9000").await.unwrap().port(), 9000);
-        assert_eq!(resolve("localhost:9000").await.unwrap().port(), 9000);
     }
 }
