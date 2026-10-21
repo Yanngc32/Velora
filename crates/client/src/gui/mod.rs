@@ -5,6 +5,7 @@
 //! process keeps a misbehaving session from taking the launcher down.
 
 mod icons;
+mod motion;
 mod strings;
 mod theme;
 mod widgets;
@@ -18,8 +19,9 @@ use std::{
 };
 
 use anyhow::{anyhow, Result};
-use eframe::egui::{self, Align, Layout, RichText, Sense, TextureHandle, Vec2};
+use eframe::egui::{self, Align, Color32, Layout, RichText, Sense, TextureHandle, Vec2};
 use icons::{Icon, Icons};
+use motion::success_notice;
 use strings::{fill, Strings};
 use theme::*;
 use velora_client_core::hosts;
@@ -103,6 +105,16 @@ struct Launcher {
     saved: bool,
     sessions: Vec<Session>,
     update: Arc<Mutex<UpdateState>>,
+    /// `ui.input` time of the current frame.
+    now: f64,
+    /// When the current page was opened, and where the sidebar highlight was at that moment.
+    page_since: f64,
+    nav_from: Option<f32>,
+    nav_y: Option<f32>,
+    /// A host that just appeared in the list, and when.
+    new_host: Option<(String, f64)>,
+    /// When each notice now on screen first appeared, to fade it in.
+    notices_seen: Vec<(String, f64)>,
 }
 
 impl Launcher {
@@ -132,6 +144,12 @@ impl Launcher {
             saved: false,
             sessions: Vec::new(),
             update: Arc::new(Mutex::new(UpdateState::Idle)),
+            now: 0.0,
+            page_since: f64::NEG_INFINITY,
+            nav_from: None,
+            nav_y: None,
+            new_host: None,
+            notices_seen: Vec::new(),
         };
         if !launcher.hosts.is_empty() {
             launcher.page = Page::Devices;
@@ -143,8 +161,24 @@ impl Launcher {
     }
 
     fn refresh_hosts(&mut self) {
-        self.hosts = hosts::list(&self.state).unwrap_or_default();
+        let hosts = hosts::list(&self.state).unwrap_or_default();
+        if let Some(added) = hosts.iter().find(|h| !self.hosts.iter().any(|old| old.name == h.name)) {
+            self.new_host = Some((added.name.clone(), self.now));
+            // Just paired from this page: show where the computer landed.
+            if self.page == Page::Connect {
+                self.go(Page::Devices);
+            }
+        }
+        self.hosts = hosts;
         self.hosts_loaded = Instant::now();
+    }
+
+    fn go(&mut self, page: Page) {
+        if page != self.page {
+            self.page = page;
+            self.page_since = self.now;
+            self.nav_from = self.nav_y;
+        }
     }
 
     fn check_updates(&self, ctx: &egui::Context) {
@@ -222,7 +256,9 @@ impl Launcher {
             self.error = Some(e);
         }
         // A pairing session saves its host; also pick up `velora pair` run from a terminal.
-        if changed || self.hosts_loaded.elapsed() > Duration::from_secs(3) {
+        // Poll faster while a session runs: a pairing session saves its host once paired.
+        let every = Duration::from_secs(if self.sessions.is_empty() { 3 } else { 1 });
+        if changed || self.hosts_loaded.elapsed() > every {
             self.refresh_hosts();
         }
     }
@@ -306,7 +342,7 @@ impl Launcher {
         // A child UI, so the button does not move the page's cursor.
         let mut corner = ui.new_child(egui::UiBuilder::new().max_rect(area).layout(Layout::right_to_left(Align::Min)));
         if secondary_button_icon(&mut corner, s.pair_computer, Some((&self.icons, Icon::Plus))).clicked() {
-            self.page = Page::Connect;
+            self.go(Page::Connect);
         }
 
         let mut action = None;
@@ -317,13 +353,19 @@ impl Launcher {
                 |ui| {
                     ui.set_width(ui.available_width());
                     ui.spacing_mut().item_spacing.y = 0.0;
+                    let count = self.hosts.len();
                     for (i, host) in self.hosts.iter().enumerate() {
-                        if i > 0 {
-                            let y = ui.cursor().min.y;
-                            ui.painter().hline(ui.max_rect().x_range(), y, egui::Stroke::new(1.0, BORDER));
-                        }
-                        let running = self.sessions.iter().any(|x| x.label == host.name);
-                        if let Some(a) = device_row(ui, s, &self.icons, host, running) {
+                        let fresh = match &self.new_host {
+                            Some((name, since)) if *name == host.name => Some(*since),
+                            _ => None,
+                        };
+                        // A pairing session is labelled with the address it dialed.
+                        let running = self.sessions.iter().any(|x| x.label == host.name || x.label == host.address);
+                        let corners = (i == 0, i + 1 == count);
+                        let row = animated_row(ui, &host.name, fresh, self.now, corners, |ui| {
+                            device_row(ui, s, &self.icons, host, running)
+                        });
+                        if let Some(a) = row {
                             action = Some((a, host.name.clone()));
                         }
                     }
@@ -361,7 +403,7 @@ impl Launcher {
                 ui.label(RichText::new(s.no_devices).color(WEAK));
                 ui.add_space(12.0);
                 if primary_button(ui, s.pair_computer, 200.0, true).clicked() {
-                    self.page = Page::Connect;
+                    self.go(Page::Connect);
                 }
                 ui.add_space(24.0);
             });
@@ -491,17 +533,35 @@ impl Launcher {
         });
         ui.add_space(22.0);
         ui.spacing_mut().item_spacing.y = 2.0;
+        // The selection highlight goes under the entries and slides to the selected one.
+        let highlight = ui.painter().add(egui::Shape::Noop);
+        let mut selected = None;
         for (page, icon, label) in [
             (Page::Connect, Icon::Connect, s.nav_connect),
             (Page::Devices, Icon::Monitor, s.nav_devices),
             (Page::Settings, Icon::Settings, s.nav_settings),
             (Page::About, Icon::Info, s.nav_about),
         ] {
-            if nav_item(ui, &self.icons, icon, label, self.page == page).clicked() {
-                self.page = page;
+            let badge = (page == Page::Devices && !self.hosts.is_empty()).then(|| {
+                let pulse = self.new_host.as_ref().map_or(0.0, |(_, since)| motion::pulse(self.now, *since, 0.8));
+                (self.hosts.len(), pulse)
+            });
+            let response = nav_item(ui, &self.icons, icon, label, self.page == page, badge);
+            if self.page == page {
+                selected = Some(response.rect);
+            }
+            if response.clicked() {
+                self.go(page);
                 self.error = None;
                 self.saved = false;
             }
+        }
+        if let Some(rect) = selected {
+            let t = motion::progress(self.now, self.page_since, 0.22);
+            let y = egui::lerp(self.nav_from.unwrap_or(rect.top())..=rect.top(), t);
+            self.nav_y = Some(y);
+            let pill = egui::Rect::from_min_size(egui::pos2(rect.left(), y), rect.size());
+            ui.painter().set(highlight, egui::epaint::RectShape::filled(pill, RADIUS, ACCENT.gamma_multiply(0.16)));
         }
 
         // This device, pinned to the bottom.
@@ -540,9 +600,15 @@ impl Launcher {
 
 impl eframe::App for Launcher {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.now = ui.input(|i| i.time);
         self.poll_sessions();
         if !self.sessions.is_empty() || matches!(*self.update.lock().unwrap(), UpdateState::Checking) {
             ui.ctx().request_repaint_after(Duration::from_millis(300));
+        }
+        if let Some((_, since)) = &self.new_host {
+            if self.now - since > motion::SUCCESS_SECONDS {
+                self.new_host = None;
+            }
         }
 
         egui::Panel::left("nav")
@@ -560,20 +626,46 @@ impl eframe::App for Launcher {
             .frame(egui::Frame::new().fill(BG).inner_margin(egui::Margin { left: 48, right: 34, top: 36, bottom: 0 }))
             .show(ui, |ui| {
                 ui.set_max_width(ui.available_width().min(860.0));
-                if let Some(updated) = match &*self.update.lock().unwrap() {
-                    UpdateState::Updated(v) => Some(fill(self.s.updated_restart, &[v])),
-                    _ => None,
-                } {
-                    banner(ui, &updated, LIVE);
+                let mut notices = Vec::new();
+                if let UpdateState::Updated(v) = &*self.update.lock().unwrap() {
+                    notices.push((fill(self.s.updated_restart, &[v]), LIVE));
                 }
                 for session in &self.sessions {
-                    banner(ui, &fill(self.s.session_running, &[&session.label]), LIVE);
+                    notices.push((fill(self.s.session_running, &[&session.label]), LIVE));
                 }
-                if let Some(error) = self.error.clone() {
-                    banner(ui, &error, ERROR);
+                if let Some(error) = &self.error {
+                    notices.push((error.clone(), ERROR));
                 }
-                if self.error.is_some() || !self.sessions.is_empty() {
+                let now = self.now;
+                self.notices_seen.retain(|(text, _)| notices.iter().any(|(t, _)| t == text));
+                if let Some((name, since)) = &self.new_host {
+                    success_notice(ui, &fill(self.s.paired_success, &[name]), now - since);
+                }
+                for (text, color) in &notices {
+                    let since = match self.notices_seen.iter().find(|(t, _)| t == text) {
+                        Some((_, since)) => *since,
+                        None => {
+                            self.notices_seen.push((text.clone(), now));
+                            now
+                        }
+                    };
+                    ui.scope(|ui| {
+                        ui.multiply_opacity(motion::progress(now, since, 0.2));
+                        banner(ui, text, *color);
+                    });
+                }
+                if !notices.is_empty() || self.new_host.is_some() {
                     ui.add_space(12.0);
+                }
+
+                // New pages fade in while rising a few points.
+                let t = motion::progress(now, self.page_since, 0.18);
+                ui.multiply_opacity(t);
+                ui.add_space((1.0 - t) * 8.0);
+                let settling =
+                    t < 1.0 || self.new_host.is_some() || self.notices_seen.iter().any(|(_, since)| now - since < 0.2);
+                if settling {
+                    ui.ctx().request_repaint();
                 }
                 // The device list scrolls itself, below its header.
                 if self.page == Page::Devices {
@@ -629,6 +721,59 @@ fn device_row(ui: &mut egui::Ui, s: &Strings, icons: &Icons, host: &KnownHost, r
         });
     });
     action
+}
+
+/// A row of the device list, with a hover fade. A `fresh` row (just paired, at that time)
+/// unfolds from nothing and keeps a teal wash that drains over a few seconds.
+fn animated_row<R>(
+    ui: &mut egui::Ui,
+    key: &str,
+    fresh: Option<f64>,
+    now: f64,
+    (first, last): (bool, bool),
+    add: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    let id = ui.scope_id().with(key);
+    let width = ui.available_width();
+    // Measured on the previous frame.
+    let full = ui.ctx().data(|d| d.get_temp::<f32>(id)).unwrap_or(68.0);
+    let (unfold, wash) = match fresh {
+        Some(since) => (motion::progress(now, since, 0.35), 1.0 - motion::progress(now, since + 0.6, 2.5)),
+        None => (1.0, 0.0),
+    };
+    let (slot, _) = ui.allocate_exact_size(egui::vec2(width, full * unfold), Sense::hover());
+    if !first {
+        ui.painter().hline(slot.x_range(), slot.top(), egui::Stroke::new(1.0, BORDER));
+    }
+    let r = CARD_RADIUS.nw;
+    let radius = egui::CornerRadius {
+        nw: if first { r } else { 0 },
+        ne: if first { r } else { 0 },
+        sw: if last { r } else { 0 },
+        se: if last { r } else { 0 },
+    };
+    let hover = ui.ctx().animate_bool_with_time(id.with("hover"), ui.rect_contains_pointer(slot), HOVER_SECONDS);
+    let mut row = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(egui::Rect::from_min_size(slot.min, egui::vec2(width, full)))
+            .layout(Layout::top_down(Align::Min)),
+    );
+    row.set_clip_rect(slot.intersect(ui.clip_rect()));
+    row.multiply_opacity(unfold);
+    let background = Color32::from_white_alpha((4.0 * hover) as u8);
+    row.painter().rect_filled(slot.shrink(0.5), radius, background);
+    if wash > 0.0 {
+        row.painter().rect_filled(slot.shrink(0.5), radius, LIVE.gamma_multiply(0.08 * wash));
+        let bar = egui::Rect::from_min_size(
+            slot.min + egui::vec2(0.5, 10.0),
+            egui::vec2(2.0, (slot.height() - 20.0).max(0.0)),
+        );
+        row.painter().rect_filled(bar, 1.0, LIVE.gamma_multiply(wash));
+    }
+    let out = add(&mut row);
+    let measured = row.min_rect().height();
+    ui.ctx().data_mut(|d| d.insert_temp(id, measured));
+    out
 }
 
 fn divider(ui: &mut egui::Ui) {

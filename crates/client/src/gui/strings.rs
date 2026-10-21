@@ -55,6 +55,7 @@ pub struct Strings {
     pub updated_restart: &'static str,
     pub session_running: &'static str,
     pub session_failed: &'static str,
+    pub paired_success: &'static str,
 }
 
 const PT: Strings = Strings {
@@ -112,6 +113,7 @@ const PT: Strings = Strings {
     updated_restart: "Atualizado para a versão {}. Reinicie o Velora para usar.",
     session_running: "Sessão aberta com {}",
     session_failed: "Não foi possível conectar a {}: {}",
+    paired_success: "{} pareado com sucesso. Ele fica salvo aqui em Dispositivos.",
 };
 
 const EN: Strings = Strings {
@@ -169,6 +171,7 @@ const EN: Strings = Strings {
     updated_restart: "Updated to version {}. Restart Velora to use it.",
     session_running: "Session open with {}",
     session_failed: "Could not connect to {}: {}",
+    paired_success: "{} paired. It is saved here in Devices.",
 };
 
 pub fn current() -> &'static Strings {

@@ -19,6 +19,7 @@ pub const FAINT: Color32 = Color32::from_rgb(0x6B, 0x6D, 0x7E);
 /// Brand violet, for the primary action and the current selection.
 pub const ACCENT: Color32 = Color32::from_rgb(0x7B, 0x4D, 0xFF);
 pub const ACCENT_HOVER: Color32 = Color32::from_rgb(0x8C, 0x63, 0xFF);
+pub const ACCENT_PRESSED: Color32 = Color32::from_rgb(0x69, 0x3C, 0xE8);
 /// Brand lavender, for accent text on dark surfaces (the violet is too dark to read there).
 pub const ACCENT_TEXT: Color32 = Color32::from_rgb(0xB3, 0x88, 0xFF);
 /// Brand teal, for live status and commands.

@@ -10,6 +10,8 @@ use super::{
 };
 
 pub const CONTROL_HEIGHT: f32 = 40.0;
+/// Hover fades, in seconds.
+pub const HOVER_SECONDS: f32 = 0.12;
 
 /// Section label, title and optional subtitle opening each page.
 pub fn page_header(ui: &mut Ui, label: &str, title: &str, subtitle: Option<&str>) {
@@ -67,11 +69,14 @@ pub fn field<'a>(text: &'a mut String, hint: &'a str, technical: bool) -> egui::
 pub fn primary_button(ui: &mut Ui, text: &str, width: f32, enabled: bool) -> Response {
     let sense = if enabled { Sense::click() } else { Sense::hover() };
     let (rect, response) = ui.allocate_exact_size(vec2(width, CONTROL_HEIGHT), sense);
+    let hover =
+        ui.ctx().animate_bool_with_time(response.id.with("hover"), enabled && response.hovered(), HOVER_SECONDS);
+    let press = ui.ctx().animate_bool_with_time(response.id.with("press"), response.is_pointer_button_down_on(), 0.06);
     let painter = ui.painter();
-    let (fill, color) = match (enabled, response.hovered()) {
-        (false, _) => (HOVER, FAINT),
-        (true, false) => (ACCENT, Color32::WHITE),
-        (true, true) => (ACCENT_HOVER, Color32::WHITE),
+    let (fill, color) = if enabled {
+        (ACCENT.lerp_to_gamma(ACCENT_HOVER, hover).lerp_to_gamma(ACCENT_PRESSED, press), Color32::WHITE)
+    } else {
+        (HOVER, FAINT)
     };
     painter.rect_filled(rect, RADIUS, fill);
     painter.text(rect.center(), Align2::CENTER_CENTER, text, font(14.0, semibold()), color);
@@ -93,8 +98,11 @@ pub fn secondary_button_icon(ui: &mut Ui, text: &str, icon: Option<(&Icons, Icon
     let galley = ui.painter().layout_no_wrap(text.to_string(), font(14.0, medium()), TEXT);
     let lead = if icon.is_some() { ICON + 8.0 } else { 0.0 };
     let (rect, response) = ui.allocate_exact_size(vec2(galley.size().x + lead + 28.0, CONTROL_HEIGHT), Sense::click());
-    let fill = if response.hovered() { HOVER } else { Color32::TRANSPARENT };
-    ui.painter().rect(rect, RADIUS, fill, Stroke::new(1.0, BORDER_STRONG), StrokeKind::Inside);
+    let hover = ui.ctx().animate_bool_with_time(response.id.with("hover"), response.hovered(), HOVER_SECONDS);
+    let press = ui.ctx().animate_bool_with_time(response.id.with("press"), response.is_pointer_button_down_on(), 0.06);
+    let fill = Color32::TRANSPARENT.lerp_to_gamma(HOVER, hover).lerp_to_gamma(BORDER, press);
+    let edge = BORDER_STRONG.lerp_to_gamma(FAINT, hover * 0.5);
+    ui.painter().rect(rect, RADIUS, fill, Stroke::new(1.0, edge), StrokeKind::Inside);
     let left = rect.left() + 14.0;
     if let Some((icons, icon)) = icon {
         icons.paint(ui.painter(), icon, egui::pos2(left + ICON / 2.0, rect.center().y), ICON, TEXT);
@@ -130,18 +138,31 @@ pub fn toggle(ui: &mut Ui, on: &mut bool, enabled: bool) -> Response {
     }
 }
 
-pub fn nav_item(ui: &mut Ui, icons: &Icons, icon: Icon, label: &str, selected: bool) -> Response {
+/// A sidebar entry. The selection highlight is drawn by the sidebar, which slides it between
+/// entries; `badge` is a count with its pulse (see [`super::motion::badge`]).
+pub fn nav_item(
+    ui: &mut Ui,
+    icons: &Icons,
+    icon: Icon,
+    label: &str,
+    selected: bool,
+    badge: Option<(usize, f32)>,
+) -> Response {
     let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 38.0), Sense::click());
+    let t = ui.ctx().animate_bool_with_time(response.id.with("selected"), selected, 0.18);
+    let hover =
+        ui.ctx().animate_bool_with_time(response.id.with("hover"), response.hovered() && !selected, HOVER_SECONDS);
     let painter = ui.painter();
-    if selected {
-        painter.rect_filled(rect, RADIUS, ACCENT.gamma_multiply(0.16));
-    } else if response.hovered() {
-        painter.rect_filled(rect, RADIUS, Color32::from_white_alpha(10));
+    if hover > 0.0 {
+        painter.rect_filled(rect, RADIUS, Color32::from_white_alpha((10.0 * hover) as u8));
     }
-    let color = if selected || response.hovered() { TEXT } else { WEAK };
+    let color = WEAK.lerp_to_gamma(TEXT, t.max(hover));
     let icon_center = rect.left_center() + vec2(20.0, 0.0);
-    icons.paint(painter, icon, icon_center, 18.0, if selected { ACCENT_TEXT } else { color });
+    icons.paint(painter, icon, icon_center, 18.0, color.lerp_to_gamma(ACCENT_TEXT, t));
     painter.text(rect.left_center() + vec2(40.0, 0.0), Align2::LEFT_CENTER, label, font(14.0, medium()), color);
+    if let Some((count, pulse)) = badge {
+        super::motion::badge(painter, rect.right_center() - vec2(10.0, 0.0), count, pulse);
+    }
     response.on_hover_cursor(CursorIcon::PointingHand)
 }
 
