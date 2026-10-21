@@ -1,1 +1,3 @@
 /target
+# Release signing key (see README, "Releasing"): never commit it.
+signing-key*.txt

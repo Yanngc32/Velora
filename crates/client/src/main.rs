@@ -37,6 +37,9 @@ struct Cli {
     /// Directory for identity and known hosts (defaults to the OS config directory).
     #[arg(long, global = true)]
     config_dir: Option<PathBuf>,
+    /// Don't install updates in the background (release builds update themselves by default).
+    #[arg(long, global = true)]
+    no_update: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -62,6 +65,8 @@ enum Command {
         #[arg(long, default_value_t = 10)]
         seconds: u64,
     },
+    /// Install the latest release now.
+    Update,
 }
 
 fn main() -> Result<()> {
@@ -73,8 +78,26 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let state = StateDir::open(cli.config_dir, "client")?;
     let runtime = tokio::runtime::Runtime::new()?;
+    sm_update::cleanup_current_exe();
+    if matches!(cli.command, Command::Pair { .. } | Command::Connect { .. })
+        && sm_update::auto_update_enabled(cli.no_update)
+    {
+        // A session runs for a long time: update in the background, effective next start.
+        std::thread::spawn(|| match sm_update::update_now() {
+            Ok(Some(v)) => eprintln!("Updated to {v}; it takes effect the next time sm-client starts."),
+            Ok(None) => {}
+            Err(e) => tracing::warn!("update check failed: {e:#}"),
+        });
+    }
 
     match cli.command {
+        Command::Update => {
+            match sm_update::update_now()? {
+                Some(v) => println!("Updated to {v}."),
+                None => println!("Already up to date ({}).", sm_update::Version::current()),
+            }
+            Ok(())
+        }
         Command::List => {
             let hosts: Vec<KnownHost> = state.load(StateDir::KNOWN_HOSTS)?;
             if hosts.is_empty() {

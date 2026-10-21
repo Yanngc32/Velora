@@ -1,0 +1,145 @@
+name: Release
+
+# A `v*` tag builds, signs and publishes a release that installed copies update to.
+# Pull requests touching the release machinery run the same builds as a dry run.
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - crates/update/**
+      - crates/release/**
+      - packaging/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # LGPL shared FFmpeg builds; see packaging/NOTICE.txt.
+  FFMPEG_URL: https://github.com/BtbN/FFmpeg-Builds/releases/download/latest
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Oldest supported Ubuntu runner, for a low glibc requirement.
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            ffmpeg: ffmpeg-n8.1-latest-linux64-lgpl-shared-8.1
+            archive: tar.xz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            ffmpeg: ffmpeg-n8.1-latest-win64-lgpl-shared-8.1
+            archive: zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check tag matches the crate version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          [ "v$version" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME != version $version"; exit 1; }
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install bindgen dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libclang-dev
+
+      - name: Fetch FFmpeg
+        run: |
+          curl -sSLf -o "ffmpeg.${{ matrix.archive }}" "$FFMPEG_URL/${{ matrix.ffmpeg }}.${{ matrix.archive }}"
+          # Git Bash's tar cannot read zip files on Windows.
+          if [ "${{ matrix.archive }}" = zip ]; then 7z x -y ffmpeg.zip > /dev/null; else tar -xf ffmpeg.tar.xz; fi
+          echo "FFMPEG_DIR=$PWD/${{ matrix.ffmpeg }}" >> "$GITHUB_ENV"
+
+      - name: Build
+        env:
+          SM_RELEASE_BUILD: "1"
+          # Linux: find the bundled FFmpeg in ./lib next to the binaries. DT_RPATH (not RUNPATH)
+          # also applies to the libraries' own dependencies (libavcodec -> libswresample).
+          RUSTFLAGS: ${{ runner.os == 'Linux' && '-C link-arg=-Wl,--disable-new-dtags,-rpath,$ORIGIN/lib' || '' }}
+        run: cargo build --release --locked -p sm-host -p sm-client --features sm-host/ffmpeg
+
+      - name: Stage install directory
+        run: |
+          mkdir -p stage
+          cp LICENSE packaging/NOTICE.txt stage/
+          cp "$FFMPEG_DIR/LICENSE.txt" stage/FFMPEG-LICENSE.txt
+          if [ "$RUNNER_OS" = Windows ]; then
+            cp target/release/sm-host.exe target/release/sm-client.exe stage/
+            for lib in avcodec avutil swresample; do cp "$FFMPEG_DIR"/bin/$lib-*.dll stage/; done
+          else
+            cp target/release/sm-host target/release/sm-client stage/
+            mkdir -p stage/lib
+            # Copy each library once, under its SONAME (e.g. libavcodec.so.62).
+            for f in "$FFMPEG_DIR"/lib/lib{avcodec,avutil,swresample}.so.*; do
+              name=$(basename "$f")
+              [[ $name =~ ^lib[a-z]+\.so\.[0-9]+$ ]] && cp -L "$f" "stage/lib/$name"
+            done
+            chmod 644 stage/lib/* stage/LICENSE stage/NOTICE.txt stage/FFMPEG-LICENSE.txt
+          fi
+          ls -lR stage
+
+      - name: Smoke test (binaries start with the bundled libraries)
+        run: |
+          ./stage/sm-host --version
+          ./stage/sm-client --version
+
+      - name: Package
+        run: cargo run --release --locked -p sm-release -- package --target ${{ matrix.target }} --root stage --dist dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+
+      - name: Dry run (unsigned manifest)
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        run: |
+          cargo run --release --locked -p sm-release -- manifest --dist dist --unsigned
+          cat dist/manifest.json
+          ls -l dist
+
+      - name: Sign manifest
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          SM_SIGNING_KEY: ${{ secrets.SM_SIGNING_KEY }}
+        run: cargo run --release --locked -p sm-release -- manifest --dist dist
+
+      # Draft first so installed copies never see a manifest before all its files exist.
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --draft --title "$GITHUB_REF_NAME" --generate-notes dist/*
+          gh release edit "$GITHUB_REF_NAME" --draft=false --latest

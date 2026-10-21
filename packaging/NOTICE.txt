@@ -1,0 +1,12 @@
+Screen Mirroring - https://github.com/yanngc32/screen_mirroring
+Licensed under the MIT License (see LICENSE).
+
+This distribution includes FFmpeg libraries (libavcodec, libavutil, libswresample), licensed
+under the GNU Lesser General Public License v2.1 or later (see FFMPEG-LICENSE.txt). They are
+dynamically linked and can be replaced with compatible builds of your own. They come from the
+LGPL "shared" builds at https://github.com/BtbN/FFmpeg-Builds (release branch n8.1); the
+corresponding source code is available at https://git.ffmpeg.org/ffmpeg.git (branch
+release/8.1) and the build scripts at https://github.com/BtbN/FFmpeg-Builds.
+
+This distribution also includes OpenH264 (BSD 2-Clause, Cisco Systems), compiled from source.
+H.264 is covered by patents; see the project README.

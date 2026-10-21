@@ -52,6 +52,40 @@ project yet (no GPU in CI).
 | `crates/host` (`sm-host`) | Capture, color conversion and encoding, input injection, sessions |
 | `crates/client-core` | UI-independent client: connection, input API, decoding. Mobile apps will reuse it through FFI |
 | `crates/client` (`sm-client`) | Desktop client (winit + softbuffer) |
+| `crates/update` | Signed self-updates from GitHub Releases |
+| `crates/release` (`sm-release`) | Release tooling used by CI: signing key, packaging, manifest signing |
+
+## Installing
+
+Download `screen-mirroring-<version>-<target>.zip` for Windows or Linux (x86-64) from the
+[releases page](https://github.com/yanngc32/screen_mirroring/releases). Extract it to a
+directory **your user can write to**, so updates can be installed, for example
+`%LOCALAPPDATA%\ScreenMirroring` or `~/.local/share/screen-mirroring`. The archive contains
+both `sm-host` and `sm-client` and the FFmpeg libraries for hardware encoding.
+
+### Updates
+
+Release builds keep themselves up to date:
+
+- `sm-host run` checks one minute after start and then every 6 hours. When it finds a new
+  version, it installs it and restarts once nobody is connected and no pairing code is open.
+- `sm-client` checks in the background when it connects. The new version is used the next
+  time it starts.
+- `sm-host update` and `sm-client update` update immediately. Pass `--no-update` or set
+  `SM_NO_UPDATE=1` to turn background updates off. Builds made from source never update
+  themselves.
+
+Each release carries `manifest.json`, which lists every file with its SHA-256. The manifest is
+signed with an Ed25519 key that only the release workflow holds, and the public key is
+compiled into the binaries. Before installing anything, an update checks:
+
+- the manifest signature;
+- that the version is newer than the installed one (an old manifest can't be replayed);
+- each file's hash and size.
+
+Only files that changed are downloaded, so the FFmpeg libraries aren't fetched again unless
+they changed. Files are swapped in by renaming. If any step fails, the update is rolled back,
+and the previous files are removed on the next start.
 
 ## Building
 
@@ -170,6 +204,30 @@ secure desktop (UAC prompts, lock screen) needs the host to run as a service (pl
 5. Wayland capture (xdg-desktop-portal + PipeWire), multi-monitor selection, cursor shape sync,
    clipboard, audio, relative mouse mode for games, adaptive bitrate.
 6. Run as a Windows service and a systemd user service; installers.
+
+## Releasing (maintainers)
+
+One-time setup:
+
+```sh
+cargo run -p sm-release -- keygen --private-key-out signing-key.txt
+```
+
+1. Commit the printed public key as `crates/update/release-public-key.txt`.
+2. Add the contents of `signing-key.txt` as the repository secret `SM_SIGNING_KEY`
+   (Settings → Secrets and variables → Actions).
+3. Delete the local `signing-key.txt`, or keep it offline. Anyone with this key can push
+   updates to every installation.
+
+To publish a release, bump `version` in the workspace `Cargo.toml`, merge, then push a
+matching tag (`git tag v0.2.0 && git push origin v0.2.0`). The Release workflow then:
+
+1. builds Windows and Linux with FFmpeg (Linux on Ubuntu 22.04, for a low glibc requirement);
+2. smoke-tests the packaged binaries;
+3. signs the manifest;
+4. publishes the GitHub release.
+
+Pull requests that touch the release machinery run the same build as a dry run.
 
 ## License
 

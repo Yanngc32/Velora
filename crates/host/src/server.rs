@@ -36,6 +36,9 @@ const MAX_IN_FLIGHT: u32 = 16;
 /// If no ack arrives for this long, assume the counter is out of sync and resume sending.
 const ACK_STALL_RESET: Duration = Duration::from_secs(2);
 const STATS_INTERVAL: Duration = Duration::from_secs(5);
+const UPDATE_FIRST_CHECK: Duration = Duration::from_secs(60);
+const UPDATE_INTERVAL: Duration = Duration::from_secs(6 * 3600);
+const UPDATE_IDLE_POLL: Duration = Duration::from_secs(30);
 
 pub struct HostOptions {
     pub bind: SocketAddr,
@@ -58,13 +61,21 @@ struct Shared {
     active: Mutex<Option<quinn::Connection>>,
 }
 
-pub async fn run(options: HostOptions, state: StateDir, pairing: Option<(PairingCode, Duration)>) -> Result<()> {
+/// Runs until the endpoint fails, or until an update was installed and the host is idle;
+/// then returns `true` so the caller restarts into the new version.
+pub async fn run(
+    options: HostOptions,
+    state: StateDir,
+    pairing: Option<(PairingCode, Duration)>,
+    auto_update: bool,
+) -> Result<bool> {
     let identity = state.load_or_create_identity()?;
     let endpoint = quinn::Endpoint::server(tls::server_config(&identity)?, options.bind)
         .with_context(|| format!("binding {}", options.bind))?;
     tracing::info!(
-        "host '{}' listening on {} (fingerprint {})",
+        "host '{}' {} listening on {} (fingerprint {})",
         options.name,
+        sm_update::Version::current(),
         endpoint.local_addr()?,
         identity.fingerprint()
     );
@@ -77,16 +88,61 @@ pub async fn run(options: HostOptions, state: StateDir, pairing: Option<(Pairing
         active: Mutex::new(None),
     });
 
-    while let Some(incoming) = endpoint.accept().await {
-        let shared = shared.clone();
-        tokio::spawn(async move {
-            let remote = incoming.remote_address();
-            if let Err(e) = handle_connection(incoming, shared).await {
-                tracing::info!("connection from {remote} ended: {e:#}");
+    let updated = async {
+        if auto_update {
+            update_loop(&shared).await
+        } else {
+            std::future::pending().await
+        }
+    };
+    tokio::pin!(updated);
+
+    loop {
+        tokio::select! {
+            incoming = endpoint.accept() => {
+                let Some(incoming) = incoming else { return Ok(false) };
+                let shared = shared.clone();
+                tokio::spawn(async move {
+                    let remote = incoming.remote_address();
+                    if let Err(e) = handle_connection(incoming, shared).await {
+                        tracing::info!("connection from {remote} ended: {e:#}");
+                    }
+                });
             }
-        });
+            () = &mut updated => {
+                // Release the UDP port before the new version binds it.
+                endpoint.close(0u32.into(), b"host is updating");
+                endpoint.wait_idle().await;
+                return Ok(true);
+            }
+        }
     }
-    Ok(())
+}
+
+/// Periodically installs new releases; resolves once one is installed and nobody is using
+/// the host (no session, no open pairing window).
+async fn update_loop(shared: &Shared) {
+    let mut delay = UPDATE_FIRST_CHECK;
+    loop {
+        tokio::time::sleep(delay).await;
+        delay = UPDATE_INTERVAL;
+        match tokio::task::spawn_blocking(sm_update::update_now).await {
+            Ok(Ok(Some(version))) => {
+                tracing::info!("installed version {version}; restarting when idle");
+                break;
+            }
+            Ok(Ok(None)) => tracing::debug!("up to date"),
+            Ok(Err(e)) => tracing::warn!("update check failed: {e:#}"),
+            Err(e) => tracing::warn!("update task failed: {e}"),
+        }
+    }
+    loop {
+        let pairing_open = shared.pairing.lock().unwrap().as_ref().is_some_and(|p| p.expires > Instant::now());
+        if shared.active.lock().unwrap().is_none() && !pairing_open {
+            return;
+        }
+        tokio::time::sleep(UPDATE_IDLE_POLL).await;
+    }
 }
 
 async fn handle_connection(incoming: quinn::Incoming, shared: Arc<Shared>) -> Result<()> {

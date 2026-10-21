@@ -23,6 +23,9 @@ struct Cli {
     /// Directory for identity and paired devices (defaults to the OS config directory).
     #[arg(long, global = true)]
     config_dir: Option<PathBuf>,
+    /// Don't install updates in the background (release builds update themselves by default).
+    #[arg(long, global = true)]
+    no_update: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -54,6 +57,8 @@ enum Command {
     Clients,
     /// Remove a paired device by name or fingerprint.
     Revoke { device: String },
+    /// Install the latest release now (restart a running host to use it).
+    Update,
 }
 
 #[tokio::main]
@@ -71,8 +76,11 @@ async fn main() -> Result<()> {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
 
+    // Captured before an update renames the running file.
+    let exe = std::env::current_exe()?;
     let cli = Cli::parse();
     let state = StateDir::open(cli.config_dir, "host")?;
+    sm_update::cleanup_current_exe();
 
     match cli.command {
         Command::Run { bind, name, fps, bitrate, pair, encoder } => {
@@ -91,7 +99,17 @@ async fn main() -> Result<()> {
                 bitrate_kbps: bitrate.max(100),
                 encoder,
             };
-            server::run(options, state, pairing).await
+            if server::run(options, state, pairing, sm_update::auto_update_enabled(cli.no_update)).await? {
+                sm_update::restart(&exe);
+            }
+            Ok(())
+        }
+        Command::Update => {
+            match sm_update::update_now()? {
+                Some(v) => println!("Updated to {v}. Restart sm-host to use it."),
+                None => println!("Already up to date ({}).", sm_update::Version::current()),
+            }
+            Ok(())
         }
         Command::Clients => {
             let clients: Vec<AuthorizedClient> = state.load(StateDir::AUTHORIZED_CLIENTS)?;

@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 sm-protocol.workspace = true
 sm-client-core.workspace = true
+sm-update.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
