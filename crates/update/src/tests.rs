@@ -35,7 +35,7 @@ fn signed(manifest: &Manifest, key: &Ed25519KeyPair) -> (Vec<u8>, String) {
 }
 
 fn temp_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("sm-update-{name}-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("velora-update-{name}-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
     dir
@@ -55,8 +55,10 @@ fn versions() {
 #[test]
 fn manifest_signatures() {
     let (key, public) = keypair();
-    let manifest =
-        Manifest { version: "0.2.0".into(), targets: BTreeMap::from([(TARGET.into(), vec![entry("sm-host", b"x")])]) };
+    let manifest = Manifest {
+        version: "0.2.0".into(),
+        targets: BTreeMap::from([(TARGET.into(), vec![entry("velora-host", b"x")])]),
+    };
     let (bytes, sig) = signed(&manifest, &key);
     assert_eq!(verify_manifest(&bytes, &sig, &public).unwrap(), manifest);
 
@@ -147,10 +149,10 @@ fn updates_only_changed_files() {
     let (key, public) = keypair();
     let dir = temp_dir("install");
     fs::create_dir_all(dir.join("lib")).unwrap();
-    fs::write(dir.join("sm-host"), "host v1").unwrap();
+    fs::write(dir.join("velora-host"), "host v1").unwrap();
     fs::write(dir.join("lib/libav.so.1"), "same lib").unwrap();
 
-    let files = [("sm-host", &b"host v2"[..]), ("sm-client", b"client v2"), ("lib/libav.so.1", b"same lib")];
+    let files = [("velora-host", &b"host v2"[..]), ("velora", b"client v2"), ("lib/libav.so.1", b"same lib")];
     let entries: Vec<FileEntry> = files.iter().map(|(p, d)| entry(p, d)).collect();
     let manifest = Manifest { version: "0.9.0".into(), targets: BTreeMap::from([(TARGET.into(), entries.clone())]) };
     let (bytes, sig) = signed(&manifest, &key);
@@ -167,20 +169,20 @@ fn updates_only_changed_files() {
     let update = updater.check().unwrap().expect("newer version available");
     assert_eq!(update.version, Version(0, 9, 0));
     let paths: Vec<_> = update.files.iter().map(|f| f.path.as_str()).collect();
-    assert_eq!(paths, ["sm-host", "sm-client"], "unchanged files are skipped");
+    assert_eq!(paths, ["velora-host", "velora"], "unchanged files are skipped");
 
     updater.install(&update).unwrap();
-    assert_eq!(fs::read_to_string(dir.join("sm-host")).unwrap(), "host v2");
-    assert_eq!(fs::read_to_string(dir.join("sm-client")).unwrap(), "client v2");
-    assert_eq!(fs::read_to_string(dir.join("sm-host.old")).unwrap(), "host v1");
+    assert_eq!(fs::read_to_string(dir.join("velora-host")).unwrap(), "host v2");
+    assert_eq!(fs::read_to_string(dir.join("velora")).unwrap(), "client v2");
+    assert_eq!(fs::read_to_string(dir.join("velora-host.old")).unwrap(), "host v1");
     assert!(!log.lock().unwrap().iter().any(|p| p.ends_with("libav.so.1")));
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        assert_eq!(fs::metadata(dir.join("sm-client")).unwrap().permissions().mode() & 0o777, 0o755);
+        assert_eq!(fs::metadata(dir.join("velora")).unwrap().permissions().mode() & 0o777, 0o755);
     }
     cleanup(&dir);
-    assert!(!dir.join("sm-host.old").exists());
+    assert!(!dir.join("velora-host.old").exists());
 
     // Same version is not offered again; a newer local build ignores older releases.
     let current = Updater::new(base.clone(), public.clone(), TARGET.into(), dir.clone(), Version(0, 9, 0));
@@ -193,8 +195,8 @@ fn updates_only_changed_files() {
 fn corrupted_download_changes_nothing() {
     let (key, public) = keypair();
     let dir = temp_dir("corrupt");
-    fs::write(dir.join("sm-host"), "host v1").unwrap();
-    let e = entry("sm-host", b"host v2");
+    fs::write(dir.join("velora-host"), "host v1").unwrap();
+    let e = entry("velora-host", b"host v2");
     let manifest = Manifest { version: "0.9.0".into(), targets: BTreeMap::from([(TARGET.into(), vec![e.clone()])]) };
     let (bytes, sig) = signed(&manifest, &key);
     let (base, _) = serve(HashMap::from([
@@ -206,6 +208,6 @@ fn corrupted_download_changes_nothing() {
     let update = updater.check().unwrap().unwrap();
     let err = updater.install(&update).unwrap_err();
     assert!(format!("{err:#}").contains("does not match"), "{err:#}");
-    assert_eq!(fs::read_to_string(dir.join("sm-host")).unwrap(), "host v1");
-    assert!(!dir.join("sm-host.new").exists() && !dir.join(LOCK_FILE).exists());
+    assert_eq!(fs::read_to_string(dir.join("velora-host")).unwrap(), "host v1");
+    assert!(!dir.join("velora-host.new").exists() && !dir.join(LOCK_FILE).exists());
 }

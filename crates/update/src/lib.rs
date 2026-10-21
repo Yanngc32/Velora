@@ -30,19 +30,19 @@ pub const SIGNATURE: &str = "manifest.json.sig";
 
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 const MAX_FILE_BYTES: u64 = 512 * 1024 * 1024;
-const LOCK_FILE: &str = ".sm-update.lock";
+const LOCK_FILE: &str = ".velora-update.lock";
 const STALE_LOCK: Duration = Duration::from_secs(30 * 60);
 
 /// Release signing key (base64 Ed25519 public key). Can be overridden at build time with
-/// `SM_UPDATE_PUBLIC_KEY`, which tests use to sign with a throwaway key.
+/// `VELORA_UPDATE_PUBLIC_KEY`, which tests use to sign with a throwaway key.
 pub fn embedded_public_key() -> &'static str {
-    option_env!("SM_UPDATE_PUBLIC_KEY").unwrap_or(include_str!("../release-public-key.txt")).trim()
+    option_env!("VELORA_UPDATE_PUBLIC_KEY").unwrap_or(include_str!("../release-public-key.txt")).trim()
 }
 
-/// Official release builds set `SM_RELEASE_BUILD=1` at compile time. Source builds never update
+/// Official release builds set `VELORA_RELEASE_BUILD=1` at compile time. Source builds never update
 /// themselves, so a developer's binary is not silently replaced by a release.
 pub fn is_release_build() -> bool {
-    option_env!("SM_RELEASE_BUILD") == Some("1")
+    option_env!("VELORA_RELEASE_BUILD") == Some("1")
 }
 
 /// Release target of this binary, if releases are published for it.
@@ -166,12 +166,12 @@ pub struct Updater {
 }
 
 impl Updater {
-    /// Updater for the running binary, installed next to it. `SM_UPDATE_URL` points to a
+    /// Updater for the running binary, installed next to it. `VELORA_UPDATE_URL` points to a
     /// mirror of the releases (still verified with the embedded key).
     pub fn for_current_exe() -> Result<Self> {
         let exe = std::env::current_exe().context("locating the running executable")?;
         let install_dir = exe.parent().context("executable has no parent directory")?.to_path_buf();
-        let base_url = std::env::var("SM_UPDATE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_string());
+        let base_url = std::env::var("VELORA_UPDATE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_string());
         let target = target().context("no releases are published for this platform")?;
         Ok(Self::new(base_url, embedded_public_key().to_string(), target.to_string(), install_dir, Version::current()))
     }
@@ -179,7 +179,7 @@ impl Updater {
     pub fn new(base_url: String, public_key: String, target: String, install_dir: PathBuf, current: Version) -> Self {
         let agent = ureq::Agent::config_builder()
             .timeout_connect(Some(Duration::from_secs(15)))
-            .user_agent(format!("screen-mirroring/{current}"))
+            .user_agent(format!("velora/{current}"))
             // The OS trust store also covers corporate TLS-inspecting proxies.
             .tls_config(ureq::tls::TlsConfig::builder().root_certs(ureq::tls::RootCerts::PlatformVerifier).build())
             .build()
@@ -409,7 +409,7 @@ impl Drop for Lock {
 
 /// Whether this process should update itself in the background.
 pub fn auto_update_enabled(disabled_by_flag: bool) -> bool {
-    is_release_build() && !disabled_by_flag && std::env::var_os("SM_NO_UPDATE").is_none()
+    is_release_build() && !disabled_by_flag && std::env::var_os("VELORA_NO_UPDATE").is_none()
 }
 
 /// Checks for and installs the latest release next to the running executable.

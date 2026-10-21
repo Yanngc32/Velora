@@ -68,11 +68,11 @@ jobs:
 
       - name: Build
         env:
-          SM_RELEASE_BUILD: "1"
+          VELORA_RELEASE_BUILD: "1"
           # Linux: find the bundled FFmpeg in ./lib next to the binaries. DT_RPATH (not RUNPATH)
           # also applies to the libraries' own dependencies (libavcodec -> libswresample).
           RUSTFLAGS: ${{ runner.os == 'Linux' && '-C link-arg=-Wl,--disable-new-dtags,-rpath,$ORIGIN/lib' || '' }}
-        run: cargo build --release --locked -p sm-host -p sm-client --features sm-host/ffmpeg
+        run: cargo build --release --locked -p velora-host -p velora --features velora-host/ffmpeg
 
       - name: Stage install directory
         run: |
@@ -80,10 +80,10 @@ jobs:
           cp LICENSE packaging/NOTICE.txt stage/
           cp "$FFMPEG_DIR/LICENSE.txt" stage/FFMPEG-LICENSE.txt
           if [ "$RUNNER_OS" = Windows ]; then
-            cp target/release/sm-host.exe target/release/sm-client.exe stage/
+            cp target/release/velora-host.exe target/release/velora.exe stage/
             for lib in avcodec avutil swresample; do cp "$FFMPEG_DIR"/bin/$lib-*.dll stage/; done
           else
-            cp target/release/sm-host target/release/sm-client stage/
+            cp target/release/velora-host target/release/velora stage/
             mkdir -p stage/lib
             # Copy each library once, under its SONAME (e.g. libavcodec.so.62).
             for f in "$FFMPEG_DIR"/lib/lib{avcodec,avutil,swresample}.so.*; do
@@ -96,11 +96,11 @@ jobs:
 
       - name: Smoke test (binaries start with the bundled libraries)
         run: |
-          ./stage/sm-host --version
-          ./stage/sm-client --version
+          ./stage/velora-host --version
+          ./stage/velora --version
 
       - name: Package
-        run: cargo run --release --locked -p sm-release -- package --target ${{ matrix.target }} --root stage --dist dist
+        run: cargo run --release --locked -p velora-release -- package --target ${{ matrix.target }} --root stage --dist dist
 
       - uses: actions/upload-artifact@v4
         with:
@@ -125,15 +125,15 @@ jobs:
       - name: Dry run (unsigned manifest)
         if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
         run: |
-          cargo run --release --locked -p sm-release -- manifest --dist dist --unsigned
+          cargo run --release --locked -p velora-release -- manifest --dist dist --unsigned
           cat dist/manifest.json
           ls -l dist
 
       - name: Sign manifest
         if: startsWith(github.ref, 'refs/tags/v')
         env:
-          SM_SIGNING_KEY: ${{ secrets.SM_SIGNING_KEY }}
-        run: cargo run --release --locked -p sm-release -- manifest --dist dist
+          VELORA_SIGNING_KEY: ${{ secrets.VELORA_SIGNING_KEY }}
+        run: cargo run --release --locked -p velora-release -- manifest --dist dist
 
       # Draft first so installed copies never see a manifest before all its files exist.
       - name: Publish release

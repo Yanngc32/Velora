@@ -1,4 +1,4 @@
-package io.github.yanngc32.screenmirroring
+package io.github.yanngc32.velora
 
 import android.app.Activity
 import android.content.Context
@@ -25,12 +25,12 @@ import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
-import uniffi.sm_mobile.Session
-import uniffi.sm_mobile.SessionListener
-import uniffi.sm_mobile.VideoFrame
+import uniffi.velora_mobile.Session
+import uniffi.velora_mobile.SessionListener
+import uniffi.velora_mobile.VideoFrame
 import kotlin.concurrent.thread
 import kotlin.math.min
-import uniffi.sm_mobile.Button as RemoteButton
+import uniffi.velora_mobile.Button as RemoteButton
 
 /** Full-screen remote session: video, trackpad, keyboard. */
 class SessionActivity : Activity(), SessionListener, SurfaceHolder.Callback, VideoDecoder.Callbacks {
@@ -77,7 +77,11 @@ class SessionActivity : Activity(), SessionListener, SurfaceHolder.Callback, Vid
     /** Full screen; system bars come back with a swipe from the edge. */
     private fun immersive() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            window.setDecorFitsSystemWindows(false)
+            // Android 15+ is edge-to-edge for apps targeting it; earlier versions need asking.
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.VANILLA_ICE_CREAM) {
+                @Suppress("DEPRECATION")
+                window.setDecorFitsSystemWindows(false)
+            }
             window.insetsController?.apply {
                 hide(WindowInsets.Type.systemBars())
                 systemBarsBehavior = WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
@@ -91,7 +95,7 @@ class SessionActivity : Activity(), SessionListener, SurfaceHolder.Callback, Vid
     }
 
     private fun buildLayout() {
-        val root = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
+        val root = FrameLayout(this).apply { setBackgroundColor(getColor(R.color.velora_ink)) }
         videoArea = FrameLayout(this)
         surfaceView = SurfaceView(this).also { it.holder.addCallback(this) }
         cursorView = CursorView(this)
@@ -122,7 +126,7 @@ class SessionActivity : Activity(), SessionListener, SurfaceHolder.Callback, Vid
     private fun toolbar(): View {
         val bar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            setBackgroundColor(0xFF202020.toInt())
+            setBackgroundColor(TOOLBAR_COLOR)
         }
         fun add(label: String, onClick: (Button) -> Unit) {
             val b = Button(this, null, android.R.attr.borderlessButtonStyle).apply {
@@ -347,7 +351,8 @@ class SessionActivity : Activity(), SessionListener, SurfaceHolder.Callback, Vid
 
     companion object {
         private const val TAG = "SessionActivity"
-        private const val LATCHED_COLOR = 0xFF4FC3F7.toInt()
+        private const val TOOLBAR_COLOR = 0xFF16141F.toInt()
+        private const val LATCHED_COLOR = 0xFF4EE1C3.toInt() // Velora teal
         private const val EXTRA_HOST = "host"
         private const val EXTRA_ADDRESS = "address"
         private const val EXTRA_CODE = "code"

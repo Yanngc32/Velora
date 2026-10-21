@@ -1,4 +1,4 @@
-package io.github.yanngc32.screenmirroring
+package io.github.yanngc32.velora
 
 import kotlin.math.abs
 import kotlin.math.hypot

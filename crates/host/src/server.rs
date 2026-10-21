@@ -16,13 +16,13 @@ use std::{
 };
 
 use anyhow::{bail, Context, Result};
-use sm_protocol::{
+use tokio::sync::{mpsc, oneshot};
+use velora_protocol::{
     identity::{AuthorizedClient, StateDir},
     pairing::PairingCode,
     tls::{self, Fingerprint},
     wire::{self, ClientMsg, Codec, FrameHeader, HostMsg, MouseMove, PROTOCOL_VERSION},
 };
-use tokio::sync::{mpsc, oneshot};
 
 use crate::{
     capture::{self, DisplayRect},
@@ -75,7 +75,7 @@ pub async fn run(
     tracing::info!(
         "host '{}' {} listening on {} (fingerprint {})",
         options.name,
-        sm_update::Version::current(),
+        velora_update::Version::current(),
         endpoint.local_addr()?,
         identity.fingerprint()
     );
@@ -126,7 +126,7 @@ async fn update_loop(shared: &Shared) {
     loop {
         tokio::time::sleep(delay).await;
         delay = UPDATE_INTERVAL;
-        match tokio::task::spawn_blocking(sm_update::update_now).await {
+        match tokio::task::spawn_blocking(velora_update::update_now).await {
             Ok(Ok(Some(version))) => {
                 tracing::info!("installed version {version}; restarting when idle");
                 break;
@@ -209,7 +209,7 @@ fn authorize(
     secret: Option<[u8; wire::PAIRING_SECRET_LEN]>,
 ) -> Result<Auth> {
     let fp = fingerprint.to_base64();
-    // Re-read on every connection so `sm-host revoke` applies without a restart.
+    // Re-read on every connection so `velora-host revoke` applies without a restart.
     let mut clients: Vec<AuthorizedClient> = shared.state.load(StateDir::AUTHORIZED_CLIENTS)?;
     if clients.iter().any(|c| c.fingerprint == fp) {
         return Ok(Auth::Known);

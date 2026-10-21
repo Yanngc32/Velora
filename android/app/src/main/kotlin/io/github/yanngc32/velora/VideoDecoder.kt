@@ -1,11 +1,11 @@
-package io.github.yanngc32.screenmirroring
+package io.github.yanngc32.velora
 
 import android.media.MediaCodec
 import android.media.MediaFormat
 import android.os.Build
 import android.util.Log
 import android.view.Surface
-import uniffi.sm_mobile.VideoFrame
+import uniffi.velora_mobile.VideoFrame
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 

@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish = false
-description = "Generates the Kotlin/Swift bindings for sm-mobile."
+description = "Generates the Kotlin/Swift bindings for velora-mobile."
 
 [dependencies]
 uniffi = { workspace = true, features = ["cli", "cargo-metadata"] }

@@ -1,9 +1,9 @@
-package io.github.yanngc32.screenmirroring
+package io.github.yanngc32.velora
 
 import android.app.Application
 import android.content.Context
 import android.os.Build
-import uniffi.sm_mobile.Client
+import uniffi.velora_mobile.Client
 
 class App : Application() {
     /** Identity and paired hosts live in the app's private storage. */

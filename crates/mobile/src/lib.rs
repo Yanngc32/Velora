@@ -7,8 +7,8 @@
 
 use std::sync::{Arc, Mutex, OnceLock};
 
-use sm_client_core::{hosts, EncodedFrame, VideoOutput};
-use sm_protocol::{
+use velora_client_core::{hosts, EncodedFrame, VideoOutput};
+use velora_protocol::{
     identity::StateDir,
     wire::{KeyState, MouseButton as WireButton},
 };
@@ -35,7 +35,7 @@ fn runtime() -> &'static tokio::runtime::Runtime {
     RUNTIME.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
-            .thread_name("sm-net")
+            .thread_name("velora-net")
             .enable_all()
             .build()
             .expect("starting the network runtime")
@@ -48,7 +48,7 @@ fn init_logging() {
         static INIT: std::sync::Once = std::sync::Once::new();
         INIT.call_once(|| {
             use tracing_subscriber::layer::SubscriberExt;
-            let subscriber = tracing_subscriber::registry().with(paranoid_android::layer("ScreenMirroring"));
+            let subscriber = tracing_subscriber::registry().with(paranoid_android::layer("Velora"));
             let _ = tracing::subscriber::set_global_default(subscriber);
         });
     }
@@ -107,7 +107,7 @@ impl Client {
         Ok(hosts::forget(&self.state, &name)?)
     }
 
-    /// Pairs with the code printed by `sm-host run --pair`. Blocking.
+    /// Pairs with the code printed by `velora-host run --pair`. Blocking.
     pub fn pair(&self, address: String, code: String) -> Result<Arc<Session>> {
         let gate = Arc::new(Gate::default());
         let output = gate.output();
@@ -170,7 +170,7 @@ impl Gate {
 /// An active connection. Input methods are cheap and non-blocking.
 #[derive(uniffi::Object)]
 pub struct Session {
-    inner: Arc<sm_client_core::Session>,
+    inner: Arc<velora_client_core::Session>,
     gate: Arc<Gate>,
 }
 

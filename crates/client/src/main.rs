@@ -14,8 +14,8 @@ use std::{
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use sm_client_core::{hosts, FrameSlot, InputSender, Session, VideoFrame, VideoOutput};
-use sm_protocol::{
+use velora_client_core::{hosts, FrameSlot, InputSender, Session, VideoFrame, VideoOutput};
+use velora_protocol::{
     identity::StateDir,
     wire::{KeyState, MouseButton},
 };
@@ -29,7 +29,7 @@ use winit::{
 };
 
 #[derive(Parser)]
-#[command(name = "sm-client", version, about = "Control a remote computer running sm-host")]
+#[command(name = "velora", version, about = "Control a remote computer running velora-host")]
 struct Cli {
     /// Directory for identity and known hosts (defaults to the OS config directory).
     #[arg(long, global = true)]
@@ -43,7 +43,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Pair with a host using the code printed by `sm-host run --pair`, then connect.
+    /// Pair with a host using the code printed by `velora-host run --pair`, then connect.
     Pair {
         /// Host address, `ip[:port]` or `hostname[:port]`.
         address: String,
@@ -75,13 +75,13 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let state = StateDir::open(cli.config_dir, "client")?;
     let runtime = tokio::runtime::Runtime::new()?;
-    sm_update::cleanup_current_exe();
+    velora_update::cleanup_current_exe();
     if matches!(cli.command, Command::Pair { .. } | Command::Connect { .. })
-        && sm_update::auto_update_enabled(cli.no_update)
+        && velora_update::auto_update_enabled(cli.no_update)
     {
         // A session runs for a long time: update in the background, effective next start.
-        std::thread::spawn(|| match sm_update::update_now() {
-            Ok(Some(v)) => eprintln!("Updated to {v}; it takes effect the next time sm-client starts."),
+        std::thread::spawn(|| match velora_update::update_now() {
+            Ok(Some(v)) => eprintln!("Updated to {v}; it takes effect the next time velora starts."),
             Ok(None) => {}
             Err(e) => tracing::warn!("update check failed: {e:#}"),
         });
@@ -89,16 +89,16 @@ fn main() -> Result<()> {
 
     match cli.command {
         Command::Update => {
-            match sm_update::update_now()? {
+            match velora_update::update_now()? {
                 Some(v) => println!("Updated to {v}."),
-                None => println!("Already up to date ({}).", sm_update::Version::current()),
+                None => println!("Already up to date ({}).", velora_update::Version::current()),
             }
             Ok(())
         }
         Command::List => {
             let hosts = hosts::list(&state)?;
             if hosts.is_empty() {
-                println!("No paired hosts. Use `sm-client pair <address> <code>`.");
+                println!("No paired hosts. Use `velora pair <address> <code>`.");
             }
             for h in hosts {
                 println!("{:<24} {}", h.name, h.address);
@@ -111,7 +111,7 @@ fn main() -> Result<()> {
             let output = VideoOutput::Decoded { slot: slot.clone(), on_frame: redraw_callback(proxy) };
             let name = name.unwrap_or_else(device_name);
             let session = runtime.block_on(hosts::pair(&state, &address, &code, &name, output))?;
-            println!("Paired with '{}'. Next time: sm-client connect {}", session.host_name, session.host_name);
+            println!("Paired with '{}'. Next time: velora connect {}", session.host_name, session.host_name);
             run_window(&runtime, event_loop, session, slot)
         }
         Command::Connect { host } => {
@@ -184,7 +184,7 @@ fn run_window(
     let mut app = App {
         input: session.input.clone(),
         frames,
-        title: format!("{} — Screen Mirroring", session.host_name),
+        title: format!("{} — Velora", session.host_name),
         remote_size: (session.width as u32, session.height as u32),
         session,
         window: None,

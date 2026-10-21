@@ -7,7 +7,7 @@
 use std::{collections::HashSet, sync::mpsc};
 
 use anyhow::Result;
-use sm_protocol::wire::{KeyState, MouseButton};
+use velora_protocol::wire::{KeyState, MouseButton};
 
 use crate::capture::DisplayRect;
 

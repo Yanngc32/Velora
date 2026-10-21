@@ -17,7 +17,7 @@ val cargoBuild by tasks.registering(Exec::class) {
     val out = rustLibs.get().asFile
     commandLine(
         listOf("cargo", "ndk") + abis.flatMap { listOf("-t", it) } +
-            listOf("--platform", "26", "-o", out.absolutePath, "build", "--release", "--locked", "-p", "sm-mobile"),
+            listOf("--platform", "26", "-o", out.absolutePath, "build", "--release", "--locked", "-p", "velora-mobile"),
     )
     inputs.files(fileTree(repoRoot.resolve("crates")) { include("**/*.rs", "**/Cargo.toml") })
     inputs.file(repoRoot.resolve("Cargo.lock"))
@@ -31,7 +31,7 @@ val uniffiBindings by tasks.registering(Exec::class) {
     val out = uniffiKotlin.get().asFile
     commandLine(
         "cargo", "run", "--locked", "-p", "uniffi-bindgen", "--", "generate",
-        "--library", rustLibs.get().asFile.resolve("arm64-v8a/libsm_mobile.so").absolutePath,
+        "--library", rustLibs.get().asFile.resolve("arm64-v8a/libvelora_mobile.so").absolutePath,
         "--language", "kotlin", "--no-format", "--out-dir", out.absolutePath,
     )
     inputs.files(cargoBuild)
@@ -39,11 +39,11 @@ val uniffiBindings by tasks.registering(Exec::class) {
 }
 
 android {
-    namespace = "io.github.yanngc32.screenmirroring"
+    namespace = "io.github.yanngc32.velora"
     compileSdk = 35
 
     defaultConfig {
-        applicationId = "io.github.yanngc32.screenmirroring"
+        applicationId = "io.github.yanngc32.velora"
         minSdk = 26
         targetSdk = 35
         versionCode = 1

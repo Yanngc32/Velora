@@ -1,4 +1,4 @@
-Screen Mirroring - https://github.com/yanngc32/screen_mirroring
+Velora - https://github.com/yanngc32/screen_mirroring
 Licensed under the MIT License (see LICENSE).
 
 This distribution includes FFmpeg libraries (libavcodec, libavutil, libswresample), licensed

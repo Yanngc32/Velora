@@ -63,7 +63,7 @@ impl StateDir {
     pub fn open(base: Option<PathBuf>, role: &str) -> Result<Self> {
         let base = match base {
             Some(b) => b,
-            None => directories::ProjectDirs::from("", "", "screen-mirroring")
+            None => directories::ProjectDirs::from("", "", "velora")
                 .context("could not determine the config directory")?
                 .config_dir()
                 .to_path_buf(),

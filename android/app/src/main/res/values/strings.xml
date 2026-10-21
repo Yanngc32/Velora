@@ -1,19 +1,20 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">Screen Mirroring</string>
-    <string name="no_hosts">No computers paired yet. On the computer, run `sm-host run --pair` and scan the QR code it shows.</string>
+    <string name="app_name">Velora</string>
+    <string name="tagline" translatable="false">Your screen. Anywhere.</string>
+    <string name="no_hosts">No computers paired yet. On the computer, run `velora-host run --pair` and scan the QR code it shows.</string>
     <string name="scan_qr">Scan QR code</string>
     <string name="enter_code">Enter code</string>
     <string name="pair_title">Pair a computer</string>
-    <string name="pair_hint">Address and code printed by `sm-host run --pair`.</string>
+    <string name="pair_hint">Address and code printed by `velora-host run --pair`.</string>
     <string name="address">Address (IP:port)</string>
-    <string name="code">Pairing code (SM1-…)</string>
+    <string name="code">Pairing code (VL1-…)</string>
     <string name="pair">Pair</string>
     <string name="cancel">Cancel</string>
     <string name="forget">Forget</string>
     <string name="forget_title">Forget %1$s?</string>
     <string name="connecting">Connecting…</string>
     <string name="disconnected">Disconnected: %1$s</string>
-    <string name="not_a_pairing_code">That QR code is not a Screen Mirroring pairing code.</string>
+    <string name="not_a_pairing_code">That QR code is not a Velora pairing code.</string>
     <string name="scanner_unavailable">The QR scanner is unavailable on this device; enter the code instead.</string>
 </resources>

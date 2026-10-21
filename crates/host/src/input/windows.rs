@@ -7,7 +7,7 @@
 use std::mem::size_of;
 
 use anyhow::{bail, Result};
-use sm_protocol::wire::{KeyState, MouseButton};
+use velora_protocol::wire::{KeyState, MouseButton};
 use windows::Win32::UI::{
     Input::KeyboardAndMouse::{
         SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY,

@@ -13,10 +13,10 @@ use anyhow::{bail, ensure, Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use clap::{Parser, Subcommand};
 use ring::signature::{Ed25519KeyPair, KeyPair};
-use sm_update::{FileEntry, Manifest, Version, MANIFEST, SIGNATURE};
+use velora_update::{FileEntry, Manifest, Version, MANIFEST, SIGNATURE};
 
 #[derive(Parser)]
-#[command(name = "sm-release")]
+#[command(name = "velora-release")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -25,7 +25,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Create the release signing key. Keep the private key secret (CI secret
-    /// `SM_SIGNING_KEY`); commit the printed public key to crates/update/release-public-key.txt.
+    /// `VELORA_SIGNING_KEY`); commit the printed public key to crates/update/release-public-key.txt.
     Keygen {
         #[arg(long)]
         private_key_out: PathBuf,
@@ -40,7 +40,7 @@ enum Command {
         #[arg(long)]
         dist: PathBuf,
     },
-    /// Merge packaged targets into manifest.json and sign it with `SM_SIGNING_KEY`.
+    /// Merge packaged targets into manifest.json and sign it with `VELORA_SIGNING_KEY`.
     Manifest {
         #[arg(long)]
         dist: PathBuf,
@@ -71,7 +71,7 @@ fn keygen(out: &Path) -> Result<()> {
         opts.mode(0o600);
     }
     opts.open(out)?.write_all(B64.encode(pkcs8.as_ref()).as_bytes())?;
-    println!("Private key written to {} (store it as the SM_SIGNING_KEY secret).", out.display());
+    println!("Private key written to {} (store it as the VELORA_SIGNING_KEY secret).", out.display());
     println!("Public key (commit to crates/update/release-public-key.txt):");
     println!("{}", B64.encode(pair.public_key().as_ref()));
     Ok(())
@@ -113,7 +113,7 @@ fn package(target: &str, root: &Path, dist: &Path) -> Result<()> {
     let files = walk(root)?;
     ensure!(!files.is_empty(), "{} is empty", root.display());
 
-    let zip_name = format!("screen-mirroring-{}-{target}.zip", Version::current());
+    let zip_name = format!("velora-{}-{target}.zip", Version::current());
     let mut zip = zip::ZipWriter::new(fs::File::create(dist.join(&zip_name))?);
     let mut entries = Vec::new();
     for rel in &files {
@@ -126,13 +126,13 @@ fn package(target: &str, root: &Path, dist: &Path) -> Result<()> {
         let options = zip::write::SimpleFileOptions::default()
             .compression_method(zip::CompressionMethod::Deflated)
             .unix_permissions(if executable { 0o755 } else { 0o644 });
-        zip.start_file(format!("screen-mirroring/{rel}"), options)?;
+        zip.start_file(format!("velora/{rel}"), options)?;
         zip.write_all(&data)?;
 
         entries.push(FileEntry {
             path: rel.clone(),
             asset,
-            sha256: sm_update::sha256_hex(&data),
+            sha256: velora_update::sha256_hex(&data),
             size: data.len() as u64,
             executable,
         });
@@ -163,17 +163,17 @@ fn manifest(dist: &Path, unsigned: bool) -> Result<()> {
         return Ok(());
     }
 
-    let key = std::env::var("SM_SIGNING_KEY").context("SM_SIGNING_KEY is not set")?;
-    let pkcs8 = B64.decode(key.trim()).context("SM_SIGNING_KEY is not base64")?;
+    let key = std::env::var("VELORA_SIGNING_KEY").context("VELORA_SIGNING_KEY is not set")?;
+    let pkcs8 = B64.decode(key.trim()).context("VELORA_SIGNING_KEY is not base64")?;
     let pair =
-        Ed25519KeyPair::from_pkcs8(&pkcs8).map_err(|_| anyhow::anyhow!("SM_SIGNING_KEY is not an Ed25519 key"))?;
+        Ed25519KeyPair::from_pkcs8(&pkcs8).map_err(|_| anyhow::anyhow!("VELORA_SIGNING_KEY is not an Ed25519 key"))?;
     let signature = B64.encode(pair.sign(&bytes).as_ref());
     // Refuse to publish what the shipped binaries would reject.
-    let public = sm_update::embedded_public_key();
+    let public = velora_update::embedded_public_key();
     if public.is_empty() {
-        bail!("crates/update/release-public-key.txt is empty; run `sm-release keygen` and commit the public key");
+        bail!("crates/update/release-public-key.txt is empty; run `velora-release keygen` and commit the public key");
     }
-    sm_update::verify_manifest(&bytes, &signature, public)
+    velora_update::verify_manifest(&bytes, &signature, public)
         .context("the signing key does not match crates/update/release-public-key.txt")?;
     fs::write(dist.join(SIGNATURE), signature)?;
     println!("wrote signed {MANIFEST} for version {}", manifest.version);

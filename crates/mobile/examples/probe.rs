@@ -7,7 +7,7 @@ use std::{
     time::Duration,
 };
 
-use sm_mobile::{Client, Session, SessionListener, VideoFrame};
+use velora_mobile::{Client, Session, SessionListener, VideoFrame};
 
 struct Probe {
     session: OnceLock<Arc<Session>>,

@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 
-use sm_protocol::wire::FrameHeader;
+use velora_protocol::wire::FrameHeader;
 
 /// Frames buffered while waiting for a missing earlier frame before giving up on it.
 const MAX_REORDER: usize = 64;

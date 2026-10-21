@@ -35,8 +35,8 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy -p sm-host --all-targets --features ffmpeg -- -D warnings
-      - run: cargo test -p sm-host --features ffmpeg
+      - run: cargo clippy -p velora-host --all-targets --features ffmpeg -- -D warnings
+      - run: cargo test -p velora-host --features ffmpeg
 
   msrv:
     runs-on: ubuntu-latest

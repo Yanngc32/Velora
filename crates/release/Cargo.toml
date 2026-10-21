@@ -1,5 +1,5 @@
 [package]
-name = "sm-release"
+name = "velora-release"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,7 +8,7 @@ publish = false
 description = "Release tooling: signing key generation, packaging and manifest signing (used by CI)."
 
 [dependencies]
-sm-update.workspace = true
+velora-update.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 ring.workspace = true

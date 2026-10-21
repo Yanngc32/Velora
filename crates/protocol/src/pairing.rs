@@ -10,9 +10,9 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64, Engine};
 
 use crate::{tls::Fingerprint, wire::PAIRING_SECRET_LEN};
 
-const PREFIX: &str = "SM1-";
+const PREFIX: &str = "VL1-";
 /// Scheme of the pairing link shown as a QR code; apps register it to fill in address and code.
-pub const URI_PREFIX: &str = "screenmirroring://pair?";
+pub const URI_PREFIX: &str = "velora://pair?";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PairingCode {
@@ -36,7 +36,7 @@ impl PairingCode {
     }
 
     pub fn parse(code: &str) -> Result<Self> {
-        let body = code.trim().strip_prefix(PREFIX).context("pairing code must start with SM1-")?;
+        let body = code.trim().strip_prefix(PREFIX).context("pairing code must start with VL1-")?;
         let raw = B64.decode(body).context("malformed pairing code")?;
         if raw.len() != 32 + PAIRING_SECRET_LEN {
             bail!("pairing code has the wrong length");
@@ -50,7 +50,7 @@ impl PairingCode {
     }
 }
 
-/// Link carrying everything a device needs to pair: `screenmirroring://pair?address=..&code=..`.
+/// Link carrying everything a device needs to pair: `velora://pair?address=..&code=..`.
 pub fn pairing_uri(address: &str, code: &PairingCode) -> String {
     fn encode(s: &str) -> String {
         s.bytes()
@@ -79,14 +79,14 @@ mod tests {
     fn pairing_link() {
         let code = PairingCode { host: Fingerprint([0; 32]), secret: [0; PAIRING_SECRET_LEN] };
         let uri = pairing_uri("[fe80::1]:7420", &code);
-        assert!(uri.starts_with("screenmirroring://pair?address=%5Bfe80%3A%3A1%5D%3A7420&code=SM1-AAAA"), "{uri}");
+        assert!(uri.starts_with("velora://pair?address=%5Bfe80%3A%3A1%5D%3A7420&code=VL1-AAAA"), "{uri}");
     }
 
     #[test]
     fn rejects_bad_codes() {
         assert!(PairingCode::parse("XX1-abc").is_err());
-        assert!(PairingCode::parse("SM1-abc").is_err());
-        assert!(PairingCode::parse("SM1-!!!!").is_err());
+        assert!(PairingCode::parse("VL1-abc").is_err());
+        assert!(PairingCode::parse("VL1-!!!!").is_err());
     }
 
     #[test]

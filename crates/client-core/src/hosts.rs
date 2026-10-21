@@ -3,7 +3,7 @@
 use std::net::{IpAddr, SocketAddr};
 
 use anyhow::{Context, Result};
-use sm_protocol::{
+use velora_protocol::{
     identity::{KnownHost, StateDir},
     pairing::PairingCode,
     tls::Fingerprint,

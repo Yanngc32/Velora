@@ -12,5 +12,5 @@ dependencyResolutionManagement {
         mavenCentral()
     }
 }
-rootProject.name = "ScreenMirroring"
+rootProject.name = "Velora"
 include(":app")

@@ -1,4 +1,4 @@
-package io.github.yanngc32.screenmirroring
+package io.github.yanngc32.velora
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
@@ -68,8 +68,8 @@ class TrackpadTest {
         pad.down(100f, 300f); pad.secondFingerDown(150f, 300f)
         pad.reanchor(100f, 300f) // second finger lifted: centroid is back on the first finger
         now += 16; pad.move(100f, 300f)
-        now += 16; pad.up()
-        assertTrue(events.isEmpty())
+        now += 300; pad.up() // held too long to count as a two-finger tap
+        assertTrue("no scroll from the centroid jump", events.isEmpty())
     }
 
     @Test

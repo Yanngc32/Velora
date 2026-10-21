@@ -12,7 +12,7 @@
 use anyhow::{bail, ensure, Context, Result};
 
 pub const PROTOCOL_VERSION: u16 = 1;
-pub const ALPN: &[u8] = b"sm/1";
+pub const ALPN: &[u8] = b"velora/1";
 pub const DEFAULT_PORT: u16 = 7420;
 
 /// Upper bound for a single control message, enforced before allocation.

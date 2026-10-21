@@ -8,7 +8,7 @@ use std::{net::SocketAddr, path::PathBuf, time::Duration};
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 use encode::EncoderChoice;
-use sm_protocol::{
+use velora_protocol::{
     identity::{AuthorizedClient, StateDir},
     pairing::PairingCode,
     tls::Fingerprint,
@@ -18,7 +18,7 @@ use sm_protocol::{
 const PAIRING_TTL: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Parser)]
-#[command(name = "sm-host", version, about = "Share this computer's screen and accept remote input")]
+#[command(name = "velora-host", version, about = "Share this computer's screen and accept remote input")]
 struct Cli {
     /// Directory for identity and paired devices (defaults to the OS config directory).
     #[arg(long, global = true)]
@@ -80,7 +80,7 @@ async fn main() -> Result<()> {
     let exe = std::env::current_exe()?;
     let cli = Cli::parse();
     let state = StateDir::open(cli.config_dir, "host")?;
-    sm_update::cleanup_current_exe();
+    velora_update::cleanup_current_exe();
 
     match cli.command {
         Command::Run { bind, name, fps, bitrate, pair, encoder } => {
@@ -99,22 +99,22 @@ async fn main() -> Result<()> {
                 bitrate_kbps: bitrate.max(100),
                 encoder,
             };
-            if server::run(options, state, pairing, sm_update::auto_update_enabled(cli.no_update)).await? {
-                sm_update::restart(&exe);
+            if server::run(options, state, pairing, velora_update::auto_update_enabled(cli.no_update)).await? {
+                velora_update::restart(&exe);
             }
             Ok(())
         }
         Command::Update => {
-            match sm_update::update_now()? {
-                Some(v) => println!("Updated to {v}. Restart sm-host to use it."),
-                None => println!("Already up to date ({}).", sm_update::Version::current()),
+            match velora_update::update_now()? {
+                Some(v) => println!("Updated to {v}. Restart velora-host to use it."),
+                None => println!("Already up to date ({}).", velora_update::Version::current()),
             }
             Ok(())
         }
         Command::Clients => {
             let clients: Vec<AuthorizedClient> = state.load(StateDir::AUTHORIZED_CLIENTS)?;
             if clients.is_empty() {
-                println!("No paired devices. Run `sm-host run --pair` to add one.");
+                println!("No paired devices. Run `velora-host run --pair` to add one.");
             }
             for c in clients {
                 let fp = Fingerprint::from_base64(&c.fingerprint).map(|f| f.short()).unwrap_or(c.fingerprint);
@@ -146,8 +146,8 @@ fn print_pairing(code: &PairingCode, port: u16) {
     println!();
     println!("    {}", code.encode());
     println!();
-    println!("On a phone, scan this with the Screen Mirroring app:");
-    let link = sm_protocol::pairing::pairing_uri(&addr, code);
+    println!("On a phone, scan this with the Velora app:");
+    let link = velora_protocol::pairing::pairing_uri(&addr, code);
     match qrcode::QrCode::new(link.as_bytes()) {
         // Light modules drawn as blocks: reads correctly on the usual dark terminal background.
         Ok(qr) => println!(
@@ -160,7 +160,7 @@ fn print_pairing(code: &PairingCode, port: u16) {
         Err(e) => println!("    (cannot render QR code: {e})"),
     }
     println!("On a computer run:");
-    println!("    sm-client pair {addr} {}", code.encode());
+    println!("    velora pair {addr} {}", code.encode());
     println!();
     println!("Host fingerprint: {}", code.host.short());
     println!();

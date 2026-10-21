@@ -9,7 +9,7 @@ use evdev::{
     uinput::VirtualDevice, AbsInfo, AbsoluteAxisCode, AttributeSet, EventType, InputEvent, KeyCode, RelativeAxisCode,
     UinputAbsSetup,
 };
-use sm_protocol::wire::{KeyState, MouseButton};
+use velora_protocol::wire::{KeyState, MouseButton};
 
 use super::{x11_keymap::Keymap, Backend};
 
@@ -31,7 +31,7 @@ impl Uinput {
         }
         let keyboard = VirtualDevice::builder()
             .context("cannot open /dev/uinput")?
-            .name("Screen Mirroring Keyboard")
+            .name("Velora Keyboard")
             .with_keys(&keys)?
             .build()?;
 
@@ -50,7 +50,7 @@ impl Uinput {
         }
         let axis = |code| UinputAbsSetup::new(code, AbsInfo::new(0, 0, u16::MAX as i32, 0, 0, 0));
         let pointer = VirtualDevice::builder()?
-            .name("Screen Mirroring Pointer")
+            .name("Velora Pointer")
             .with_keys(&buttons)?
             .with_relative_axes(&wheels)?
             .with_absolute_axis(&axis(AbsoluteAxisCode::ABS_X))?

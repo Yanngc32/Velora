@@ -1,4 +1,4 @@
-package io.github.yanngc32.screenmirroring
+package io.github.yanngc32.velora
 
 import android.os.Bundle
 import android.widget.Toast
@@ -6,7 +6,6 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.combinedClickable
-import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -24,7 +23,6 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.darkColorScheme
-import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
@@ -32,12 +30,13 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import com.google.mlkit.vision.barcode.common.Barcode
 import com.google.mlkit.vision.codescanner.GmsBarcodeScannerOptions
 import com.google.mlkit.vision.codescanner.GmsBarcodeScanning
-import uniffi.sm_mobile.HostEntry
+import uniffi.velora_mobile.HostEntry
 
 class MainActivity : ComponentActivity() {
     private val hosts = mutableStateListOf<HostEntry>()
@@ -47,7 +46,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContent {
-            MaterialTheme(colorScheme = if (isSystemInDarkTheme()) darkColorScheme() else lightColorScheme()) {
+            MaterialTheme(colorScheme = VeloraColors) {
                 Surface(Modifier.fillMaxSize()) {
                     HostsScreen(
                         hosts = hosts,
@@ -99,6 +98,26 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+/** The Velora palette: dark ink background, teal actions, lavender and lime accents. */
+private val Ink = Color(0xFF0B0B0F)
+private val Card = Color(0xFF16141F)
+private val VeloraColors = darkColorScheme(
+    primary = Color(0xFF4EE1C3),
+    onPrimary = Ink,
+    secondary = Color(0xFFB388FF),
+    onSecondary = Ink,
+    tertiary = Color(0xFFB8FF6A),
+    onTertiary = Ink,
+    background = Ink,
+    onBackground = Color(0xFFF2F1F7),
+    surface = Ink,
+    onSurface = Color(0xFFF2F1F7),
+    surfaceVariant = Card,
+    onSurfaceVariant = Color(0xFFB9B6C9),
+    surfaceContainerHigh = Card,
+    outline = Color(0xFF3B2A6F),
+)
+
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun HostsScreen(
@@ -110,14 +129,21 @@ private fun HostsScreen(
 ) {
     var confirmForget by remember { mutableStateOf<HostEntry?>(null) }
     Column(Modifier.fillMaxSize().padding(24.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
-        Text(stringResource(R.string.app_name), style = MaterialTheme.typography.headlineMedium)
+        Column {
+            Text(stringResource(R.string.app_name), style = MaterialTheme.typography.headlineMedium)
+            Text(
+                stringResource(R.string.tagline).uppercase(),
+                style = MaterialTheme.typography.labelLarge,
+                color = MaterialTheme.colorScheme.primary,
+            )
+        }
         if (hosts.isEmpty()) {
             Text(stringResource(R.string.no_hosts), style = MaterialTheme.typography.bodyLarge)
         }
         LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             items(hosts, key = { it.name }) { host ->
                 Surface(
-                    tonalElevation = 2.dp,
+                    color = MaterialTheme.colorScheme.surfaceVariant,
                     shape = MaterialTheme.shapes.medium,
                     modifier = Modifier.fillMaxWidth().combinedClickable(
                         onClick = { onConnect(host) },
@@ -163,7 +189,7 @@ private fun PairDialog(initial: PairingLink, onPair: (String, String) -> Unit, o
             }
         },
         confirmButton = {
-            TextButton(enabled = address.isNotBlank() && code.startsWith("SM1-"), onClick = { onPair(address, code) }) {
+            TextButton(enabled = address.isNotBlank() && code.startsWith("VL1-"), onClick = { onPair(address, code) }) {
                 Text(stringResource(R.string.pair))
             }
         },

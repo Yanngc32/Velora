@@ -2357,115 +2357,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
-name = "sm-client"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "sm-client-core",
- "sm-protocol",
- "sm-update",
- "softbuffer",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "winit",
-]
-
-[[package]]
-name = "sm-client-core"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytes",
- "openh264",
- "quinn",
- "sm-protocol",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "sm-host"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "evdev",
- "ffmpeg-sys-next",
- "libc",
- "openh264",
- "qrcode",
- "quinn",
- "sm-protocol",
- "sm-update",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "windows",
- "x11rb",
-]
-
-[[package]]
-name = "sm-mobile"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "openh264",
- "paranoid-android",
- "sm-client-core",
- "sm-protocol",
- "thiserror 2.0.21",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "uniffi",
-]
-
-[[package]]
-name = "sm-protocol"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64 0.22.1",
- "directories",
- "quinn",
- "rcgen",
- "ring",
- "rustls",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "sm-release"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64 0.22.1",
- "clap",
- "ring",
- "serde_json",
- "sm-update",
- "zip",
-]
-
-[[package]]
-name = "sm-update"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64 0.22.1",
- "ring",
- "serde",
- "serde_json",
- "tracing",
- "ureq",
-]
-
-[[package]]
 name = "smallvec"
 version = "1.16.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3116,6 +3007,115 @@ name = "vcpkg"
 version = "0.2.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
+
+[[package]]
+name = "velora"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "softbuffer",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "velora-client-core",
+ "velora-protocol",
+ "velora-update",
+ "winit",
+]
+
+[[package]]
+name = "velora-client-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "openh264",
+ "quinn",
+ "tokio",
+ "tracing",
+ "velora-protocol",
+]
+
+[[package]]
+name = "velora-host"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "evdev",
+ "ffmpeg-sys-next",
+ "libc",
+ "openh264",
+ "qrcode",
+ "quinn",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "velora-protocol",
+ "velora-update",
+ "windows",
+ "x11rb",
+]
+
+[[package]]
+name = "velora-mobile"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "openh264",
+ "paranoid-android",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uniffi",
+ "velora-client-core",
+ "velora-protocol",
+]
+
+[[package]]
+name = "velora-protocol"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "directories",
+ "quinn",
+ "rcgen",
+ "ring",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "velora-release"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "clap",
+ "ring",
+ "serde_json",
+ "velora-update",
+ "zip",
+]
+
+[[package]]
+name = "velora-update"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "ring",
+ "serde",
+ "serde_json",
+ "tracing",
+ "ureq",
+]
 
 [[package]]
 name = "version_check"

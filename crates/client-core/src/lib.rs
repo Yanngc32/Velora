@@ -16,12 +16,12 @@ use std::{
 };
 
 use anyhow::{bail, Context, Result};
-use sm_protocol::{
+use tokio::sync::mpsc;
+use velora_protocol::{
     identity::Identity,
     tls::{self, Fingerprint},
     wire::{self, ClientMsg, FrameHeader, HostMsg, KeyState, MouseButton, MouseMove, PROTOCOL_VERSION},
 };
-use tokio::sync::mpsc;
 
 #[cfg(feature = "decode")]
 pub use video::{FrameSlot, VideoFrame};
