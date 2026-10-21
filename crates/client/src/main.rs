@@ -1,5 +1,10 @@
+// The launcher is a GUI app: no console window on Windows (see `attach_console`).
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
+mod gui;
 mod keymap;
 mod render;
+mod settings;
 
 use std::{
     num::NonZeroU32,
@@ -14,6 +19,7 @@ use std::{
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use settings::Settings;
 use velora_client_core::{hosts, FrameSlot, InputSender, Session, VideoFrame, VideoOutput};
 use velora_protocol::{
     identity::StateDir,
@@ -29,7 +35,11 @@ use winit::{
 };
 
 #[derive(Parser)]
-#[command(name = "velora", version, about = "Control a remote computer running velora-host")]
+#[command(
+    name = "velora",
+    version,
+    about = "Control a remote computer running velora-host. Without a command, opens the Velora app."
+)]
 struct Cli {
     /// Directory for identity and known hosts (defaults to the OS config directory).
     #[arg(long, global = true)]
@@ -38,7 +48,7 @@ struct Cli {
     #[arg(long, global = true)]
     no_update: bool,
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -67,17 +77,24 @@ enum Command {
 }
 
 fn main() -> Result<()> {
+    #[cfg(windows)]
+    attach_console();
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .with_writer(std::io::stderr)
         .init();
 
     let cli = Cli::parse();
-    let state = StateDir::open(cli.config_dir, "client")?;
-    let runtime = tokio::runtime::Runtime::new()?;
+    let state = StateDir::open(cli.config_dir.clone(), "client")?;
     velora_update::cleanup_current_exe();
-    if matches!(cli.command, Command::Pair { .. } | Command::Connect { .. })
-        && velora_update::auto_update_enabled(cli.no_update)
+    let settings = Settings::load(&state);
+    let no_update = cli.no_update || !settings.auto_update;
+    let Some(command) = cli.command else {
+        return gui::run(state, cli.config_dir, no_update);
+    };
+    let runtime = tokio::runtime::Runtime::new()?;
+    if matches!(command, Command::Pair { .. } | Command::Connect { .. })
+        && velora_update::auto_update_enabled(no_update)
     {
         // A session runs for a long time: update in the background, effective next start.
         std::thread::spawn(|| match velora_update::update_now() {
@@ -87,7 +104,8 @@ fn main() -> Result<()> {
         });
     }
 
-    match cli.command {
+    let device_name = settings.device_name;
+    match command {
         Command::Update => {
             match velora_update::update_now()? {
                 Some(v) => println!("Updated to {v}."),
@@ -109,7 +127,7 @@ fn main() -> Result<()> {
             let (proxy, event_loop) = new_event_loop()?;
             let slot = Arc::new(FrameSlot::default());
             let output = VideoOutput::Decoded { slot: slot.clone(), on_frame: redraw_callback(proxy) };
-            let name = name.unwrap_or_else(device_name);
+            let name = name.unwrap_or(device_name);
             let session = runtime.block_on(hosts::pair(&state, &address, &code, &name, output))?;
             println!("Paired with '{}'. Next time: velora connect {}", session.host_name, session.host_name);
             run_window(&runtime, event_loop, session, slot)
@@ -118,7 +136,7 @@ fn main() -> Result<()> {
             let (proxy, event_loop) = new_event_loop()?;
             let slot = Arc::new(FrameSlot::default());
             let output = VideoOutput::Decoded { slot: slot.clone(), on_frame: redraw_callback(proxy) };
-            let session = runtime.block_on(hosts::connect(&state, &host, &device_name(), output))?;
+            let session = runtime.block_on(hosts::connect(&state, &host, &device_name, output))?;
             run_window(&runtime, event_loop, session, slot)
         }
         Command::Bench { host, seconds } => runtime.block_on(async {
@@ -128,7 +146,7 @@ fn main() -> Result<()> {
                 counter.fetch_add(1, Ordering::Relaxed);
             });
             let output = VideoOutput::Decoded { slot: Arc::new(FrameSlot::default()), on_frame };
-            let session = hosts::connect(&state, &host, &device_name(), output).await?;
+            let session = hosts::connect(&state, &host, &device_name, output).await?;
             println!("connected to '{}' ({}x{})", session.host_name, session.width, session.height);
             tokio::time::sleep(Duration::from_secs(seconds)).await;
             let n = frames.load(Ordering::Relaxed);
@@ -143,14 +161,15 @@ fn main() -> Result<()> {
     }
 }
 
-fn device_name() -> String {
-    std::env::var("COMPUTERNAME")
-        .or_else(|_| std::env::var("HOSTNAME"))
-        .ok()
-        .or_else(|| std::fs::read_to_string("/etc/hostname").ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "client".into())
+/// A GUI-subsystem program has no console; reuse the terminal it was started from, if any,
+/// so the command line still prints.
+#[cfg(windows)]
+fn attach_console() {
+    use windows::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
+    // SAFETY: no preconditions; fails harmlessly when there is no parent console.
+    unsafe {
+        let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+    }
 }
 
 fn new_event_loop() -> Result<(EventLoopProxy<()>, EventLoop<()>)> {

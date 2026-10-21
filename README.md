@@ -54,7 +54,7 @@ project yet (no GPU in CI).
 | `crates/protocol` | Wire format, TLS/QUIC configuration with certificate pinning, pairing codes, identity storage |
 | `crates/host` (`velora-host`) | Capture, color conversion and encoding, input injection, sessions |
 | `crates/client-core` | UI-independent client: connection, input API, decoding. Mobile apps will reuse it through FFI |
-| `crates/client` (`velora`) | Desktop client (winit + softbuffer) |
+| `crates/client` (`velora`) | Desktop client: launcher (egui) for pairing, devices and settings; session window (winit + softbuffer) |
 | `crates/mobile` (`velora-mobile`) | Client core exported to the mobile apps through [UniFFI](https://mozilla.github.io/uniffi-rs/) |
 | `crates/uniffi-bindgen` | Generates the Kotlin (later Swift) bindings for `velora-mobile` |
 | `android/` | Android app (Kotlin): MediaCodec hardware decoding, trackpad, soft and physical keyboards |
@@ -95,7 +95,7 @@ and the previous files are removed on the next start.
 
 ## Building
 
-Requirements: Rust 1.89+ and a C/C++ compiler (OpenH264 is built from source by the
+Requirements: Rust 1.95+ and a C/C++ compiler (OpenH264 is built from source by the
 `openh264` crate).
 
 ```sh
@@ -149,8 +149,12 @@ On the computer to control:
 velora-host run --pair
 ```
 
-This prints a single-use pairing code, valid for 10 minutes, and the exact command to run on the
-other device:
+This prints a single-use pairing code, valid for 10 minutes, a QR code for the phone, and the
+exact command to run on the other device.
+
+On a desktop, open **Velora** (`velora` with no arguments) and paste the code or the
+`velora://` link under **Connect**. Paired computers are listed under **Devices**, one click
+away; each session opens in its own window. The same is available from the command line:
 
 ```sh
 velora pair 192.168.0.10:7420 VL1-...      # first time: pairs, saves the host and connects
@@ -270,6 +274,9 @@ Pull requests that touch the release machinery run the same build as a dry run.
 ## License
 
 MIT, see [LICENSE](LICENSE).
+
+The desktop launcher bundles Inter and JetBrains Mono (SIL Open Font License) and Lucide icons
+(ISC); their licenses are next to them in `crates/client/assets`.
 
 H.264 is covered by patents. Cisco pays the royalties for OpenH264 only when users download
 Cisco's prebuilt binary. This project compiles OpenH264 from source, which isn't covered.

@@ -42,7 +42,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@1.89
+      - uses: dtolnay/rust-toolchain@1.95
       - uses: Swatinem/rust-cache@v2
       # uniffi-bindgen is a build tool (not shipped) and follows its own MSRV.
       - run: cargo check --workspace --exclude uniffi-bindgen --all-targets

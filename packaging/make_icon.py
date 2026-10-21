@@ -131,4 +131,17 @@ res = ROOT / "android/app/src/main/res"
 (res / "drawable/ic_launcher_foreground.xml").write_text(vector(LAYERS, "Velora mark inside the adaptive-icon safe zone."))
 (res / "drawable/ic_launcher_background.xml").write_text(background())
 (res / "drawable/ic_launcher_monochrome.xml").write_text(monochrome())
+
+# Desktop window and sidebar icon. Rasterizing needs cairosvg (pip install cairosvg).
+try:
+    import cairosvg
+
+    cairosvg.svg2png(
+        url=str(ROOT / "packaging/velora-icon.svg"),
+        write_to=str(ROOT / "crates/client/assets/velora-icon.png"),
+        output_width=256,
+        output_height=256,
+    )
+except ImportError:
+    print("cairosvg not installed: crates/client/assets/velora-icon.png not regenerated")
 print("icon written")

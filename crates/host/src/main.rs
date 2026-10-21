@@ -87,7 +87,7 @@ async fn main() -> Result<()> {
             let identity = state.load_or_create_identity()?;
             let pairing = if pair {
                 let code = PairingCode::generate(identity.fingerprint())?;
-                print_pairing(&code, bind.port());
+                print_pairing(&code, bind);
                 Some((code, PAIRING_TTL))
             } else {
                 None
@@ -139,8 +139,14 @@ async fn main() -> Result<()> {
     }
 }
 
-fn print_pairing(code: &PairingCode, port: u16) {
-    let addr = local_ip().map(|ip| format!("{ip}:{port}")).unwrap_or_else(|| format!("<this-pc-address>:{port}"));
+fn print_pairing(code: &PairingCode, bind: SocketAddr) {
+    // Advertise the address clients can actually reach: the bound one, or the LAN address
+    // when listening on every interface.
+    let ip = if bind.ip().is_unspecified() { local_ip() } else { Some(bind.ip()) };
+    let addr = match ip {
+        Some(ip) => SocketAddr::new(ip, bind.port()).to_string(),
+        None => format!("<this-pc-address>:{}", bind.port()),
+    };
     println!();
     println!("Pairing code (single use, valid for 10 minutes):");
     println!();

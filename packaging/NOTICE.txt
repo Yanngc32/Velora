@@ -10,3 +10,9 @@ release/8.1) and the build scripts at https://github.com/BtbN/FFmpeg-Builds.
 
 This distribution also includes OpenH264 (BSD 2-Clause, Cisco Systems), compiled from source.
 H.264 is covered by patents; see the project README.
+
+The desktop launcher (velora) embeds these fonts and icons; their licenses are in licenses/:
+- Inter, Copyright 2020 The Inter Project Authors (https://github.com/rsms/inter), and
+  JetBrains Mono, Copyright 2020 The JetBrains Mono Project Authors
+  (https://github.com/JetBrains/JetBrainsMono), under the SIL Open Font License 1.1.
+- Lucide icons (https://lucide.dev), ISC License.

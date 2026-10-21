@@ -73,6 +73,10 @@ impl StateDir {
         Ok(Self(dir))
     }
 
+    pub fn dir(&self) -> &Path {
+        &self.0
+    }
+
     pub fn path(&self, file: &str) -> PathBuf {
         self.0.join(file)
     }

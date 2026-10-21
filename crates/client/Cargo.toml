@@ -17,3 +17,10 @@ tokio.workspace = true
 clap.workspace = true
 winit = "0.30"
 softbuffer = "0.4"
+serde.workspace = true
+eframe = { version = "0.37", default-features = false, features = ["accesskit", "clipboard", "default_fonts", "glow", "links", "wayland", "x11"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+sys-locale = "0.3"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = ["Win32_System_Console"] }

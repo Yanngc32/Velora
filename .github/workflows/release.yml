@@ -79,6 +79,9 @@ jobs:
           mkdir -p stage
           cp LICENSE packaging/NOTICE.txt stage/
           cp "$FFMPEG_DIR/LICENSE.txt" stage/FFMPEG-LICENSE.txt
+          # Fonts and icons embedded in the desktop launcher.
+          mkdir -p stage/licenses
+          cp crates/client/assets/fonts/OFL-*.txt crates/client/assets/icons/LICENSE-lucide.txt stage/licenses/
           if [ "$RUNNER_OS" = Windows ]; then
             cp target/release/velora-host.exe target/release/velora.exe stage/
             for lib in avcodec avutil swresample; do cp "$FFMPEG_DIR"/bin/$lib-*.dll stage/; done
@@ -90,7 +93,7 @@ jobs:
               name=$(basename "$f")
               [[ $name =~ ^lib[a-z]+\.so\.[0-9]+$ ]] && cp -L "$f" "stage/lib/$name"
             done
-            chmod 644 stage/lib/* stage/LICENSE stage/NOTICE.txt stage/FFMPEG-LICENSE.txt
+            chmod 644 stage/lib/* stage/licenses/* stage/LICENSE stage/NOTICE.txt stage/FFMPEG-LICENSE.txt
           fi
           ls -lR stage
 
