@@ -195,6 +195,19 @@ struct OutFrame {
     data: Vec<u8>,
 }
 
+impl Session {
+    /// Saturating decrement: the counter may have been reset by the stall guard.
+    fn ack_frame(&self) {
+        let mut n = self.in_flight.load(Ordering::Acquire);
+        while n > 0 {
+            match self.in_flight.compare_exchange_weak(n, n - 1, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => break,
+                Err(actual) => n = actual,
+            }
+        }
+    }
+}
+
 async fn run_session(
     conn: &quinn::Connection,
     mut control_send: quinn::SendStream,
@@ -263,7 +276,7 @@ async fn run_session(
                 ClientMsg::ReleaseAll => shared.input.send(InputCmd::ReleaseAll),
                 ClientMsg::RequestKeyframe => session.keyframe_requested.store(true, Ordering::Relaxed),
                 ClientMsg::FrameAck { frame_id } => {
-                    let _ = session.in_flight.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
+                    session.ack_frame();
                     *session.last_ack.lock().unwrap() = Instant::now();
                     session.stats.lock().unwrap().acked(frame_id);
                 }
