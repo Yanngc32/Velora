@@ -26,7 +26,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::{
     capture::{self, DisplayRect},
-    encode::{VideoEncoder, Yuv420},
+    encode::{self, EncoderChoice, EncoderSettings},
     input::{InputCmd, InputHandle},
 };
 
@@ -42,6 +42,7 @@ pub struct HostOptions {
     pub name: String,
     pub fps: u32,
     pub bitrate_kbps: u32,
+    pub encoder: EncoderChoice,
 }
 
 struct PendingPairing {
@@ -229,15 +230,26 @@ async fn run_session(
     {
         let session = session.clone();
         let input = shared.input.clone();
-        let (fps, bitrate) = (opts.fps, opts.bitrate_kbps);
+        let settings = EncoderSettings { fps: opts.fps, bitrate_kbps: opts.bitrate_kbps };
+        let choice = opts.encoder.clone();
         std::thread::Builder::new().name("capture".into()).spawn(move || {
-            if let Err(e) = capture_loop(&session, fps, bitrate, frame_tx, ready_tx, &input) {
+            if let Err(e) = capture_loop(&session, &choice, settings, frame_tx, ready_tx, &input) {
                 tracing::error!("capture stopped: {e:#}");
             }
             session.running.store(false, Ordering::Relaxed);
         })?;
     }
-    let rect = ready_rx.await.context("capture failed to start")??;
+    let rect = match ready_rx.await.context("capture thread exited")? {
+        Ok(rect) => rect,
+        Err(e) => {
+            // Tell the client why instead of just dropping the connection.
+            let reason = format!("host cannot stream: {e:#}");
+            control_send.write_all(&HostMsg::Rejected { reason }.encode()).await?;
+            let _ = control_send.finish();
+            let _ = control_send.stopped().await;
+            return Err(e);
+        }
+    };
 
     control_send
         .write_all(
@@ -331,13 +343,19 @@ async fn run_session(
 
 fn capture_loop(
     session: &Session,
-    fps: u32,
-    bitrate_kbps: u32,
+    choice: &EncoderChoice,
+    settings: EncoderSettings,
     frames: mpsc::Sender<OutFrame>,
     ready: oneshot::Sender<Result<DisplayRect>>,
     input: &InputHandle,
 ) -> Result<()> {
-    let setup = || -> Result<_> { Ok((capture::open()?, VideoEncoder::new(fps, bitrate_kbps)?)) };
+    let setup = || -> Result<_> {
+        let capturer = capture::open()?;
+        let rect = capturer.rect();
+        let encoder = encode::open(choice, settings, rect.width, rect.height)?;
+        tracing::info!("encoder: {}", encoder.name());
+        Ok((capturer, encoder))
+    };
     let (mut capturer, mut encoder) = match setup() {
         Ok(v) => v,
         Err(e) => {
@@ -349,8 +367,7 @@ fn capture_loop(
     input.send(InputCmd::SetDisplay(rect));
     let _ = ready.send(Ok(rect));
 
-    let interval = Duration::from_secs_f64(1.0 / fps.max(1) as f64);
-    let mut yuv = Yuv420::default();
+    let interval = Duration::from_secs_f64(1.0 / settings.fps.max(1) as f64);
     let mut have_picture = false;
     let mut next_id = 0u32;
     let mut last_capture = Instant::now() - interval;
@@ -379,44 +396,43 @@ fn capture_loop(
         // Block until the screen changes (bounded so shutdown and keyframe requests are
         // noticed), but return immediately when a keyframe of an unchanged screen is due.
         let timeout = if keyframe && have_picture { Duration::ZERO } else { Duration::from_millis(100) };
-        let changed = match capturer.capture(timeout)? {
-            Some(frame) => {
-                let convert_start = Instant::now();
-                yuv.convert_from(&frame);
-                session.stats.lock().unwrap().convert_time += convert_start.elapsed();
-                have_picture = true;
-                true
-            }
-            None => false,
-        };
+        let frame = capturer.capture(timeout)?;
+        let changed = frame.is_some();
         let captured_at = Instant::now();
         last_capture = captured_at;
+        if !changed && !(keyframe && have_picture) {
+            continue;
+        }
+        have_picture = true;
+
+        session.keyframe_requested.store(false, Ordering::Relaxed);
+        let encode_start = Instant::now();
+        let encoded = encoder.encode(frame.as_ref(), keyframe)?;
+        {
+            let mut stats = session.stats.lock().unwrap();
+            stats.convert_time += encoded.convert_time;
+            stats.encode_time += encode_start.elapsed() - encoded.convert_time;
+        }
 
         if capturer.rect() != rect {
             rect = capturer.rect();
             input.send(InputCmd::SetDisplay(rect));
         }
-        if !changed && !(keyframe && have_picture) {
-            continue;
-        }
 
-        session.keyframe_requested.store(false, Ordering::Relaxed);
-        let encode_start = Instant::now();
-        let Some(encoded) = encoder.encode(&yuv, keyframe)? else { continue };
-        session.stats.lock().unwrap().encode_time += encode_start.elapsed();
-
-        session.in_flight.fetch_add(1, Ordering::AcqRel);
-        let frame = OutFrame {
-            id: next_id,
-            keyframe: encoded.keyframe,
-            width: yuv.width() as u16,
-            height: yuv.height() as u16,
-            captured: captured_at,
-            data: encoded.data,
-        };
-        next_id = next_id.wrapping_add(1);
-        if frames.blocking_send(frame).is_err() {
-            break;
+        for encoded in encoded.frames {
+            session.in_flight.fetch_add(1, Ordering::AcqRel);
+            let frame = OutFrame {
+                id: next_id,
+                keyframe: encoded.keyframe,
+                width: encoded.width,
+                height: encoded.height,
+                captured: captured_at,
+                data: encoded.data,
+            };
+            next_id = next_id.wrapping_add(1);
+            if frames.blocking_send(frame).is_err() {
+                return Ok(());
+            }
         }
     }
     Ok(())

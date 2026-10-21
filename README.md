@@ -5,8 +5,8 @@ Linux PC from another PC (and, later, from your phone). It is designed around in
 responsiveness and a picture that is always current, not around maximum image quality.
 
 > **Status: early MVP.** Desktop host (Windows, Linux/X11) and desktop client work end to end:
-> pairing, encrypted streaming, keyboard/mouse/scroll. Mobile clients, hardware encoding and
-> NAT traversal are next (see [Roadmap](#roadmap)).
+> pairing, encrypted streaming, keyboard/mouse/scroll, hardware encoding through FFmpeg.
+> Mobile clients and NAT traversal are next (see [Roadmap](#roadmap)).
 
 ## How it works
 
@@ -40,8 +40,9 @@ Latency decisions:
   physical keyboard (e.g. ABNT2).
 
 Measured on a 4-core cloud VM with host, client and a virtual display on the same machine,
-full-screen scrolling text at 1080p (worst case for the software encoder): about 37 fps and
-about 26 ms from capture to decoded frame. Hardware encoding is the next big step (see Roadmap).
+full-screen scrolling text at 1080p (worst case for the encoder): about 40 fps and 25-30 ms
+from capture to decoded frame with CPU encoders. GPU encoders haven't been benchmarked by the
+project yet (no GPU in CI).
 
 ## Project layout
 
@@ -54,13 +55,38 @@ about 26 ms from capture to decoded frame. Hardware encoding is the next big ste
 
 ## Building
 
-Requirements: Rust 1.88+ and a C/C++ compiler (OpenH264 is built from source by the
+Requirements: Rust 1.89+ and a C/C++ compiler (OpenH264 is built from source by the
 `openh264` crate).
 
 ```sh
 cargo build --release
 # binaries: target/release/sm-host, target/release/sm-client
 ```
+
+### Hardware encoding (recommended)
+
+The default build encodes in software (OpenH264). For GPU encoding, build the host with the
+`ffmpeg` feature, which links the FFmpeg libraries (libavcodec, libavutil) dynamically:
+
+```sh
+# Linux (Debian/Ubuntu): FFmpeg development packages and clang (for bindgen)
+sudo apt install libavcodec-dev libavutil-dev pkg-config clang
+cargo build --release --features sm-host/ffmpeg
+
+# Windows: an LGPL *shared* FFmpeg build (e.g. BtbN's win64-lgpl-shared) and LLVM
+set FFMPEG_DIR=C:\path\to\ffmpeg     # contains include\ and lib\
+cargo build --release --features sm-host/ffmpeg
+# then copy the avcodec-*.dll and avutil-*.dll from FFMPEG_DIR\bin next to sm-host.exe
+```
+
+`sm-host run --encoder auto` (the default) picks the first encoder that opens:
+NVENC, then AMF, then Quick Sync on Windows, and NVENC, then VA-API, then Quick Sync on Linux.
+If none opens, it falls back to software. To force one, pass `--encoder nvenc|amf|qsv|vaapi|software`,
+or `--encoder ffmpeg:<name>` for any FFmpeg encoder. All hardware encoders are configured for
+low latency: no B-frames, CBR, no lookahead, and keyframes only on demand.
+
+On Linux, VA-API needs the driver for your GPU (`intel-media-driver` or `mesa-va-drivers`)
+and access to `/dev/dri/renderD128` (the `render` group).
 
 Linux runtime requirements:
 
@@ -100,7 +126,7 @@ Host management:
 ```sh
 sm-host clients                 # paired devices
 sm-host revoke <name|fingerprint>
-sm-host run --fps 60 --bitrate 12000 --bind 0.0.0.0:7420
+sm-host run --fps 60 --bitrate 12000 --bind 0.0.0.0:7420 --encoder auto
 ```
 
 When a second paired device connects, it takes over the session. Switching from the phone to
@@ -133,8 +159,9 @@ secure desktop (UAC prompts, lock screen) needs the host to run as a service (pl
 
 ## Roadmap
 
-1. **Hardware encoding.** NVENC / Quick Sync / AMF on Windows (zero-copy from the DXGI texture)
-   and VA-API on Linux, with software OpenH264 as fallback.
+1. **Zero-copy GPU pipeline.** Hardware encoders work today, but frames still go through CPU
+   color conversion and an upload. Next: convert on the GPU (D3D11 video processor, VA-API VPP)
+   and hand the DXGI texture straight to the encoder.
 2. **GPU presentation on the client.** YUV textures and shader conversion/scaling instead of the
    CPU path, plus hardware decoding.
 3. **Mobile clients** (Android: Kotlin + MediaCodec, iOS: Swift + VideoToolbox) on top of
@@ -150,4 +177,5 @@ MIT, see [LICENSE](LICENSE).
 
 H.264 is covered by patents. Cisco pays the royalties for OpenH264 only when users download
 Cisco's prebuilt binary. This project compiles OpenH264 from source, which isn't covered.
-Check your situation before distributing binaries. Hardware encoders and AV1 avoid the issue.
+Check your situation before distributing binaries. AV1, which is royalty-free, is on the
+roadmap. FFmpeg is used under the LGPL: link it dynamically and use an LGPL build.

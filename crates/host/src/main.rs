@@ -7,6 +7,7 @@ use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
+use encode::EncoderChoice;
 use sm_protocol::{
     identity::{AuthorizedClient, StateDir},
     pairing::PairingCode,
@@ -44,6 +45,10 @@ enum Command {
         /// Print a one-time pairing code (valid for 10 minutes) to add a new device.
         #[arg(long)]
         pair: bool,
+        /// Video encoder: auto (first working hardware encoder, else software), software,
+        /// nvenc, qsv, amf, vaapi, or ffmpeg:<name> for any FFmpeg encoder.
+        #[arg(long, default_value = "auto")]
+        encoder: EncoderChoice,
     },
     /// List paired devices.
     Clients,
@@ -70,7 +75,7 @@ async fn main() -> Result<()> {
     let state = StateDir::open(cli.config_dir, "host")?;
 
     match cli.command {
-        Command::Run { bind, name, fps, bitrate, pair } => {
+        Command::Run { bind, name, fps, bitrate, pair, encoder } => {
             let identity = state.load_or_create_identity()?;
             let pairing = if pair {
                 let code = PairingCode::generate(identity.fingerprint())?;
@@ -84,6 +89,7 @@ async fn main() -> Result<()> {
                 name: name.unwrap_or_else(hostname),
                 fps: fps.clamp(1, 240),
                 bitrate_kbps: bitrate.max(100),
+                encoder,
             };
             server::run(options, state, pairing).await
         }

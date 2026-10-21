@@ -15,6 +15,11 @@ tokio.workspace = true
 quinn.workspace = true
 clap.workspace = true
 openh264.workspace = true
+ffmpeg-sys-next = { version = "9", default-features = false, features = ["avcodec"], optional = true }
+
+[features]
+# Hardware encoders (NVENC, Quick Sync, AMF, VA-API) through the system FFmpeg libraries.
+ffmpeg = ["dep:ffmpeg-sys-next"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 x11rb = { version = "0.13", features = ["shm", "damage"] }
