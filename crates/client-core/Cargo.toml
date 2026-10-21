@@ -1,0 +1,16 @@
+[package]
+name = "sm-client-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+sm-protocol.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+quinn.workspace = true
+openh264.workspace = true
+bytes = "1"

@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --all-targets
+
+  ffmpeg:
+    # Hardware encoder backend, built against the distro's FFmpeg.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libavcodec-dev libavutil-dev pkg-config clang
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy -p sm-host --all-targets --features ffmpeg -- -D warnings
+      - run: cargo test -p sm-host --features ffmpeg
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.89
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --all-targets
