@@ -260,14 +260,14 @@ fn init_logging(cli: &Cli) -> Result<()> {
     Ok(())
 }
 
-fn print_pairing(code: &PairingCode, addr: &str) {
+fn print_pairing(code: &PairingCode, addr: &str, also: &[String]) {
     println!();
     println!("Pairing code (single use, valid for 10 minutes):");
     println!();
     println!("    {}", code.encode());
     println!();
     println!("On a phone, scan this with the Velora app:");
-    let link = velora_protocol::pairing::pairing_uri(addr, code);
+    let link = velora_protocol::pairing::pairing_uri_with(addr, also, code);
     match qrcode::QrCode::new(link.as_bytes()) {
         // Light modules drawn as blocks: reads correctly on the usual dark terminal background.
         Ok(qr) => println!(

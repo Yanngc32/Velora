@@ -27,6 +27,8 @@ pub const PAIRING_SECRET_LEN: usize = 16;
 pub const MAX_NAME_LEN: usize = 256;
 /// Longest text carried by one [`ClientMsg::Text`]; longer input is split by [`split_text`].
 pub const MAX_TEXT_LEN: usize = 4096;
+/// Most addresses a welcome carries.
+pub const MAX_ADDRESSES: usize = 8;
 /// Longest pairing link in [`ClientMsg::OfferPairing`], in bytes.
 pub const MAX_LINK_LEN: usize = 1024;
 /// Longest access password, in bytes.
@@ -45,6 +47,8 @@ pub struct HelloExt {
     pub files_only: bool,
     /// The client takes clipboard content on its file streams.
     pub clipboard: bool,
+    /// The client wants the host's other addresses in the welcome (see `HostMsg::Welcome`).
+    pub addresses: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -174,6 +178,10 @@ pub enum HostMsg {
         /// `FEATURE_*` bits. Sent only in reply to a hello with [`HelloExt`]: clients that
         /// predate it reject trailing bytes.
         features: Option<u32>,
+        /// `ip:port` addresses the host can also be reached at (its LAN address, and on a VPN
+        /// mesh like Tailscale or Netbird, that one), for the client to try next time. Sent
+        /// only to clients that ask ([`HelloExt::addresses`]), after `features`.
+        addresses: Vec<String>,
     },
     /// Sent before `Welcome` when the client was just authorized through a pairing secret.
     Paired,
@@ -381,7 +389,7 @@ impl ClientMsg {
                     (None, None) => {}
                 }
                 if let Some(ext) = ext {
-                    w.u8(ext.files_only as u8 | (ext.clipboard as u8) << 1);
+                    w.u8(ext.files_only as u8 | (ext.clipboard as u8) << 1 | (ext.addresses as u8) << 2);
                 }
                 w.finish()
             }
@@ -442,7 +450,7 @@ impl ClientMsg {
                     None
                 } else {
                     let flags = r.u8()?;
-                    Some(HelloExt { files_only: flags & 1 != 0, clipboard: flags & 2 != 0 })
+                    Some(HelloExt { files_only: flags & 1 != 0, clipboard: flags & 2 != 0, addresses: flags & 4 != 0 })
                 };
                 Self::Hello { version, name, pairing_secret, password, ext }
             }
@@ -467,7 +475,7 @@ impl ClientMsg {
 impl HostMsg {
     pub fn encode(&self) -> Vec<u8> {
         match self {
-            Self::Welcome { version, host_name, codec, width, height, features } => {
+            Self::Welcome { version, host_name, codec, width, height, features, addresses } => {
                 let mut w = Writer::new(1);
                 w.u16(*version);
                 w.str(host_name);
@@ -476,6 +484,13 @@ impl HostMsg {
                 w.u16(*height);
                 if let Some(features) = features {
                     w.u32(*features);
+                    if !addresses.is_empty() {
+                        let addresses: Vec<&String> = addresses.iter().take(MAX_ADDRESSES).collect();
+                        w.u8(addresses.len() as u8);
+                        for address in addresses {
+                            w.str(address);
+                        }
+                    }
                 }
                 w.finish()
             }
@@ -503,6 +518,12 @@ impl HostMsg {
                 width: r.u16()?,
                 height: r.u16()?,
                 features: if r.0.is_empty() { None } else { Some(r.u32()?) },
+                addresses: if r.0.is_empty() {
+                    Vec::new()
+                } else {
+                    let n = r.u8()? as usize;
+                    (0..n.min(MAX_ADDRESSES)).map(|_| r.str()).collect::<Result<_>>()?
+                },
             },
             2 => Self::Paired,
             3 => Self::Rejected { reason: r.str()? },
@@ -575,14 +596,14 @@ mod tests {
                 name: "laptop".into(),
                 pairing_secret: None,
                 password,
-                ext: Some(HelloExt { files_only: true, clipboard: false }),
+                ext: Some(HelloExt { files_only: true, clipboard: false, addresses: false }),
             });
             roundtrip_client(ClientMsg::Hello {
                 version: 1,
                 name: "a".into(),
                 pairing_secret: None,
                 password: None,
-                ext: Some(HelloExt { files_only: false, clipboard: true }),
+                ext: Some(HelloExt { files_only: false, clipboard: true, addresses: true }),
             });
         }
         roundtrip_client(ClientMsg::Key { code: 30, state: KeyState::Repeat });
@@ -625,6 +646,7 @@ mod tests {
             width: 2560,
             height: 1440,
             features: None,
+            addresses: Vec::new(),
         });
         roundtrip_host(HostMsg::Welcome {
             version: 1,
@@ -633,6 +655,16 @@ mod tests {
             width: 0,
             height: 0,
             features: Some(FEATURE_FILES),
+            addresses: Vec::new(),
+        });
+        roundtrip_host(HostMsg::Welcome {
+            version: 1,
+            host_name: "desktop".into(),
+            codec: Codec::H264,
+            width: 1920,
+            height: 1080,
+            features: Some(FEATURE_FILES | FEATURE_CLIPBOARD),
+            addresses: vec!["192.168.1.9:7420".into(), "100.64.1.2:7420".into()],
         });
         roundtrip_host(HostMsg::Paired);
         roundtrip_host(HostMsg::PasswordRequired { wrong: true });

@@ -50,6 +50,35 @@ impl PairingCode {
     }
 }
 
+/// What a pairing link carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairingLink {
+    pub address: String,
+    /// Other addresses of the host (on a VPN mesh), tried along with `address`.
+    pub also: Vec<String>,
+    pub code: PairingCode,
+}
+
+/// Link carrying everything a device needs to pair: `velora://pair?address=..&code=..`, plus
+/// an `also=..` for each other address, which clients that predate them skip.
+pub fn pairing_uri_with(address: &str, also: &[String], code: &PairingCode) -> String {
+    let mut uri = pairing_uri(address, code);
+    for other in also {
+        uri.push_str("&also=");
+        uri.push_str(&encode_component(other));
+    }
+    uri
+}
+
+fn encode_component(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => (b as char).to_string(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
 /// Link carrying everything a device needs to pair: `velora://pair?address=..&code=..`.
 pub fn pairing_uri(address: &str, code: &PairingCode) -> String {
     fn encode(s: &str) -> String {
@@ -65,6 +94,11 @@ pub fn pairing_uri(address: &str, code: &PairingCode) -> String {
 
 /// Inverse of [`pairing_uri`]: the address and code carried by a pairing link.
 pub fn parse_pairing_uri(link: &str) -> Option<(String, PairingCode)> {
+    parse_pairing_link(link).map(|l| (l.address, l.code))
+}
+
+/// Inverse of [`pairing_uri_with`].
+pub fn parse_pairing_link(link: &str) -> Option<PairingLink> {
     fn decode(s: &str) -> Option<String> {
         let bytes = s.as_bytes();
         let mut out = Vec::with_capacity(bytes.len());
@@ -81,15 +115,16 @@ pub fn parse_pairing_uri(link: &str) -> Option<(String, PairingCode)> {
         String::from_utf8(out).ok()
     }
     let query = link.trim().strip_prefix(URI_PREFIX)?;
-    let (mut address, mut code) = (None, None);
+    let (mut address, mut code, mut also) = (None, None, Vec::new());
     for pair in query.split('&') {
         match pair.split_once('=')? {
             ("address", v) => address = Some(decode(v)?),
             ("code", v) => code = Some(PairingCode::parse(&decode(v)?).ok()?),
+            ("also", v) => also.push(decode(v)?),
             _ => {}
         }
     }
-    Some((address.filter(|a| !a.is_empty())?, code?))
+    Some(PairingLink { address: address.filter(|a| !a.is_empty())?, also, code: code? })
 }
 
 #[cfg(test)]
@@ -134,5 +169,16 @@ mod tests {
         let mut other = code.secret;
         other[15] ^= 1;
         assert!(!code.secret_matches(&other));
+    }
+
+    #[test]
+    fn pairing_link_with_other_addresses() {
+        let code = PairingCode { host: Fingerprint([1; 32]), secret: [2; PAIRING_SECRET_LEN] };
+        let also = vec!["100.101.102.103:7420".to_string(), "[fd7a:115c:a1e0::1]:7420".to_string()];
+        let uri = pairing_uri_with("192.168.1.9:7420", &also, &code);
+        let link = parse_pairing_link(&uri).unwrap();
+        assert_eq!((link.address.as_str(), link.also, link.code), ("192.168.1.9:7420", also, code.clone()));
+        // Older parsers read the same address and code.
+        assert_eq!(parse_pairing_uri(&uri), Some(("192.168.1.9:7420".to_string(), code)));
     }
 }

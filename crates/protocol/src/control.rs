@@ -63,6 +63,10 @@ pub struct Status {
     pub fingerprint: String,
     /// Address other devices should dial, when it could be determined.
     pub address: Option<String>,
+    /// Addresses on a VPN mesh (Tailscale, Netbird) other devices can also dial, from outside
+    /// the local network. Absent from hosts that predate them.
+    #[serde(default)]
+    pub also: Vec<String>,
     /// Running as the system service, so it also works on the lock screen.
     pub service: bool,
     /// Devices must also give an access password to connect. Absent from hosts that predate

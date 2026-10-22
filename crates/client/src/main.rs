@@ -82,6 +82,10 @@ enum Command {
         /// Pairing link to this computer's own host, offered so the host's computer pairs back.
         #[arg(long)]
         offer: Option<String>,
+        /// Another address of the host (say, on Tailscale or Netbird), tried along with
+        /// `address`. May be given several times.
+        #[arg(long)]
+        also: Vec<String>,
     },
     /// Connect to a paired host by name or address.
     Connect { host: String },
@@ -182,12 +186,12 @@ fn run() -> Result<()> {
             }
             Ok(())
         }
-        Command::Pair { address, code, name, offer } => {
+        Command::Pair { address, code, name, offer, also } => {
             let (proxy, event_loop) = new_event_loop()?;
             let slot = Arc::new(FrameSlot::default());
             let output = VideoOutput::Decoded { slot: slot.clone(), on_frame: redraw_callback(proxy) };
             let name = name.unwrap_or(device_name);
-            let session = runtime.block_on(hosts::pair(&state, &address, &code, &name, password, output))?;
+            let session = runtime.block_on(hosts::pair(&state, &address, &also, &code, &name, password, output))?;
             println!("Paired with '{}'. Next time: velora connect {}", session.host_name, session.host_name);
             if let Some(link) = offer {
                 session.input.offer_pairing(&link);

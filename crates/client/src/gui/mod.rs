@@ -33,7 +33,7 @@ use this_pc::{HostLink, ServiceJob};
 use velora_client_core::hosts;
 use velora_protocol::{
     identity::{KnownHost, StateDir},
-    pairing::{parse_pairing_uri, PairingCode},
+    pairing::{parse_pairing_link, PairingCode},
 };
 use widgets::*;
 
@@ -168,6 +168,8 @@ struct Launcher {
     host_child: Option<this_pc::StartedHost>,
     /// Pairing a new computer also lets it reach this one.
     offer_back: bool,
+    /// Other addresses from a pasted pairing link.
+    pair_also: Vec<String>,
     /// File requests already answered or announced, by id, and those to always accept.
     requests_answered: Vec<u64>,
     requests_seen: Vec<u64>,
@@ -227,6 +229,7 @@ impl Launcher {
             new_client: None,
             host_child: None,
             offer_back: true,
+            pair_also: Vec::new(),
             requests_answered: Vec::new(),
             requests_seen: Vec::new(),
             requests_always: Vec::new(),
@@ -465,11 +468,13 @@ impl Launcher {
         card(ui, |ui| {
             field_label(ui, s.code);
             let code = ui.add(field(&mut self.code, s.code_hint, true));
-            // Pasting the whole pairing link fills in both fields.
+            // Pasting the whole pairing link fills in both fields, and keeps the host's other
+            // addresses (VPN mesh) to try along.
             if code.changed() {
-                if let Some((address, code)) = parse_pairing_uri(&self.code) {
-                    self.address = address;
-                    self.code = code.encode();
+                if let Some(link) = parse_pairing_link(&self.code) {
+                    self.address = link.address;
+                    self.code = link.code.encode();
+                    self.pair_also = link.also;
                 }
             }
             ui.add_space(12.0);
@@ -502,6 +507,9 @@ impl Launcher {
                             self.settings.device_name.clone(),
                         );
                         let mut args = vec!["pair".to_string(), address.clone(), code, "--name".into(), name];
+                        for other in std::mem::take(&mut self.pair_also) {
+                            args.extend(["--also".to_string(), other]);
+                        }
                         let mut offer_error = None;
                         if self.offer_back && sharing {
                             // A fresh code from this computer's host, for the other one to pair back.

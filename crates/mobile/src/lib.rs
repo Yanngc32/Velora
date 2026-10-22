@@ -125,6 +125,7 @@ impl Client {
         let session = runtime().block_on(hosts::pair(
             &self.state,
             address.trim(),
+            &[],
             code.trim(),
             &self.device_name,
             password.as_deref(),
