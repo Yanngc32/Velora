@@ -125,18 +125,11 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: Dry run (unsigned manifest)
-        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+      - name: Manifest
         run: |
-          cargo run --release --locked -p velora-release -- manifest --dist dist --unsigned
+          cargo run --release --locked -p velora-release -- manifest --dist dist
           cat dist/manifest.json
           ls -l dist
-
-      - name: Sign manifest
-        if: startsWith(github.ref, 'refs/tags/v')
-        env:
-          VELORA_SIGNING_KEY: ${{ secrets.VELORA_SIGNING_KEY }}
-        run: cargo run --release --locked -p velora-release -- manifest --dist dist
 
       # Draft first so installed copies never see a manifest before all its files exist.
       - name: Publish release

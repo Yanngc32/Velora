@@ -28,7 +28,7 @@ FONTS = [
     ("Inter[opsz,wght].ttf", "Inter-Bold.ttf", ["wght=700", "opsz=32"]),
     ("JetBrainsMono[wght].ttf", "JetBrainsMono-Regular.ttf", ["wght=400"]),
 ]
-ICONS = ["log-in", "monitor", "settings", "info", "plus"]
+ICONS = ["log-in", "monitor", "settings", "info", "plus", "smartphone"]
 ICON_PX = 36
 
 

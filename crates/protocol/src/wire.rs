@@ -25,6 +25,8 @@ pub const PAIRING_SECRET_LEN: usize = 16;
 pub const MAX_NAME_LEN: usize = 256;
 /// Longest text carried by one [`ClientMsg::Text`]; longer input is split by [`split_text`].
 pub const MAX_TEXT_LEN: usize = 4096;
+/// Longest access password, in bytes.
+pub const MAX_PASSWORD_LEN: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
@@ -94,6 +96,10 @@ pub enum ClientMsg {
         version: u16,
         name: String,
         pairing_secret: Option<[u8; PAIRING_SECRET_LEN]>,
+        /// The host's access password, when it has one (see [`HostMsg::PasswordRequired`]).
+        /// Sent inside TLS to the pinned host. Encoded only when present, so hosts that
+        /// predate passwords still understand every hello without one.
+        password: Option<String>,
     },
     /// `code` is a Linux evdev key code (`KEY_*`), i.e. a physical, layout-independent key.
     Key {
@@ -144,6 +150,11 @@ pub enum HostMsg {
     Paired,
     Rejected {
         reason: String,
+    },
+    /// The host has an access password and the hello carried none (`wrong: false`) or a
+    /// wrong one. The host closes the connection; the client asks the user and reconnects.
+    PasswordRequired {
+        wrong: bool,
     },
 }
 
@@ -315,7 +326,7 @@ impl ClientMsg {
     /// Encodes the message including its u32 length prefix.
     pub fn encode(&self) -> Vec<u8> {
         match self {
-            Self::Hello { version, name, pairing_secret } => {
+            Self::Hello { version, name, pairing_secret, password } => {
                 let mut w = Writer::new(1);
                 w.u16(*version);
                 w.str(name);
@@ -325,6 +336,10 @@ impl ClientMsg {
                         w.bytes(s);
                     }
                     None => w.u8(0),
+                }
+                if let Some(password) = password {
+                    w.u8(1);
+                    w.str_max(password, MAX_PASSWORD_LEN);
                 }
                 w.finish()
             }
@@ -373,7 +388,9 @@ impl ClientMsg {
                 let name = r.str()?;
                 let pairing_secret =
                     if r.bool()? { Some(r.take(PAIRING_SECRET_LEN)?.try_into().unwrap()) } else { None };
-                Self::Hello { version, name, pairing_secret }
+                // Absent in hellos without a password, and from clients that predate them.
+                let password = if !r.0.is_empty() && r.bool()? { Some(r.str()?) } else { None };
+                Self::Hello { version, name, pairing_secret, password }
             }
             2 => Self::Key { code: r.u16()?, state: KeyState::from_u8(r.u8()?)? },
             3 => {
@@ -410,6 +427,11 @@ impl HostMsg {
                 w.str(reason);
                 w.finish()
             }
+            Self::PasswordRequired { wrong } => {
+                let mut w = Writer::new(4);
+                w.u8(*wrong as u8);
+                w.finish()
+            }
         }
     }
 
@@ -425,6 +447,7 @@ impl HostMsg {
             },
             2 => Self::Paired,
             3 => Self::Rejected { reason: r.str()? },
+            4 => Self::PasswordRequired { wrong: r.bool()? },
             t => bail!("unknown host message tag {t}"),
         };
         r.end()?;
@@ -466,11 +489,18 @@ mod tests {
 
     #[test]
     fn client_messages_roundtrip() {
-        roundtrip_client(ClientMsg::Hello { version: 1, name: "laptop".into(), pairing_secret: None });
+        roundtrip_client(ClientMsg::Hello { version: 1, name: "laptop".into(), pairing_secret: None, password: None });
         roundtrip_client(ClientMsg::Hello {
             version: 1,
             name: "telefone".into(),
             pairing_secret: Some([7; PAIRING_SECRET_LEN]),
+            password: None,
+        });
+        roundtrip_client(ClientMsg::Hello {
+            version: 1,
+            name: "telefone".into(),
+            pairing_secret: None,
+            password: Some("senha secreta".into()),
         });
         roundtrip_client(ClientMsg::Key { code: 30, state: KeyState::Repeat });
         roundtrip_client(ClientMsg::MouseButton { button: MouseButton::Back, down: true, x: 65535, y: 0 });
@@ -505,6 +535,7 @@ mod tests {
             height: 1440,
         });
         roundtrip_host(HostMsg::Paired);
+        roundtrip_host(HostMsg::PasswordRequired { wrong: true });
         roundtrip_host(HostMsg::Rejected { reason: "not authorized".into() });
     }
 
@@ -537,7 +568,7 @@ mod tests {
     #[test]
     fn long_names_are_truncated_on_char_boundary() {
         let name = "é".repeat(1000);
-        let enc = ClientMsg::Hello { version: 1, name, pairing_secret: None }.encode();
+        let enc = ClientMsg::Hello { version: 1, name, pairing_secret: None, password: None }.encode();
         let ClientMsg::Hello { name, .. } = ClientMsg::decode(&enc[4..]).unwrap() else { panic!() };
         assert_eq!(name.len(), MAX_NAME_LEN);
         assert!(name.chars().all(|c| c == 'é'));

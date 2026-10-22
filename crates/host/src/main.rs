@@ -1,9 +1,15 @@
 mod capture;
+mod control;
 mod encode;
 mod input;
+mod password;
 mod server;
+#[cfg(windows)]
+mod service;
+#[cfg(windows)]
+mod win;
 
-use std::{net::SocketAddr, path::PathBuf, time::Duration};
+use std::{net::SocketAddr, path::PathBuf};
 
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
@@ -14,8 +20,6 @@ use velora_protocol::{
     tls::Fingerprint,
     wire::DEFAULT_PORT,
 };
-
-const PAIRING_TTL: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Parser)]
 #[command(name = "velora-host", version, about = "Share this computer's screen and accept remote input")]
@@ -52,21 +56,57 @@ enum Command {
         /// nvenc, qsv, amf, vaapi, or ffmpeg:<name> for any FFmpeg encoder.
         #[arg(long, default_value = "auto")]
         encoder: EncoderChoice,
+        /// Started by the Windows service (set by the service itself).
+        #[arg(long, hide = true)]
+        service: bool,
+        /// Write the log to this file instead of stderr.
+        #[arg(long, hide = true)]
+        log_file: Option<PathBuf>,
     },
     /// List paired devices.
     Clients,
     /// Remove a paired device by name or fingerprint.
     Revoke { device: String },
+    /// Set the password paired devices must also give to connect (asked without echo).
+    Password {
+        /// Remove the password instead.
+        #[arg(long)]
+        clear: bool,
+    },
     /// Install the latest release now (restart a running host to use it).
     Update,
+    /// Run as a Windows service, to be reachable on the lock screen and before logon.
+    #[cfg(windows)]
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
+}
+
+#[cfg(windows)]
+#[derive(Subcommand)]
+enum ServiceAction {
+    /// Copy Velora to Program Files and install and start the service (as administrator).
+    /// Paired devices are kept.
+    Install {
+        /// Write the outcome to this file (empty on success), for the launcher.
+        #[arg(long, hide = true)]
+        report: Option<PathBuf>,
+    },
+    /// Stop and remove the service (as administrator).
+    Uninstall {
+        #[arg(long, hide = true)]
+        report: Option<PathBuf>,
+    },
+    /// Entry point for the service manager.
+    #[command(hide = true)]
+    Run,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
-        .with_writer(std::io::stderr)
-        .init();
+    let cli = Cli::parse();
+    init_logging(&cli)?;
 
     // Physical pixels everywhere: DXGI reports them, and SendInput must agree under scaling.
     #[cfg(windows)]
@@ -78,28 +118,23 @@ async fn main() -> Result<()> {
 
     // Captured before an update renames the running file.
     let exe = std::env::current_exe()?;
-    let cli = Cli::parse();
-    let state = StateDir::open(cli.config_dir, "host")?;
     velora_update::cleanup_current_exe();
+    let state = || StateDir::open(cli.config_dir.clone(), "host");
 
     match cli.command {
-        Command::Run { bind, name, fps, bitrate, pair, encoder } => {
-            let identity = state.load_or_create_identity()?;
-            let pairing = if pair {
-                let code = PairingCode::generate(identity.fingerprint())?;
-                print_pairing(&code, bind);
-                Some((code, PAIRING_TTL))
-            } else {
-                None
-            };
+        Command::Run { bind, name, fps, bitrate, pair, encoder, service, log_file: _ } => {
             let options = server::HostOptions {
                 bind,
                 name: name.unwrap_or_else(hostname),
                 fps: fps.clamp(1, 240),
                 bitrate_kbps: bitrate.max(100),
                 encoder,
+                service,
             };
-            if server::run(options, state, pairing, velora_update::auto_update_enabled(cli.no_update)).await? {
+            let auto_update = velora_update::auto_update_enabled(cli.no_update);
+            let updated = server::run(options, state()?, pair, auto_update).await?;
+            // Under the service, exit and let it start the new version.
+            if updated && !service {
                 velora_update::restart(&exe);
             }
             Ok(())
@@ -112,7 +147,7 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Command::Clients => {
-            let clients: Vec<AuthorizedClient> = state.load(StateDir::AUTHORIZED_CLIENTS)?;
+            let clients: Vec<AuthorizedClient> = state()?.load(StateDir::AUTHORIZED_CLIENTS)?;
             if clients.is_empty() {
                 println!("No paired devices. Run `velora-host run --pair` to add one.");
             }
@@ -123,37 +158,99 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Command::Revoke { device } => {
-            let mut clients: Vec<AuthorizedClient> = state.load(StateDir::AUTHORIZED_CLIENTS)?;
-            let before = clients.len();
-            clients.retain(|c| {
-                let short = Fingerprint::from_base64(&c.fingerprint).map(|f| f.short()).unwrap_or_default();
-                c.name != device && c.fingerprint != device && short != device
-            });
-            if clients.len() == before {
+            let removed = server::revoke(&state()?, &device)?;
+            if removed == 0 {
                 bail!("no paired device matches '{device}'");
             }
-            state.save(StateDir::AUTHORIZED_CLIENTS, &clients)?;
-            println!("Removed {} device(s). Active sessions continue until they disconnect.", before - clients.len());
+            println!("Removed {removed} device(s). Active sessions continue until they disconnect.");
             Ok(())
         }
+        Command::Password { clear } => {
+            let new = if clear {
+                None
+            } else {
+                let first = rpassword::prompt_password("New password: ")?;
+                if rpassword::prompt_password("Repeat it: ")? != first {
+                    bail!("the passwords do not match");
+                }
+                Some(first)
+            };
+            // Through the running host when there is one: it knows where its state is (the
+            // service keeps it in ProgramData, not in this user's folder).
+            let running = cli.config_dir.is_none()
+                && velora_protocol::control::request(&velora_protocol::control::Request::Status).is_ok();
+            if running {
+                velora_protocol::control::request(&velora_protocol::control::Request::SetPassword {
+                    password: new.clone(),
+                })?;
+            } else {
+                password::set(&state()?, new.as_deref())?;
+            }
+            match new {
+                Some(_) => println!("Password set. Paired devices will be asked for it when they connect."),
+                None => println!("Password removed: paired devices connect without one."),
+            }
+            Ok(())
+        }
+        #[cfg(windows)]
+        Command::Service { action } => service_command(action, cli.config_dir.clone()),
     }
 }
 
-fn print_pairing(code: &PairingCode, bind: SocketAddr) {
-    // Advertise the address clients can actually reach: the bound one, or the LAN address
-    // when listening on every interface.
-    let ip = if bind.ip().is_unspecified() { local_ip() } else { Some(bind.ip()) };
-    let addr = match ip {
-        Some(ip) => SocketAddr::new(ip, bind.port()).to_string(),
-        None => format!("<this-pc-address>:{}", bind.port()),
+#[cfg(windows)]
+fn service_command(action: ServiceAction, config_dir: Option<PathBuf>) -> Result<()> {
+    let (result, report) = match action {
+        ServiceAction::Install { report } => (service::install(config_dir), report),
+        ServiceAction::Uninstall { report } => (service::uninstall(), report),
+        ServiceAction::Run => return service::run_dispatcher(),
     };
+    // The launcher runs these elevated, without a console to read. `create_new` never
+    // follows a link someone planted at that path in the user's temporary folder.
+    if let Some(path) = report {
+        let text = result.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default();
+        if let Ok(mut file) = std::fs::OpenOptions::new().write(true).create_new(true).open(path) {
+            use std::io::Write;
+            let _ = file.write_all(text.as_bytes());
+        }
+    }
+    result
+}
+
+/// Logs to stderr, or to a file for processes without a console: the service, and the host it
+/// starts (`--log-file`).
+fn init_logging(cli: &Cli) -> Result<()> {
+    let filter = || tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
+    let file = match &cli.command {
+        Command::Run { log_file: Some(path), .. } => Some(path.clone()),
+        #[cfg(windows)]
+        Command::Service { action: ServiceAction::Run } => Some(service::config_dir().join("service.log")),
+        _ => None,
+    };
+    match file {
+        Some(path) => {
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            let file = std::fs::File::create(&path)?;
+            tracing_subscriber::fmt()
+                .with_env_filter(filter())
+                .with_ansi(false)
+                .with_writer(std::sync::Mutex::new(file))
+                .init();
+        }
+        None => tracing_subscriber::fmt().with_env_filter(filter()).with_writer(std::io::stderr).init(),
+    }
+    Ok(())
+}
+
+fn print_pairing(code: &PairingCode, addr: &str) {
     println!();
     println!("Pairing code (single use, valid for 10 minutes):");
     println!();
     println!("    {}", code.encode());
     println!();
     println!("On a phone, scan this with the Velora app:");
-    let link = velora_protocol::pairing::pairing_uri(&addr, code);
+    let link = velora_protocol::pairing::pairing_uri(addr, code);
     match qrcode::QrCode::new(link.as_bytes()) {
         // Light modules drawn as blocks: reads correctly on the usual dark terminal background.
         Ok(qr) => println!(
@@ -170,14 +267,6 @@ fn print_pairing(code: &PairingCode, bind: SocketAddr) {
     println!();
     println!("Host fingerprint: {}", code.host.short());
     println!();
-}
-
-/// Primary LAN address, found by asking the OS which interface would route to a public IP
-/// (no packet is sent).
-fn local_ip() -> Option<std::net::IpAddr> {
-    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
-    socket.connect("192.0.2.1:9").ok()?;
-    Some(socket.local_addr().ok()?.ip())
 }
 
 fn hostname() -> String {

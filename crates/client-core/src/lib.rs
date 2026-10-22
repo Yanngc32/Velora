@@ -53,7 +53,25 @@ pub struct ConnectParams {
     pub device_name: String,
     /// Set when pairing for the first time.
     pub pairing_secret: Option<[u8; wire::PAIRING_SECRET_LEN]>,
+    /// The host's access password, when the user gave one.
+    pub password: Option<String>,
 }
+
+/// The host has an access password: ask the user for it and connect again with
+/// [`ConnectParams::password`]. Find it in a connection error with `downcast_ref`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PasswordRequired {
+    /// A password was sent and it was wrong.
+    pub wrong: bool,
+}
+
+impl std::fmt::Display for PasswordRequired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.wrong { "wrong password" } else { "this computer asks for a password" })
+    }
+}
+
+impl std::error::Error for PasswordRequired {}
 
 pub struct Session {
     pub host_name: String,
@@ -101,6 +119,7 @@ pub async fn connect(params: ConnectParams, output: VideoOutput) -> Result<Sessi
             version: PROTOCOL_VERSION,
             name: params.device_name,
             pairing_secret: params.pairing_secret,
+            password: params.password,
         }
         .encode(),
     )
@@ -118,6 +137,7 @@ pub async fn connect(params: ConnectParams, output: VideoOutput) -> Result<Sessi
                 break (host_name, width, height);
             }
             HostMsg::Rejected { reason } => bail!("host rejected the connection: {reason}"),
+            HostMsg::PasswordRequired { wrong } => return Err(PasswordRequired { wrong }.into()),
         }
     };
 

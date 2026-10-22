@@ -4,35 +4,47 @@ import android.os.Bundle
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.safeDrawingPadding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
-import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.Button
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
-import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.res.pluralStringResource
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
 import com.google.mlkit.vision.barcode.common.Barcode
 import com.google.mlkit.vision.codescanner.GmsBarcodeScannerOptions
 import com.google.mlkit.vision.codescanner.GmsBarcodeScanning
@@ -44,13 +56,14 @@ class MainActivity : ComponentActivity() {
     private var pairing by mutableStateOf<PairingLink?>(null)
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        enableEdgeToEdge()
         super.onCreate(savedInstanceState)
         setContent {
-            MaterialTheme(colorScheme = VeloraColors) {
-                Surface(Modifier.fillMaxSize()) {
+            VeloraTheme {
+                Box(Modifier.fillMaxSize().background(Velora.Bg)) {
                     HostsScreen(
                         hosts = hosts,
-                        onConnect = { SessionActivity.connect(this, it.name) },
+                        onConnect = { SessionActivity.connect(this@MainActivity, it.name) },
                         onForget = { forget(it) },
                         onScan = ::scan,
                         onManual = { pairing = PairingLink("", "") },
@@ -60,7 +73,7 @@ class MainActivity : ComponentActivity() {
                             initial = link,
                             onPair = { address, code ->
                                 pairing = null
-                                SessionActivity.pair(this, address.trim(), code.trim())
+                                SessionActivity.pair(this@MainActivity, address.trim(), code.trim())
                             },
                             onDismiss = { pairing = null },
                         )
@@ -98,27 +111,6 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-/** The Velora palette: dark ink background, teal actions, lavender and lime accents. */
-private val Ink = Color(0xFF0B0B0F)
-private val Card = Color(0xFF16141F)
-private val VeloraColors = darkColorScheme(
-    primary = Color(0xFF4EE1C3),
-    onPrimary = Ink,
-    secondary = Color(0xFFB388FF),
-    onSecondary = Ink,
-    tertiary = Color(0xFFB8FF6A),
-    onTertiary = Ink,
-    background = Ink,
-    onBackground = Color(0xFFF2F1F7),
-    surface = Ink,
-    onSurface = Color(0xFFF2F1F7),
-    surfaceVariant = Card,
-    onSurfaceVariant = Color(0xFFB9B6C9),
-    surfaceContainerHigh = Card,
-    outline = Color(0xFF3B2A6F),
-)
-
-@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun HostsScreen(
     hosts: List<HostEntry>,
@@ -128,49 +120,100 @@ private fun HostsScreen(
     onManual: () -> Unit,
 ) {
     var confirmForget by remember { mutableStateOf<HostEntry?>(null) }
-    Column(Modifier.fillMaxSize().padding(24.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
-        Column {
-            Text(stringResource(R.string.app_name), style = MaterialTheme.typography.headlineMedium)
-            Text(
-                stringResource(R.string.tagline).uppercase(),
-                style = MaterialTheme.typography.labelLarge,
-                color = MaterialTheme.colorScheme.primary,
-            )
+    Column(Modifier.fillMaxSize().safeDrawingPadding().padding(horizontal = 20.dp, vertical = 16.dp)) {
+        Brand()
+        Spacer(Modifier.height(28.dp))
+        val count = if (hosts.isEmpty()) null else pluralStringResource(R.plurals.devices_count, hosts.size, hosts.size)
+        PageHeader(stringResource(R.string.devices_label), stringResource(R.string.devices_title), count)
+        Spacer(Modifier.height(20.dp))
+        Box(Modifier.weight(1f)) {
+            if (hosts.isEmpty()) EmptyDevices(onScan) else DeviceList(hosts, onConnect, onLongPress = { confirmForget = it })
         }
-        if (hosts.isEmpty()) {
-            Text(stringResource(R.string.no_hosts), style = MaterialTheme.typography.bodyLarge)
+        Spacer(Modifier.height(16.dp))
+        PrimaryButton(stringResource(R.string.scan_qr), onScan, Modifier.fillMaxWidth(), icon = R.drawable.ic_scan_qr_code)
+        Spacer(Modifier.height(10.dp))
+        SecondaryButton(stringResource(R.string.enter_code), onManual, Modifier.fillMaxWidth(), icon = R.drawable.ic_keyboard)
+    }
+    confirmForget?.let { host ->
+        VeloraDialog(onDismiss = { confirmForget = null }) {
+            Text(stringResource(R.string.forget_title, host.name), style = MaterialTheme.typography.titleMedium)
+            Spacer(Modifier.height(6.dp))
+            Text(stringResource(R.string.forget_text), style = MaterialTheme.typography.bodyMedium, color = Velora.Weak)
+            Spacer(Modifier.height(20.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                SecondaryButton(stringResource(R.string.cancel), { confirmForget = null }, Modifier.weight(1f))
+                PrimaryButton(stringResource(R.string.forget), { onForget(host); confirmForget = null }, Modifier.weight(1f))
+            }
         }
-        LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            items(hosts, key = { it.name }) { host ->
-                Surface(
-                    color = MaterialTheme.colorScheme.surfaceVariant,
-                    shape = MaterialTheme.shapes.medium,
-                    modifier = Modifier.fillMaxWidth().combinedClickable(
-                        onClick = { onConnect(host) },
-                        onLongClick = { confirmForget = host },
-                    ),
+    }
+}
+
+/** Logo and name, as at the top of the desktop sidebar. */
+@Composable
+private fun Brand() {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Image(
+            painterResource(R.drawable.velora_logo),
+            contentDescription = null,
+            modifier = Modifier.size(28.dp).clip(RoundedCornerShape(6.dp)),
+        )
+        Spacer(Modifier.width(10.dp))
+        Text(stringResource(R.string.app_name), style = MaterialTheme.typography.titleMedium.copy(fontSize = 17.sp))
+    }
+}
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun DeviceList(hosts: List<HostEntry>, onConnect: (HostEntry) -> Unit, onLongPress: (HostEntry) -> Unit) {
+    VeloraCard(padding = androidx.compose.foundation.layout.PaddingValues(0.dp)) {
+        LazyColumn {
+            itemsIndexed(hosts, key = { _, h -> h.name }) { i, host ->
+                if (i > 0) HorizontalDivider(color = Velora.Border, thickness = 1.dp)
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .combinedClickable(onClick = { onConnect(host) }, onLongClick = { onLongPress(host) })
+                        .padding(horizontal = 16.dp, vertical = 14.dp),
+                    verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    Column(Modifier.padding(16.dp)) {
-                        Text(host.name, style = MaterialTheme.typography.titleMedium)
-                        Text(host.address, style = MaterialTheme.typography.bodyMedium)
+                    IconTile(R.drawable.ic_monitor)
+                    Spacer(Modifier.width(12.dp))
+                    Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                        Text(host.name, style = MaterialTheme.typography.titleSmall.copy(fontSize = 15.sp))
+                        Text(host.address, style = TextStyle(fontFamily = Velora.Mono, fontSize = 12.sp, color = Velora.Weak))
                     }
+                    Spacer(Modifier.width(8.dp))
+                    PrimaryButton(stringResource(R.string.connect), { onConnect(host) })
                 }
             }
         }
-        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            Button(onClick = onScan) { Text(stringResource(R.string.scan_qr)) }
-            OutlinedButton(onClick = onManual) { Text(stringResource(R.string.enter_code)) }
+    }
+}
+
+/** Like the desktop's empty device list. */
+@Composable
+private fun EmptyDevices(onScan: () -> Unit) {
+    VeloraCard(padding = androidx.compose.foundation.layout.PaddingValues(24.dp)) {
+        Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
+            Icon(painterResource(R.drawable.ic_monitor), contentDescription = null, tint = Velora.Faint, modifier = Modifier.size(32.dp))
+            Spacer(Modifier.height(14.dp))
+            Text(stringResource(R.string.no_hosts_title), style = MaterialTheme.typography.titleMedium.copy(fontSize = 16.sp))
+            Spacer(Modifier.height(4.dp))
+            Text(
+                stringResource(R.string.no_hosts),
+                style = MaterialTheme.typography.bodyMedium,
+                color = Velora.Weak,
+                textAlign = TextAlign.Center,
+            )
         }
     }
-    confirmForget?.let { host ->
-        AlertDialog(
-            onDismissRequest = { confirmForget = null },
-            title = { Text(stringResource(R.string.forget_title, host.name)) },
-            confirmButton = {
-                TextButton(onClick = { onForget(host); confirmForget = null }) { Text(stringResource(R.string.forget)) }
-            },
-            dismissButton = { TextButton(onClick = { confirmForget = null }) { Text(stringResource(R.string.cancel)) } },
-        )
+}
+
+/** A card-styled dialog, like the desktop's password prompt. */
+@Composable
+fun VeloraDialog(onDismiss: () -> Unit, content: @Composable androidx.compose.foundation.layout.ColumnScope.() -> Unit) {
+    Dialog(onDismissRequest = onDismiss) {
+        VeloraCard(padding = androidx.compose.foundation.layout.PaddingValues(24.dp), content = content)
     }
 }
 
@@ -178,21 +221,23 @@ private fun HostsScreen(
 private fun PairDialog(initial: PairingLink, onPair: (String, String) -> Unit, onDismiss: () -> Unit) {
     var address by remember { mutableStateOf(initial.address) }
     var code by remember { mutableStateOf(initial.code) }
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text(stringResource(R.string.pair_title)) },
-        text = {
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text(stringResource(R.string.pair_hint))
-                OutlinedTextField(address, { address = it }, label = { Text(stringResource(R.string.address)) }, singleLine = true)
-                OutlinedTextField(code, { code = it }, label = { Text(stringResource(R.string.code)) }, singleLine = true)
-            }
-        },
-        confirmButton = {
-            TextButton(enabled = address.isNotBlank() && code.startsWith("VL1-"), onClick = { onPair(address, code) }) {
-                Text(stringResource(R.string.pair))
-            }
-        },
-        dismissButton = { TextButton(onClick = onDismiss) { Text(stringResource(R.string.cancel)) } },
-    )
+    VeloraDialog(onDismiss) {
+        Text(stringResource(R.string.pair_title), style = MaterialTheme.typography.titleMedium.copy(fontSize = 17.sp))
+        Spacer(Modifier.height(4.dp))
+        Text(stringResource(R.string.pair_hint), style = MaterialTheme.typography.bodyMedium, color = Velora.Weak)
+        Spacer(Modifier.height(18.dp))
+        Field(stringResource(R.string.code), code, { code = it }, placeholder = "VL1-…", technical = true)
+        Spacer(Modifier.height(12.dp))
+        Field(stringResource(R.string.address), address, { address = it }, placeholder = "192.168.0.10:7420", technical = true)
+        Spacer(Modifier.height(20.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            SecondaryButton(stringResource(R.string.cancel), onDismiss, Modifier.weight(1f))
+            PrimaryButton(
+                stringResource(R.string.pair),
+                { onPair(address, code) },
+                Modifier.weight(1f),
+                enabled = address.isNotBlank() && code.trim().startsWith("VL1-"),
+            )
+        }
+    }
 }

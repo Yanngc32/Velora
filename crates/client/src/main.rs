@@ -1,6 +1,7 @@
 // The launcher is a GUI app: no console window on Windows (see `attach_console`).
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+mod autostart;
 mod gui;
 mod keymap;
 mod render;
@@ -47,9 +48,20 @@ struct Cli {
     /// Don't install updates in the background (release builds update themselves by default).
     #[arg(long, global = true)]
     no_update: bool,
+    /// Read the host's access password from the first line of standard input.
+    #[arg(long, global = true)]
+    password_stdin: bool,
+    /// Started at sign-in: turn sharing on and/or open the launcher minimized, as the
+    /// settings say.
+    #[arg(long, hide = true)]
+    autostart: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
+
+/// Exit status when the host asks for its access password (missing or wrong), so the
+/// launcher can ask the user and start the session again.
+pub const EXIT_PASSWORD_REQUIRED: i32 = 3;
 
 #[derive(Subcommand)]
 enum Command {
@@ -77,6 +89,16 @@ enum Command {
 }
 
 fn main() -> Result<()> {
+    match run() {
+        Err(e) if e.downcast_ref::<velora_client_core::PasswordRequired>().is_some() => {
+            eprintln!("Error: {e:#}");
+            std::process::exit(EXIT_PASSWORD_REQUIRED);
+        }
+        result => result,
+    }
+}
+
+fn run() -> Result<()> {
     #[cfg(windows)]
     attach_console();
     tracing_subscriber::fmt()
@@ -90,7 +112,19 @@ fn main() -> Result<()> {
     let settings = Settings::load(&state);
     let no_update = cli.no_update || !settings.auto_update;
     let Some(command) = cli.command else {
-        return gui::run(state, cli.config_dir, no_update);
+        if cli.autostart {
+            if settings.share_at_login
+                && velora_protocol::control::request(&velora_protocol::control::Request::Status).is_err()
+            {
+                if let Err(e) = gui::spawn_host(cli.config_dir.as_deref(), "velora-host not found") {
+                    tracing::warn!("cannot turn sharing on: {e:#}");
+                }
+            }
+            if !settings.open_at_login {
+                return Ok(());
+            }
+        }
+        return gui::run(state, cli.config_dir, no_update, cli.autostart);
     };
     let runtime = tokio::runtime::Runtime::new()?;
     if matches!(command, Command::Pair { .. } | Command::Connect { .. })
@@ -105,6 +139,8 @@ fn main() -> Result<()> {
     }
 
     let device_name = settings.device_name;
+    let password = if cli.password_stdin { Some(read_password()?).filter(|p| !p.is_empty()) } else { None };
+    let password = password.as_deref();
     match command {
         Command::Update => {
             match velora_update::update_now()? {
@@ -128,7 +164,7 @@ fn main() -> Result<()> {
             let slot = Arc::new(FrameSlot::default());
             let output = VideoOutput::Decoded { slot: slot.clone(), on_frame: redraw_callback(proxy) };
             let name = name.unwrap_or(device_name);
-            let session = runtime.block_on(hosts::pair(&state, &address, &code, &name, output))?;
+            let session = runtime.block_on(hosts::pair(&state, &address, &code, &name, password, output))?;
             println!("Paired with '{}'. Next time: velora connect {}", session.host_name, session.host_name);
             run_window(&runtime, event_loop, session, slot)
         }
@@ -136,7 +172,7 @@ fn main() -> Result<()> {
             let (proxy, event_loop) = new_event_loop()?;
             let slot = Arc::new(FrameSlot::default());
             let output = VideoOutput::Decoded { slot: slot.clone(), on_frame: redraw_callback(proxy) };
-            let session = runtime.block_on(hosts::connect(&state, &host, &device_name, output))?;
+            let session = runtime.block_on(hosts::connect(&state, &host, &device_name, password, output))?;
             run_window(&runtime, event_loop, session, slot)
         }
         Command::Bench { host, seconds } => runtime.block_on(async {
@@ -146,7 +182,7 @@ fn main() -> Result<()> {
                 counter.fetch_add(1, Ordering::Relaxed);
             });
             let output = VideoOutput::Decoded { slot: Arc::new(FrameSlot::default()), on_frame };
-            let session = hosts::connect(&state, &host, &device_name, output).await?;
+            let session = hosts::connect(&state, &host, &device_name, password, output).await?;
             println!("connected to '{}' ({}x{})", session.host_name, session.width, session.height);
             tokio::time::sleep(Duration::from_secs(seconds)).await;
             let n = frames.load(Ordering::Relaxed);
@@ -159,6 +195,13 @@ fn main() -> Result<()> {
             Ok(())
         }),
     }
+}
+
+/// The first line of standard input, without its line ending.
+fn read_password() -> Result<String> {
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    Ok(line.trim_end_matches(['\r', '\n']).to_string())
 }
 
 /// A GUI-subsystem program has no console; reuse the terminal it was started from, if any,

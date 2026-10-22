@@ -10,18 +10,20 @@ pub enum Icon {
     Settings,
     Info,
     Plus,
+    Smartphone,
 }
 
-pub struct Icons([TextureHandle; 5]);
+pub struct Icons([TextureHandle; 6]);
 
 impl Icons {
     pub fn load(ctx: &egui::Context) -> anyhow::Result<Self> {
-        let files: [(&str, &[u8]); 5] = [
+        let files: [(&str, &[u8]); 6] = [
             ("log-in", include_bytes!("../../assets/icons/log-in.png")),
             ("monitor", include_bytes!("../../assets/icons/monitor.png")),
             ("settings", include_bytes!("../../assets/icons/settings.png")),
             ("info", include_bytes!("../../assets/icons/info.png")),
             ("plus", include_bytes!("../../assets/icons/plus.png")),
+            ("smartphone", include_bytes!("../../assets/icons/smartphone.png")),
         ];
         let mut textures = Vec::with_capacity(files.len());
         for (name, png) in files {

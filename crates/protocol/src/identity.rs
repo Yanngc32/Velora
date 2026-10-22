@@ -58,6 +58,8 @@ impl StateDir {
     pub const IDENTITY: &'static str = "identity.json";
     pub const AUTHORIZED_CLIENTS: &'static str = "authorized_clients.json";
     pub const KNOWN_HOSTS: &'static str = "known_hosts.json";
+    /// Hash of the host's access password (see the host's `password` module).
+    pub const ACCESS_PASSWORD: &'static str = "access_password.json";
 
     /// Uses `base` when given, otherwise the platform config directory.
     pub fn open(base: Option<PathBuf>, role: &str) -> Result<Self> {

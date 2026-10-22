@@ -6,4 +6,6 @@
     <color name="velora_lavender">#B388FF</color>
     <color name="velora_indigo">#3B2A6F</color>
     <color name="velora_ink">#0B0B0F</color>
+    <!-- Desktop launcher background, so windows open without a flash. -->
+    <color name="velora_bg">#0F1014</color>
 </resources>

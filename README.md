@@ -58,8 +58,8 @@ project yet (no GPU in CI).
 | `crates/mobile` (`velora-mobile`) | Client core exported to the mobile apps through [UniFFI](https://mozilla.github.io/uniffi-rs/) |
 | `crates/uniffi-bindgen` | Generates the Kotlin (later Swift) bindings for `velora-mobile` |
 | `android/` | Android app (Kotlin): MediaCodec hardware decoding, trackpad, soft and physical keyboards |
-| `crates/update` | Signed self-updates from GitHub Releases |
-| `crates/release` (`velora-release`) | Release tooling used by CI: signing key, packaging, manifest signing |
+| `crates/update` | Self-updates from GitHub Releases |
+| `crates/release` (`velora-release`) | Release tooling used by CI: packaging and the update manifest |
 
 ## Installing
 
@@ -81,12 +81,12 @@ Release builds keep themselves up to date:
   `VELORA_NO_UPDATE=1` to turn background updates off. Builds made from source never update
   themselves.
 
-Each release carries `manifest.json`, which lists every file with its SHA-256. The manifest is
-signed with an Ed25519 key that only the release workflow holds, and the public key is
-compiled into the binaries. Before installing anything, an update checks:
+Each release carries `manifest.json`, which lists every file with its SHA-256. Updates come
+over HTTPS from this repository's releases only, which are trusted as published (there is no
+separate signing key). Before installing anything, an update checks:
 
-- the manifest signature;
-- that the version is newer than the installed one (an old manifest can't be replayed);
+- that the version is newer than the installed one (no downgrades);
+- that every path stays inside the install directory;
 - each file's hash and size.
 
 Only files that changed are downloaded, so the FFmpeg libraries aren't fetched again unless
@@ -170,8 +170,23 @@ Host management:
 ```sh
 velora-host clients                 # paired devices
 velora-host revoke <name|fingerprint>
+velora-host password [--clear]      # password paired devices must also type to connect
 velora-host run --fps 60 --bitrate 12000 --bind 0.0.0.0:7420 --encoder auto
 ```
+
+The Velora app does the same under **This PC**: turn sharing on, show the pairing QR code,
+see which devices are paired and connected, remove them, and set the access password.
+**Settings → Start with Windows** opens the app and/or turns sharing on at sign-in.
+
+### Lock screen access (Windows)
+
+**This PC → Access on the lock screen** (or `velora-host service install` as administrator)
+installs Velora as a Windows service. It copies the app to `C:\Program Files\Velora`, keeps
+the host's state in `C:\ProgramData\Velora` (readable only by SYSTEM and administrators,
+paired devices and password are carried over), and starts the host as SYSTEM in the console
+session. The host then follows the lock screen, UAC prompts and the logon screen, and runs
+from boot. `velora-host service uninstall` removes it. Under the service, only administrators
+can pair or remove devices and change the password.
 
 When a second paired device connects, it takes over the session. Switching from the phone to
 the laptop just works.
@@ -229,9 +244,14 @@ Every connection is authenticated and encrypted either way.
   the host checks the client against its paired list.
 - Keys and lists are stored in the OS config directory (`~/.config/velora` on Linux,
   `%APPDATA%\velora\config` on Windows), readable only by the user on Unix.
+- Optional access password: paired devices must also send it (inside TLS) to open a session.
+  Only a salted PBKDF2-SHA256 hash is stored; repeated wrong guesses lock that device out for
+  a growing time.
+- The launcher talks to the local host over a named pipe (Windows) or a Unix socket, open
+  only to the user it serves, SYSTEM and administrators.
 
-Windows limitations: input can't reach elevated windows unless `velora-host` runs elevated. The
-secure desktop (UAC prompts, lock screen) needs the host to run as a service (planned).
+Windows limitations: without the service, input can't reach elevated windows unless
+`velora-host` runs elevated, nor the secure desktop (UAC prompts, lock screen).
 
 ## Roadmap
 
@@ -245,29 +265,20 @@ secure desktop (UAC prompts, lock screen) needs the host to run as a service (pl
 4. **NAT traversal.** A self-hostable rendezvous server, UDP hole punching, and a relay fallback.
 5. Wayland capture (xdg-desktop-portal + PipeWire), multi-monitor selection, cursor shape sync,
    clipboard, audio, relative mouse mode for games, adaptive bitrate.
-6. Run as a Windows service and a systemd user service; installers.
+6. A systemd user service; installers.
 
 ## Releasing (maintainers)
-
-One-time setup:
-
-```sh
-cargo run -p velora-release -- keygen --private-key-out signing-key.txt
-```
-
-1. Commit the printed public key as `crates/update/release-public-key.txt`.
-2. Add the contents of `signing-key.txt` as the repository secret `VELORA_SIGNING_KEY`
-   (Settings → Secrets and variables → Actions).
-3. Delete the local `signing-key.txt`, or keep it offline. Anyone with this key can push
-   updates to every installation.
 
 To publish a release, bump `version` in the workspace `Cargo.toml`, merge, then push a
 matching tag (`git tag v0.2.0 && git push origin v0.2.0`). The Release workflow then:
 
 1. builds Windows and Linux with FFmpeg (Linux on Ubuntu 22.04, for a low glibc requirement);
 2. smoke-tests the packaged binaries;
-3. signs the manifest;
+3. writes the update manifest;
 4. publishes the GitHub release.
+
+Every installed copy picks the release up automatically, so treat push access to this
+repository (and its tags) as access to every installation.
 
 Pull requests that touch the release machinery run the same build as a dry run.
 

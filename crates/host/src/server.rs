@@ -18,8 +18,9 @@ use std::{
 use anyhow::{bail, Context, Result};
 use tokio::sync::{mpsc, oneshot};
 use velora_protocol::{
+    control::{self, Reply, Request},
     identity::{AuthorizedClient, StateDir},
-    pairing::PairingCode,
+    pairing::{pairing_uri, PairingCode},
     tls::{self, Fingerprint},
     wire::{self, ClientMsg, Codec, FrameHeader, HostMsg, MouseMove, PROTOCOL_VERSION},
 };
@@ -28,6 +29,7 @@ use crate::{
     capture::{self, DisplayRect},
     encode::{self, EncoderChoice, EncoderSettings},
     input::{InputCmd, InputHandle},
+    password::Check,
 };
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -39,6 +41,7 @@ const STATS_INTERVAL: Duration = Duration::from_secs(5);
 const UPDATE_FIRST_CHECK: Duration = Duration::from_secs(60);
 const UPDATE_INTERVAL: Duration = Duration::from_secs(6 * 3600);
 const UPDATE_IDLE_POLL: Duration = Duration::from_secs(30);
+const PAIRING_TTL: Duration = Duration::from_secs(10 * 60);
 
 pub struct HostOptions {
     pub bind: SocketAddr,
@@ -46,29 +49,41 @@ pub struct HostOptions {
     pub fps: u32,
     pub bitrate_kbps: u32,
     pub encoder: EncoderChoice,
+    /// Running as the system service, which the launcher shows.
+    pub service: bool,
 }
 
-struct PendingPairing {
-    code: PairingCode,
+#[derive(Clone)]
+pub struct PendingPairing {
+    pub code: PairingCode,
+    /// Address advertised in the pairing link.
+    pub address: String,
     expires: Instant,
 }
 
-struct Shared {
-    options: HostOptions,
-    state: StateDir,
-    input: InputHandle,
-    pairing: Mutex<Option<PendingPairing>>,
-    active: Mutex<Option<quinn::Connection>>,
+struct Active {
+    conn: quinn::Connection,
+    fingerprint: Fingerprint,
 }
 
-/// Runs until the endpoint fails, or until an update was installed and the host is idle;
-/// then returns `true` so the caller restarts into the new version.
-pub async fn run(
+pub struct Shared {
     options: HostOptions,
     state: StateDir,
-    pairing: Option<(PairingCode, Duration)>,
-    auto_update: bool,
-) -> Result<bool> {
+    fingerprint: Fingerprint,
+    input: InputHandle,
+    pairing: Mutex<Option<PendingPairing>>,
+    /// Held across every read-modify-write of the paired list, so pairing and removing a
+    /// device at the same moment cannot undo each other.
+    clients: Mutex<()>,
+    password: crate::password::Gate,
+    active: Mutex<Option<Active>>,
+    shutdown: tokio::sync::Notify,
+}
+
+/// Runs until the endpoint fails or the launcher stops the host, or until an update was
+/// installed and the host is idle; then returns `true` so the caller restarts into the new
+/// version. With `pair`, a pairing window opens right away and is printed.
+pub async fn run(options: HostOptions, state: StateDir, pair: bool, auto_update: bool) -> Result<bool> {
     let identity = state.load_or_create_identity()?;
     let endpoint = quinn::Endpoint::server(tls::server_config(&identity)?, options.bind)
         .with_context(|| format!("binding {}", options.bind))?;
@@ -83,10 +98,33 @@ pub async fn run(
     let shared = Arc::new(Shared {
         options,
         state,
+        password: crate::password::Gate::default(),
+        fingerprint: identity.fingerprint(),
         input: crate::input::spawn(),
-        pairing: Mutex::new(pairing.map(|(code, ttl)| PendingPairing { code, expires: Instant::now() + ttl })),
+        pairing: Mutex::new(None),
+        clients: Mutex::new(()),
         active: Mutex::new(None),
+        shutdown: tokio::sync::Notify::new(),
     });
+    if pair {
+        let pairing = shared.start_pairing()?;
+        crate::print_pairing(&pairing.code, &pairing.address);
+    }
+    // The launcher's view of this host. Without it the host still works from the command line.
+    {
+        let shared = shared.clone();
+        tokio::spawn(async move {
+            if let Err(e) = crate::control::serve(shared.clone()).await {
+                // Under the service another process could have taken the pipe's name: exit
+                // and let the service start the host again rather than run unreachable.
+                if shared.is_service() {
+                    tracing::error!("local control channel failed: {e:#}");
+                    std::process::exit(1);
+                }
+                tracing::warn!("local control channel unavailable: {e:#}");
+            }
+        });
+    }
 
     let updated = async {
         if auto_update {
@@ -114,6 +152,12 @@ pub async fn run(
                 endpoint.close(0u32.into(), b"host is updating");
                 endpoint.wait_idle().await;
                 return Ok(true);
+            }
+            () = shared.shutdown.notified() => {
+                tracing::info!("stopping at the launcher's request");
+                endpoint.close(0u32.into(), b"host stopped");
+                endpoint.wait_idle().await;
+                return Ok(false);
             }
         }
     }
@@ -155,7 +199,7 @@ async fn handle_connection(incoming: quinn::Incoming, shared: Arc<Shared>) -> Re
         .await
         .context("no hello")??
         .context("closed before hello")?;
-    let ClientMsg::Hello { version, name, pairing_secret } = ClientMsg::decode(&body)? else {
+    let ClientMsg::Hello { version, name, pairing_secret, password } = ClientMsg::decode(&body)? else {
         bail!("expected hello");
     };
     // Shown in logs and stored in the paired list: strip control characters.
@@ -169,55 +213,230 @@ async fn handle_connection(incoming: quinn::Incoming, shared: Arc<Shared>) -> Re
         bail!("client '{name}' uses protocol {version}");
     }
 
-    match authorize(&shared, fingerprint, &name, pairing_secret)? {
-        Auth::Known => {}
-        Auth::Paired => send.write_all(&HostMsg::Paired.encode()).await?,
-        Auth::Denied => {
-            send.write_all(&reject("this device is not paired with the host")).await?;
-            let _ = send.finish();
-            let _ = send.stopped().await;
-            bail!("unauthorized client '{name}' ({fingerprint})");
+    let auth = {
+        let shared = shared.clone();
+        let name = name.clone();
+        // Checking a password is deliberately slow (key stretching): off the async workers.
+        tokio::task::spawn_blocking(move || authorize(&shared, fingerprint, &name, pairing_secret, password.as_deref()))
+            .await??
+    };
+    let refusal = match auth {
+        Auth::Known => None,
+        Auth::Paired => {
+            send.write_all(&HostMsg::Paired.encode()).await?;
+            None
         }
+        Auth::Denied => Some((reject("this device is not paired with the host"), "not paired")),
+        Auth::Password { wrong } => {
+            Some((HostMsg::PasswordRequired { wrong }.encode(), if wrong { "wrong password" } else { "no password" }))
+        }
+        Auth::LockedOut(left) => {
+            let reason = format!("too many wrong passwords; try again in {} s", left.as_secs().max(1));
+            Some((reject(&reason), "password locked out"))
+        }
+    };
+    if let Some((message, why)) = refusal {
+        send.write_all(&message).await?;
+        let _ = send.finish();
+        let _ = send.stopped().await;
+        bail!("refused client '{name}' ({fingerprint}): {why}");
     }
     tracing::info!("client '{name}' ({fingerprint}) connected from {}", conn.remote_address());
 
     // A newly connected device takes over: switching from the phone to a PC should just work.
-    if let Some(old) = shared.active.lock().unwrap().replace(conn.clone()) {
-        old.close(1u32.into(), b"another device took over");
+    if let Some(old) = shared.active.lock().unwrap().replace(Active { conn: conn.clone(), fingerprint }) {
+        old.conn.close(1u32.into(), b"another device took over");
     }
 
     let result = run_session(&conn, send, recv, &shared).await;
 
     shared.input.send(InputCmd::ReleaseAll);
     let mut active = shared.active.lock().unwrap();
-    if active.as_ref().is_some_and(|c| c.stable_id() == conn.stable_id()) {
+    if active.as_ref().is_some_and(|a| a.conn.stable_id() == conn.stable_id()) {
         *active = None;
     }
     result
+}
+
+impl Shared {
+    pub fn is_service(&self) -> bool {
+        self.options.service
+    }
+
+    /// Opens a pairing window, replacing any open one.
+    fn start_pairing(&self) -> Result<PendingPairing> {
+        let pairing = PendingPairing {
+            code: PairingCode::generate(self.fingerprint)?,
+            address: advertised_address(self.options.bind),
+            expires: Instant::now() + PAIRING_TTL,
+        };
+        *self.pairing.lock().unwrap() = Some(pairing.clone());
+        Ok(pairing)
+    }
+
+    /// Handles a request from the launcher on this computer. Under the service, the host is
+    /// shared by everyone who logs on: only administrators may change who has access, and
+    /// nobody stops it this way (the service would only start it again).
+    pub fn control(&self, request: Request, privileged: bool) -> Reply {
+        if self.options.service && request == Request::Shutdown {
+            return Err("this host runs as the Velora service; turn the service off instead".into());
+        }
+        if self.options.service && !privileged && request != Request::Status {
+            return Err("only an administrator can change this computer's access".into());
+        }
+        let result = match request {
+            Request::Status => Ok(()),
+            Request::StartPairing => self.start_pairing().map(drop),
+            Request::CancelPairing => {
+                *self.pairing.lock().unwrap() = None;
+                Ok(())
+            }
+            Request::Revoke { fingerprint } => self.revoke(&fingerprint),
+            Request::SetPassword { password } => {
+                crate::password::set(&self.state, password.as_deref()).map(|()| self.password.reset())
+            }
+            Request::Shutdown => {
+                self.shutdown.notify_one();
+                Ok(())
+            }
+        };
+        result.and_then(|()| self.status()).map_err(|e| format!("{e:#}"))
+    }
+
+    fn revoke(&self, fingerprint: &str) -> Result<()> {
+        let fingerprint = Fingerprint::from_base64(fingerprint)?;
+        let _clients = self.clients.lock().unwrap();
+        if revoke(&self.state, &fingerprint.to_base64())? == 0 {
+            bail!("this device is not paired");
+        }
+        if let Some(active) = self.active.lock().unwrap().as_ref().filter(|a| a.fingerprint == fingerprint) {
+            active.conn.close(2u32.into(), b"device removed on the host");
+        }
+        Ok(())
+    }
+
+    fn status(&self) -> Result<control::Status> {
+        let clients: Vec<AuthorizedClient> = self.state.load(StateDir::AUTHORIZED_CLIENTS)?;
+        let connected = self.active.lock().unwrap().as_ref().map(|a| a.fingerprint.to_base64());
+        let devices = clients
+            .into_iter()
+            .map(|c| control::Device {
+                short: Fingerprint::from_base64(&c.fingerprint).map(|f| f.short()).unwrap_or_default(),
+                connected: connected.as_deref() == Some(c.fingerprint.as_str()),
+                name: c.name,
+                fingerprint: c.fingerprint,
+                added_unix: c.added_unix,
+            })
+            .collect();
+        let pairing = self.pairing.lock().unwrap().as_ref().and_then(|p| {
+            let left = p.expires.checked_duration_since(Instant::now())?;
+            Some(control::Pairing {
+                uri: pairing_uri(&p.address, &p.code),
+                code: p.code.encode(),
+                address: p.address.clone(),
+                expires_in_secs: left.as_secs(),
+            })
+        });
+        let address = advertised_address(self.options.bind);
+        Ok(control::Status {
+            name: self.options.name.clone(),
+            version: velora_update::Version::current().to_string(),
+            fingerprint: self.fingerprint.short(),
+            address: (!address.starts_with('<')).then_some(address),
+            service: self.options.service,
+            password_set: crate::password::is_set(&self.state)?,
+            devices,
+            pairing,
+        })
+    }
+}
+
+/// Removes the paired devices matching `device` (name, or full or short fingerprint) and
+/// returns how many. Every handshake re-reads the list, so this applies without a restart.
+pub fn revoke(state: &StateDir, device: &str) -> Result<usize> {
+    let mut clients: Vec<AuthorizedClient> = state.load(StateDir::AUTHORIZED_CLIENTS)?;
+    let before = clients.len();
+    clients.retain(|c| {
+        let short = Fingerprint::from_base64(&c.fingerprint).map(|f| f.short()).unwrap_or_default();
+        c.name != device && c.fingerprint != device && short != device
+    });
+    let removed = before - clients.len();
+    if removed > 0 {
+        state.save(StateDir::AUTHORIZED_CLIENTS, &clients)?;
+    }
+    Ok(removed)
+}
+
+/// The address clients can actually reach: the bound one, or the LAN address when listening
+/// on every interface.
+pub fn advertised_address(bind: SocketAddr) -> String {
+    let ip = if bind.ip().is_unspecified() { local_ip() } else { Some(bind.ip()) };
+    match ip {
+        Some(ip) => SocketAddr::new(ip, bind.port()).to_string(),
+        None => format!("<this-pc-address>:{}", bind.port()),
+    }
+}
+
+/// Primary LAN address, found by asking the OS which interface would route to a public IP
+/// (no packet is sent).
+fn local_ip() -> Option<std::net::IpAddr> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("192.0.2.1:9").ok()?;
+    Some(socket.local_addr().ok()?.ip())
 }
 
 enum Auth {
     Known,
     Paired,
     Denied,
+    /// Paired (or holding a valid pairing code), but the access password is missing or wrong.
+    Password {
+        wrong: bool,
+    },
+    LockedOut(Duration),
 }
 
+/// Decides whether a connecting device may open a session. The pairing code is consumed only
+/// once the password (if any) was right too, so a device asked for the password can retry
+/// with the same code. Unpaired devices learn nothing about the password.
 fn authorize(
     shared: &Shared,
     fingerprint: Fingerprint,
     name: &str,
     secret: Option<[u8; wire::PAIRING_SECRET_LEN]>,
+    password: Option<&str>,
 ) -> Result<Auth> {
     let fp = fingerprint.to_base64();
+    let pairing_valid = |secret: &[u8; wire::PAIRING_SECRET_LEN]| {
+        let pairing = shared.pairing.lock().unwrap();
+        pairing.as_ref().is_some_and(|p| p.expires > Instant::now() && p.code.secret_matches(secret))
+    };
     // Re-read on every connection so `velora-host revoke` applies without a restart.
-    let mut clients: Vec<AuthorizedClient> = shared.state.load(StateDir::AUTHORIZED_CLIENTS)?;
-    if clients.iter().any(|c| c.fingerprint == fp) {
-        return Ok(Auth::Known);
+    let known = {
+        let _clients = shared.clients.lock().unwrap();
+        shared.state.load::<Vec<AuthorizedClient>>(StateDir::AUTHORIZED_CLIENTS)?.iter().any(|c| c.fingerprint == fp)
+    };
+    if !known && !secret.as_ref().is_some_and(pairing_valid) {
+        return Ok(Auth::Denied);
     }
-    let Some(secret) = secret else { return Ok(Auth::Denied) };
+    match shared.password.check(&shared.state, fingerprint, password) {
+        Check::Ok => {}
+        Check::Required { wrong } => return Ok(Auth::Password { wrong }),
+        Check::LockedOut(left) => return Ok(Auth::LockedOut(left)),
+    }
+    if known {
+        // The check takes a moment: the device may have been removed meanwhile.
+        let _clients = shared.clients.lock().unwrap();
+        let clients: Vec<AuthorizedClient> = shared.state.load(StateDir::AUTHORIZED_CLIENTS)?;
+        return Ok(if clients.iter().any(|c| c.fingerprint == fp) { Auth::Known } else { Auth::Denied });
+    }
 
+    let _clients = shared.clients.lock().unwrap();
+    let mut clients: Vec<AuthorizedClient> = shared.state.load(StateDir::AUTHORIZED_CLIENTS)?;
     let mut pairing = shared.pairing.lock().unwrap();
-    let valid = pairing.as_ref().is_some_and(|p| p.expires > Instant::now() && p.code.secret_matches(&secret));
+    // Another device may have used the code meanwhile.
+    let valid = secret
+        .is_some_and(|s| pairing.as_ref().is_some_and(|p| p.expires > Instant::now() && p.code.secret_matches(&s)));
     if !valid {
         return Ok(Auth::Denied);
     }

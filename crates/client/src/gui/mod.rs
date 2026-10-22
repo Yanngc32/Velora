@@ -8,10 +8,11 @@ mod icons;
 mod motion;
 mod strings;
 mod theme;
+mod this_pc;
 mod widgets;
 
 use std::{
-    io::Read,
+    io::{Read, Write},
     path::PathBuf,
     process::{Child, Command, Stdio},
     sync::{Arc, Mutex},
@@ -24,6 +25,8 @@ use icons::{Icon, Icons};
 use motion::success_notice;
 use strings::{fill, Strings};
 use theme::*;
+pub use this_pc::spawn_host;
+use this_pc::{HostLink, ServiceJob};
 use velora_client_core::hosts;
 use velora_protocol::{
     identity::{KnownHost, StateDir},
@@ -36,7 +39,8 @@ use crate::settings::Settings;
 const ICON_PNG: &[u8] = include_bytes!("../../assets/velora-icon.png");
 const REPO_URL: &str = "https://github.com/yanngc32/screen_mirroring";
 
-pub fn run(state: StateDir, config_dir: Option<PathBuf>, no_update: bool) -> Result<()> {
+/// Opens the launcher; `minimized` when started at sign-in.
+pub fn run(state: StateDir, config_dir: Option<PathBuf>, no_update: bool, minimized: bool) -> Result<()> {
     let icon = image::load_from_memory(ICON_PNG)?.into_rgba8();
     let (w, h) = icon.dimensions();
     let options = eframe::NativeOptions {
@@ -59,6 +63,9 @@ pub fn run(state: StateDir, config_dir: Option<PathBuf>, no_update: bool) -> Res
                 egui::TextureOptions::LINEAR,
             );
             let icons = Icons::load(&cc.egui_ctx)?;
+            if minimized {
+                cc.egui_ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            }
             Ok(Box::new(Launcher::new(state, config_dir, no_update, logo, icons, &cc.egui_ctx)))
         }),
     )
@@ -69,6 +76,7 @@ pub fn run(state: StateDir, config_dir: Option<PathBuf>, no_update: bool) -> Res
 enum Page {
     Connect,
     Devices,
+    ThisPc,
     Settings,
     About,
 }
@@ -84,8 +92,21 @@ enum UpdateState {
 
 struct Session {
     label: String,
+    /// Its command line, to start it again with a password.
+    args: Vec<String>,
     child: Child,
     stderr: Arc<Mutex<String>>,
+    /// Copies the session's stderr into `stderr`; done shortly after the session exits.
+    reader: Option<std::thread::JoinHandle<()>>,
+}
+
+/// A session that stopped because its host asks for an access password.
+struct PasswordPrompt {
+    label: String,
+    args: Vec<String>,
+    /// The previous attempt had a password and it was wrong.
+    wrong: bool,
+    input: String,
 }
 
 struct Launcher {
@@ -115,6 +136,23 @@ struct Launcher {
     new_host: Option<(String, f64)>,
     /// When each notice now on screen first appeared, to fade it in.
     notices_seen: Vec<(String, f64)>,
+    /// The host on this computer.
+    host: HostLink,
+    /// Pairing link and its QR code texture.
+    qr: Option<(String, TextureHandle)>,
+    /// Devices paired with this computer at the last poll, to notice new ones.
+    clients_seen: Option<Vec<String>>,
+    /// A device that just paired with this computer, and when.
+    new_client: Option<(String, f64)>,
+    /// The host view at the last poll that changed something.
+    host_view: Option<Arc<this_pc::HostView>>,
+    /// A host started from here that has not answered yet, and its log.
+    host_child: Option<(Child, PathBuf)>,
+    /// Installing or removing the Windows service.
+    service_job: Arc<Mutex<ServiceJob>>,
+    /// The access password being typed on "This PC".
+    draft_password: String,
+    password_prompt: Option<PasswordPrompt>,
 }
 
 impl Launcher {
@@ -150,6 +188,15 @@ impl Launcher {
             nav_y: None,
             new_host: None,
             notices_seen: Vec::new(),
+            host: HostLink::start(ctx.clone()),
+            qr: None,
+            clients_seen: None,
+            new_client: None,
+            host_child: None,
+            host_view: None,
+            service_job: Arc::default(),
+            draft_password: String::new(),
+            password_prompt: None,
         };
         if !launcher.hosts.is_empty() {
             launcher.page = Page::Devices;
@@ -195,8 +242,9 @@ impl Launcher {
         });
     }
 
-    /// Starts a session window: `velora [--config-dir ..] --no-update <args>`.
-    fn spawn(&mut self, label: String, args: &[&str]) {
+    /// Starts a session window: `velora [--config-dir ..] --no-update <args>`. A password
+    /// goes through standard input, never the command line, which other processes can read.
+    fn spawn(&mut self, label: String, args: &[&str], password: Option<String>) {
         let exe = match std::env::current_exe() {
             Ok(e) => e,
             Err(e) => return self.error = Some(e.to_string()),
@@ -207,12 +255,20 @@ impl Launcher {
         }
         // The launcher owns updates; sessions must not race it.
         cmd.arg("--no-update").args(args).env("NO_COLOR", "1").stdout(Stdio::null()).stderr(Stdio::piped());
+        if password.is_some() {
+            cmd.arg("--password-stdin").stdin(Stdio::piped());
+        }
         match cmd.spawn() {
             Ok(mut child) => {
+                if let (Some(mut stdin), Some(password)) = (child.stdin.take(), password) {
+                    // Dropped right after: the session reads one line.
+                    let _ = writeln!(stdin, "{password}");
+                }
                 let stderr = Arc::new(Mutex::new(String::new()));
+                let mut reader = None;
                 if let Some(mut pipe) = child.stderr.take() {
                     let buf = stderr.clone();
-                    std::thread::spawn(move || {
+                    reader = Some(std::thread::spawn(move || {
                         let mut chunk = [0u8; 4096];
                         while let Ok(n) = pipe.read(&mut chunk) {
                             if n == 0 {
@@ -227,10 +283,11 @@ impl Launcher {
                                 b.drain(..cut);
                             }
                         }
-                    });
+                    }));
                 }
                 self.error = None;
-                self.sessions.push(Session { label, child, stderr });
+                let args = args.iter().map(|a| a.to_string()).collect();
+                self.sessions.push(Session { label, args, child, stderr, reader });
             }
             Err(e) => self.error = Some(e.to_string()),
         }
@@ -240,12 +297,24 @@ impl Launcher {
         let mut changed = false;
         let s = self.s;
         let mut error = None;
+        let mut prompt = None;
         self.sessions.retain_mut(|session| match session.child.try_wait() {
             Ok(None) => true,
             Ok(Some(status)) => {
                 changed = true;
-                if !status.success() {
-                    let log = session.stderr.lock().unwrap();
+                // Its last lines (the error) may still be on their way through the pipe.
+                if let Some(reader) = session.reader.take() {
+                    let _ = reader.join();
+                }
+                let log = session.stderr.lock().unwrap();
+                if status.code() == Some(crate::EXIT_PASSWORD_REQUIRED) {
+                    prompt = Some(PasswordPrompt {
+                        label: session.label.clone(),
+                        args: std::mem::take(&mut session.args),
+                        wrong: log.contains("wrong password"),
+                        input: String::new(),
+                    });
+                } else if !status.success() {
                     error = Some(fill(s.session_failed, &[&session.label, &last_error(&log)]));
                 }
                 false
@@ -254,6 +323,10 @@ impl Launcher {
         });
         if let Some(e) = error {
             self.error = Some(e);
+        }
+        // One question at a time; another session that needs one can be started again.
+        if self.password_prompt.is_none() {
+            self.password_prompt = prompt;
         }
         // A pairing session saves its host; also pick up `velora pair` run from a terminal.
         // Poll faster while a session runs: a pairing session saves its host once paired.
@@ -312,7 +385,7 @@ impl Launcher {
                             self.code.trim().to_string(),
                             self.settings.device_name.clone(),
                         );
-                        self.spawn(address.clone(), &["pair", &address, &code, "--name", &name]);
+                        self.spawn(address.clone(), &["pair", &address, &code, "--name", &name], None);
                         self.code.clear();
                     }
                     Err(_) => self.error = Some(s.invalid_code.into()),
@@ -374,7 +447,7 @@ impl Launcher {
             ui.add_space(24.0);
         });
         match action {
-            Some((DeviceAction::Connect, name)) => self.spawn(name.clone(), &["connect", &name]),
+            Some((DeviceAction::Connect, name)) => self.spawn(name.clone(), &["connect", &name], None),
             Some((DeviceAction::Forget, name)) => {
                 if let Err(e) = hosts::forget(&self.state, &name) {
                     self.error = Some(format!("{e:#}"));
@@ -456,6 +529,8 @@ impl Launcher {
             });
         });
         ui.add_space(16.0);
+        self.startup_card(ui);
+        ui.add_space(16.0);
         card(ui, |ui| {
             card_title(ui, s.data_folder);
             ui.add_space(2.0);
@@ -464,6 +539,83 @@ impl Launcher {
                     .wrap(),
             );
         });
+    }
+
+    /// Starting with the user's session: open the launcher, turn sharing on.
+    fn startup_card(&mut self, ui: &mut egui::Ui) {
+        let s = self.s;
+        // The service already starts the host with the computer.
+        let service = self.host_view.as_ref().and_then(|v| v.status.as_ref()).is_some_and(|st| st.service);
+        let mut next = self.settings.clone();
+        card(ui, |ui| {
+            card_title(ui, s.startup_title);
+            ui.add_space(6.0);
+            let row = |ui: &mut egui::Ui, title: &str, note: &str, on: &mut bool, enabled: bool| {
+                ui.horizontal(|ui| {
+                    // Leave room for the switch so a long note wraps before it.
+                    let text_width = ui.available_width() - 64.0;
+                    ui.allocate_ui_with_layout(egui::vec2(text_width, 0.0), Layout::top_down(Align::Min), |ui| {
+                        ui.spacing_mut().item_spacing.y = 2.0;
+                        ui.label(RichText::new(title).font(font(14.0, medium())));
+                        ui.add(egui::Label::new(RichText::new(note).color(WEAK)).wrap());
+                    });
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| toggle(ui, on, enabled).changed()).inner
+                })
+                .inner
+            };
+            row(ui, s.open_at_login, s.open_at_login_text, &mut next.open_at_login, true);
+            ui.add_space(10.0);
+            let note = if service { s.share_at_login_service } else { s.share_at_login_text };
+            let mut share = next.share_at_login && !service;
+            if row(ui, s.share_at_login, note, &mut share, !service) {
+                next.share_at_login = share;
+            }
+        });
+        if next != self.settings {
+            let enabled = next.open_at_login || next.share_at_login;
+            match crate::autostart::apply(enabled, self.config_dir.as_deref()) {
+                Ok(()) => self.store(next),
+                Err(e) => self.error = Some(format!("{e:#}")),
+            }
+        }
+    }
+
+    /// Asks for the access password of a host whose session stopped for it, then starts the
+    /// session again with it.
+    fn password_modal(&mut self, ctx: &egui::Context) {
+        let s = self.s;
+        let Some(prompt) = &mut self.password_prompt else { return };
+        let mut submit = false;
+        let mut cancel = false;
+        let modal = egui::Modal::new(egui::Id::unique("password-prompt")).show(ctx, |ui| {
+            ui.set_width(340.0);
+            card_title(ui, &fill(s.password_prompt_title, &[&prompt.label]));
+            ui.add_space(4.0);
+            let (text, color) = if prompt.wrong { (s.password_wrong, ERROR) } else { (s.password_prompt_text, WEAK) };
+            ui.label(RichText::new(text).color(color));
+            ui.add_space(12.0);
+            let field = ui.add(field(&mut prompt.input, s.password_field, false).password(true));
+            field.request_focus();
+            if field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                submit = true;
+            }
+            ui.add_space(14.0);
+            ui.horizontal(|ui| {
+                if primary_button(ui, s.connect_short, 140.0, !prompt.input.is_empty()).clicked() {
+                    submit = true;
+                }
+                if secondary_button(ui, s.cancel_short).clicked() {
+                    cancel = true;
+                }
+            });
+        });
+        if modal.should_close() || cancel {
+            self.password_prompt = None;
+        } else if submit && !prompt.input.is_empty() {
+            let prompt = self.password_prompt.take().unwrap();
+            let args: Vec<&str> = prompt.args.iter().map(String::as_str).collect();
+            self.spawn(prompt.label.clone(), &args, Some(prompt.input));
+        }
     }
 
     fn store(&mut self, next: Settings) {
@@ -539,6 +691,7 @@ impl Launcher {
         for (page, icon, label) in [
             (Page::Connect, Icon::Connect, s.nav_connect),
             (Page::Devices, Icon::Monitor, s.nav_devices),
+            (Page::ThisPc, Icon::Smartphone, s.nav_this_pc),
             (Page::Settings, Icon::Settings, s.nav_settings),
             (Page::About, Icon::Info, s.nav_about),
         ] {
@@ -610,6 +763,11 @@ impl eframe::App for Launcher {
                 self.new_host = None;
             }
         }
+        let host = self.host.view();
+        self.track_clients(&host);
+        if self.new_client.as_ref().is_some_and(|(_, since)| self.now - since > motion::SUCCESS_SECONDS) {
+            self.new_client = None;
+        }
 
         egui::Panel::left("nav")
             .exact_size(232.0)
@@ -641,6 +799,9 @@ impl eframe::App for Launcher {
                 if let Some((name, since)) = &self.new_host {
                     success_notice(ui, &fill(self.s.paired_success, &[name]), now - since);
                 }
+                if let Some((name, since)) = &self.new_client {
+                    success_notice(ui, &fill(self.s.client_paired, &[name]), now - since);
+                }
                 for (text, color) in &notices {
                     let since = match self.notices_seen.iter().find(|(t, _)| t == text) {
                         Some((_, since)) => *since,
@@ -654,7 +815,7 @@ impl eframe::App for Launcher {
                         banner(ui, text, *color);
                     });
                 }
-                if !notices.is_empty() || self.new_host.is_some() {
+                if !notices.is_empty() || self.new_host.is_some() || self.new_client.is_some() {
                     ui.add_space(12.0);
                 }
 
@@ -662,8 +823,10 @@ impl eframe::App for Launcher {
                 let t = motion::progress(now, self.page_since, 0.18);
                 ui.multiply_opacity(t);
                 ui.add_space((1.0 - t) * 8.0);
-                let settling =
-                    t < 1.0 || self.new_host.is_some() || self.notices_seen.iter().any(|(_, since)| now - since < 0.2);
+                let settling = t < 1.0
+                    || self.new_host.is_some()
+                    || self.new_client.is_some()
+                    || self.notices_seen.iter().any(|(_, since)| now - since < 0.2);
                 if settling {
                     ui.ctx().request_repaint();
                 }
@@ -671,17 +834,21 @@ impl eframe::App for Launcher {
                 if self.page == Page::Devices {
                     return self.devices(ui);
                 }
-                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                // One scroll position per page: a long page must not leave the next one scrolled.
+                let scroll = egui::ScrollArea::vertical().id_salt(self.page as u8).auto_shrink([false, false]);
+                scroll.show(ui, |ui| {
                     // Keep clear of the floating scroll bar.
                     ui.set_max_width(ui.available_width() - 14.0);
                     match self.page {
                         Page::Connect => self.connect_page(ui),
+                        Page::ThisPc => self.this_pc_page(ui),
                         Page::Settings => self.settings_page(ui),
                         _ => self.about(ui),
                     }
                     ui.add_space(24.0);
                 });
             });
+        self.password_modal(ui.ctx());
     }
 }
 

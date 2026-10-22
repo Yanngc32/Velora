@@ -1,10 +1,9 @@
-//! Signed self-updates from GitHub Releases.
+//! Self-updates from the project's GitHub Releases.
 //!
 //! Every release publishes `manifest.json`, listing per target each installed file with its
-//! SHA-256, and `manifest.json.sig`, an Ed25519 signature of the manifest's exact bytes made in
-//! CI. The public key is compiled into the binaries, so only manifests signed by the project
-//! are accepted, and only files matching the signed hashes are installed. Versions never go
-//! backwards, so an old (validly signed) manifest cannot be replayed to downgrade.
+//! SHA-256 and size. Releases are trusted as published on GitHub and fetched over HTTPS from
+//! the fixed repository URL; only files matching the manifest's hashes are installed, only
+//! inside the install directory, and versions never go backwards.
 //!
 //! Only files whose hash differs from the installed copy are downloaded. They are swapped in by
 //! rename (`x` -> `x.old`, `x.new` -> `x`), which works for running executables and loaded
@@ -21,23 +20,15 @@ use std::{
 };
 
 use anyhow::{bail, ensure, Context, Result};
-use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_BASE_URL: &str = "https://github.com/yanngc32/screen_mirroring/releases";
 pub const MANIFEST: &str = "manifest.json";
-pub const SIGNATURE: &str = "manifest.json.sig";
 
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 const MAX_FILE_BYTES: u64 = 512 * 1024 * 1024;
 const LOCK_FILE: &str = ".velora-update.lock";
 const STALE_LOCK: Duration = Duration::from_secs(30 * 60);
-
-/// Release signing key (base64 Ed25519 public key). Can be overridden at build time with
-/// `VELORA_UPDATE_PUBLIC_KEY`, which tests use to sign with a throwaway key.
-pub fn embedded_public_key() -> &'static str {
-    option_env!("VELORA_UPDATE_PUBLIC_KEY").unwrap_or(include_str!("../release-public-key.txt")).trim()
-}
 
 /// Official release builds set `VELORA_RELEASE_BUILD=1` at compile time. Source builds never update
 /// themselves, so a developer's binary is not silently replaced by a release.
@@ -99,14 +90,8 @@ pub struct FileEntry {
     pub executable: bool,
 }
 
-/// Verifies `signature` (base64) over `manifest` with `public_key` (base64) and parses it.
-pub fn verify_manifest(manifest: &[u8], signature: &str, public_key: &str) -> Result<Manifest> {
-    ensure!(!public_key.is_empty(), "no release signing key is configured in this build");
-    let key = B64.decode(public_key).context("malformed release public key")?;
-    let sig = B64.decode(signature.trim()).context("malformed manifest signature")?;
-    ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, key)
-        .verify(manifest, &sig)
-        .map_err(|_| anyhow::anyhow!("manifest signature is invalid"))?;
+/// Parses and validates a manifest: a well-formed version and only safe relative paths.
+pub fn parse_manifest(manifest: &[u8]) -> Result<Manifest> {
     let manifest: Manifest = serde_json::from_slice(manifest).context("malformed manifest")?;
     manifest.version.parse::<Version>()?;
     for files in manifest.targets.values() {
@@ -158,7 +143,6 @@ pub struct Update {
 
 pub struct Updater {
     base_url: String,
-    public_key: String,
     target: String,
     install_dir: PathBuf,
     current: Version,
@@ -166,17 +150,15 @@ pub struct Updater {
 }
 
 impl Updater {
-    /// Updater for the running binary, installed next to it. `VELORA_UPDATE_URL` points to a
-    /// mirror of the releases (still verified with the embedded key).
+    /// Updater for the running binary, installed next to it, from the project's releases.
     pub fn for_current_exe() -> Result<Self> {
         let exe = std::env::current_exe().context("locating the running executable")?;
         let install_dir = exe.parent().context("executable has no parent directory")?.to_path_buf();
-        let base_url = std::env::var("VELORA_UPDATE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_string());
         let target = target().context("no releases are published for this platform")?;
-        Ok(Self::new(base_url, embedded_public_key().to_string(), target.to_string(), install_dir, Version::current()))
+        Ok(Self::new(DEFAULT_BASE_URL.to_string(), target.to_string(), install_dir, Version::current()))
     }
 
-    pub fn new(base_url: String, public_key: String, target: String, install_dir: PathBuf, current: Version) -> Self {
+    pub fn new(base_url: String, target: String, install_dir: PathBuf, current: Version) -> Self {
         let agent = ureq::Agent::config_builder()
             .timeout_connect(Some(Duration::from_secs(15)))
             .user_agent(format!("velora/{current}"))
@@ -184,7 +166,7 @@ impl Updater {
             .tls_config(ureq::tls::TlsConfig::builder().root_certs(ureq::tls::RootCerts::PlatformVerifier).build())
             .build()
             .into();
-        Self { base_url: base_url.trim_end_matches('/').to_string(), public_key, target, install_dir, current, agent }
+        Self { base_url: base_url.trim_end_matches('/').to_string(), target, install_dir, current, agent }
     }
 
     pub fn install_dir(&self) -> &Path {
@@ -196,11 +178,10 @@ impl Updater {
         Ok(resp.body_mut().with_config().limit(limit).read_to_vec()?)
     }
 
-    /// Fetches and verifies the latest manifest. `None` when already up to date.
+    /// Fetches and validates the latest manifest. `None` when already up to date.
     pub fn check(&self) -> Result<Option<Update>> {
         let manifest = self.get(&format!("{}/latest/download/{MANIFEST}", self.base_url), MAX_MANIFEST_BYTES)?;
-        let signature = self.get(&format!("{}/latest/download/{SIGNATURE}", self.base_url), 4096)?;
-        let manifest = verify_manifest(&manifest, &String::from_utf8_lossy(&signature), &self.public_key)?;
+        let manifest = parse_manifest(&manifest)?;
         let version: Version = manifest.version.parse()?;
         if version <= self.current {
             return Ok(None);

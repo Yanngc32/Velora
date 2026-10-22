@@ -4,7 +4,7 @@
 //! events are applied in arrival order. The thread tracks pressed keys and buttons so a
 //! disconnect or focus loss on the client can never leave anything stuck down on the host.
 
-use std::{collections::HashSet, sync::mpsc};
+use std::{collections::HashSet, sync::mpsc, time::Instant};
 
 use anyhow::Result;
 use velora_protocol::wire::{KeyState, MouseButton};
@@ -73,7 +73,8 @@ pub fn spawn() -> InputHandle {
                     None
                 }
             };
-            let mut injector = Injector { backend, keys: HashSet::new(), buttons: HashSet::new() };
+            let mut injector =
+                Injector { backend, keys: HashSet::new(), buttons: HashSet::new(), desktop_checked: None };
             for cmd in rx {
                 injector.apply(cmd);
             }
@@ -86,11 +87,24 @@ struct Injector {
     backend: Option<Box<dyn Backend>>,
     keys: HashSet<u16>,
     buttons: HashSet<MouseButton>,
+    /// When the input desktop was last checked; `None` forces a check.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    desktop_checked: Option<Instant>,
 }
+
+/// Input arrives hundreds of times a second while the mouse moves; desktop switches are rare.
+#[cfg(windows)]
+const DESKTOP_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
 impl Injector {
     fn apply(&mut self, cmd: InputCmd) {
         let Some(backend) = self.backend.as_mut() else { return };
+        // Input goes to the calling thread's desktop: follow the lock screen and UAC prompts.
+        #[cfg(windows)]
+        if self.desktop_checked.is_none_or(|t| t.elapsed() >= DESKTOP_CHECK_INTERVAL) {
+            crate::win::follow_input_desktop();
+            self.desktop_checked = Some(Instant::now());
+        }
         let result = match cmd {
             InputCmd::Move { x, y } => backend.move_abs(x, y),
             InputCmd::Button { button, down, x, y } => {
@@ -127,6 +141,8 @@ impl Injector {
         };
         if let Err(e) = result {
             tracing::warn!("input injection failed: {e:#}");
+            // Possibly blocked by a desktop switch: check again on the next event.
+            self.desktop_checked = None;
         }
     }
 }
