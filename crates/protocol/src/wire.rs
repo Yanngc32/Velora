@@ -34,6 +34,8 @@ pub const MAX_PASSWORD_LEN: usize = 256;
 
 /// [`HostMsg::Welcome`] feature bit: the host serves file streams.
 pub const FEATURE_FILES: u32 = 1;
+/// [`HostMsg::Welcome`] feature bit: the host shares its clipboard (see `files::FileMsg::Clipboard`).
+pub const FEATURE_CLIPBOARD: u32 = 2;
 
 /// What a client that knows about extensions adds to its hello. Hosts that predate them reject
 /// such a hello, and only hellos with it are answered with `features` in the welcome.
@@ -41,6 +43,8 @@ pub const FEATURE_FILES: u32 = 1;
 pub struct HelloExt {
     /// Only file transfers: no video or input, and the host's current session is left alone.
     pub files_only: bool,
+    /// The client takes clipboard content on its file streams.
+    pub clipboard: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -377,7 +381,7 @@ impl ClientMsg {
                     (None, None) => {}
                 }
                 if let Some(ext) = ext {
-                    w.u8(ext.files_only as u8);
+                    w.u8(ext.files_only as u8 | (ext.clipboard as u8) << 1);
                 }
                 w.finish()
             }
@@ -434,7 +438,12 @@ impl ClientMsg {
                 // Absent in hellos without a password, and from clients that predate them.
                 let password = if !r.0.is_empty() && r.bool()? { Some(r.str()?) } else { None };
                 // Unknown flag bits come from newer clients and are ignored.
-                let ext = if r.0.is_empty() { None } else { Some(HelloExt { files_only: r.u8()? & 1 != 0 }) };
+                let ext = if r.0.is_empty() {
+                    None
+                } else {
+                    let flags = r.u8()?;
+                    Some(HelloExt { files_only: flags & 1 != 0, clipboard: flags & 2 != 0 })
+                };
                 Self::Hello { version, name, pairing_secret, password, ext }
             }
             2 => Self::Key { code: r.u16()?, state: KeyState::from_u8(r.u8()?)? },
@@ -566,7 +575,14 @@ mod tests {
                 name: "laptop".into(),
                 pairing_secret: None,
                 password,
-                ext: Some(HelloExt { files_only: true }),
+                ext: Some(HelloExt { files_only: true, clipboard: false }),
+            });
+            roundtrip_client(ClientMsg::Hello {
+                version: 1,
+                name: "a".into(),
+                pairing_secret: None,
+                password: None,
+                ext: Some(HelloExt { files_only: false, clipboard: true }),
             });
         }
         roundtrip_client(ClientMsg::Key { code: 30, state: KeyState::Repeat });

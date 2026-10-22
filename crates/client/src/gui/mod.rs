@@ -724,6 +724,24 @@ impl Launcher {
             });
         });
         ui.add_space(16.0);
+        card(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 4.0;
+                    card_title(ui, s.clipboard_title);
+                    ui.add(egui::Label::new(RichText::new(s.clipboard_text).color(WEAK)).wrap());
+                });
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let mut on = self.settings.share_clipboard;
+                    if toggle(ui, &mut on, true).changed() {
+                        let mut next = self.settings.clone();
+                        next.share_clipboard = on;
+                        self.store(next);
+                    }
+                });
+            });
+        });
+        ui.add_space(16.0);
         self.startup_card(ui);
         ui.add_space(16.0);
         card(ui, |ui| {

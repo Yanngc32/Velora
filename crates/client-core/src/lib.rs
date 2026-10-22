@@ -27,8 +27,8 @@ use velora_protocol::{
     identity::Identity,
     tls::{self, Fingerprint},
     wire::{
-        self, ClientMsg, FrameHeader, HelloExt, HostMsg, KeyState, MouseButton, MouseMove, FEATURE_FILES,
-        PROTOCOL_VERSION,
+        self, ClientMsg, FrameHeader, HelloExt, HostMsg, KeyState, MouseButton, MouseMove, FEATURE_CLIPBOARD,
+        FEATURE_FILES, PROTOCOL_VERSION,
     },
 };
 
@@ -202,8 +202,33 @@ impl Session {
 
     /// Saves files the host sends (Send To on the host) into `dest`, reporting each transfer.
     /// Hosts without file transfers never send any.
-    pub fn receive_files(&self, dest: PathBuf, on_event: Arc<dyn Fn(OfferEvent) + Send + Sync>) {
-        self.runtime.spawn(files::receive_offers(self.conn.clone(), dest, on_event));
+    /// Accepts what the host sends: files into `dest`, reported to `on_event`, and its
+    /// clipboard content (kind and bytes, see `velora-clipboard`), passed to `on_clip`.
+    pub fn receive_files(
+        &self,
+        dest: PathBuf,
+        on_event: Arc<dyn Fn(OfferEvent) + Send + Sync>,
+        on_clip: Arc<dyn Fn(u8, Vec<u8>) + Send + Sync>,
+    ) {
+        self.runtime.spawn(files::receive_offers(self.conn.clone(), dest, on_event, on_clip));
+    }
+
+    /// Sends this computer's clipboard content to the host, when it shares its clipboard.
+    pub fn send_clipboard(&self, kind: u8, data: Vec<u8>) {
+        if self.features & FEATURE_CLIPBOARD == 0 {
+            return;
+        }
+        let conn = self.conn.clone();
+        self.runtime.spawn(async move {
+            let sent = async {
+                let (mut send, _recv) = conn.open_bi().await?;
+                velora_protocol::files::send_clipboard(&mut send, kind, &data).await
+            };
+            match sent.await {
+                Ok(()) => tracing::debug!("clipboard sent to the host ({} bytes)", data.len()),
+                Err(e) => tracing::debug!("clipboard not sent: {e:#}"),
+            }
+        });
     }
 }
 
@@ -231,7 +256,7 @@ impl Drop for FilesSession {
 /// Connects for file transfers only.
 pub async fn connect_files(params: ConnectParams) -> Result<FilesSession> {
     const TOO_OLD: &str = "this computer's Velora is too old for file transfers; update it";
-    let hs = match handshake(&params, Some(HelloExt { files_only: true })).await {
+    let hs = match handshake(&params, Some(HelloExt { files_only: true, clipboard: false })).await {
         Err(e) if e.is::<NoReply>() => bail!(TOO_OLD),
         hs => hs?,
     };
@@ -249,7 +274,7 @@ pub async fn connect_files(params: ConnectParams) -> Result<FilesSession> {
 
 /// Connects, authenticates and starts delivering video to `output`.
 pub async fn connect(params: ConnectParams, output: VideoOutput) -> Result<Session> {
-    let hs = match handshake(&params, Some(HelloExt::default())).await {
+    let hs = match handshake(&params, Some(HelloExt { files_only: false, clipboard: true })).await {
         // Hosts that predate hello extensions drop the connection: ask again as they expect.
         Err(e) if e.is::<NoReply>() => handshake(&params, None).await?,
         hs => hs?,

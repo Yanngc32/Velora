@@ -159,6 +159,7 @@ fn run() -> Result<()> {
         });
     }
 
+    let share_clipboard = settings.share_clipboard;
     let device_name = settings.device_name;
     let password = if cli.password_stdin { Some(read_password()?).filter(|p| !p.is_empty()) } else { None };
     let password = password.as_deref();
@@ -191,14 +192,14 @@ fn run() -> Result<()> {
             if let Some(link) = offer {
                 session.input.offer_pairing(&link);
             }
-            run_window(&runtime, event_loop, session, slot)
+            run_window(&runtime, event_loop, session, slot, share_clipboard)
         }
         Command::Connect { host } => {
             let (proxy, event_loop) = new_event_loop()?;
             let slot = Arc::new(FrameSlot::default());
             let output = VideoOutput::Decoded { slot: slot.clone(), on_frame: redraw_callback(proxy) };
             let session = runtime.block_on(hosts::connect(&state, &host, &device_name, password, output))?;
-            run_window(&runtime, event_loop, session, slot)
+            run_window(&runtime, event_loop, session, slot, share_clipboard)
         }
         Command::Bench { host, seconds } => runtime.block_on(async {
             let frames = Arc::new(AtomicU32::new(0));
@@ -256,10 +257,30 @@ fn run_window(
     event_loop: EventLoop<()>,
     session: Session,
     frames: Arc<FrameSlot>,
+    share_clipboard: bool,
 ) -> Result<()> {
     let session = Arc::new(session);
     let transfers = Arc::new(Mutex::new(Transfers::default()));
     let proxy = event_loop.create_proxy();
+    // The clipboard goes both ways: copied here, it goes to the host; copied there, it lands
+    // here (see `velora-clipboard`).
+    let clipboard = share_clipboard.then(|| {
+        let session = session.clone();
+        velora_clipboard::spawn(move |clip| match clip.encode() {
+            Ok((kind, data)) => session.send_clipboard(kind, data),
+            Err(e) => tracing::warn!("cannot share the clipboard: {e:#}"),
+        })
+    });
+    let paste = Arc::new(move |kind: u8, data: Vec<u8>| {
+        let Some(Some(clipboard)) = &clipboard else { return };
+        tracing::debug!("clipboard received from the host ({} bytes)", data.len());
+        match velora_clipboard::Clip::decode(kind, &data) {
+            Ok(clip) => {
+                let _ = clipboard.send(clip);
+            }
+            Err(e) => tracing::warn!("clipboard from the host: {e:#}"),
+        }
+    });
     // What the host sends (Send To there) lands in this user's Downloads folder.
     match velora_protocol::files::downloads_dir() {
         Ok(dest) => {
@@ -270,6 +291,7 @@ fn run_window(
                     transfers.lock().unwrap().offer(event);
                     let _ = proxy.send_event(());
                 }),
+                paste,
             );
         }
         Err(e) => tracing::warn!("cannot receive files: {e:#}"),

@@ -15,11 +15,19 @@ pub struct Settings {
     pub open_at_login: bool,
     /// Start this computer's host when the user signs in.
     pub share_at_login: bool,
+    /// Share the clipboard (text and images) with the computer of a session.
+    pub share_clipboard: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { device_name: default_device_name(), auto_update: true, open_at_login: false, share_at_login: false }
+        Self {
+            device_name: default_device_name(),
+            auto_update: true,
+            open_at_login: false,
+            share_at_login: false,
+            share_clipboard: true,
+        }
     }
 }
 

@@ -20,10 +20,13 @@ use anyhow::{bail, ensure, Context, Result};
 use tokio::sync::{mpsc, oneshot};
 use velora_protocol::{
     control::{self, Reply, Request},
+    files as wire_files,
     identity::{AuthorizedClient, StateDir},
     pairing::{pairing_uri, parse_pairing_uri, PairingCode},
     tls::{self, Fingerprint},
-    wire::{self, ClientMsg, Codec, FrameHeader, HostMsg, MouseMove, FEATURE_FILES, PROTOCOL_VERSION},
+    wire::{
+        self, ClientMsg, Codec, FrameHeader, HostMsg, MouseMove, FEATURE_CLIPBOARD, FEATURE_FILES, PROTOCOL_VERSION,
+    },
 };
 
 use crate::{
@@ -262,8 +265,9 @@ async fn handle_connection(incoming: quinn::Incoming, shared: Arc<Shared>) -> Re
         let _ = send.stopped().await;
         bail!("refused client '{name}' ({fingerprint}): {why}");
     }
-    // Only clients that know about extensions understand the features field.
-    let features = ext.map(|_| FEATURE_FILES);
+    // Only clients that know about extensions understand the features field. Sessions share
+    // the clipboard; a connection for files alone does not.
+    let features = ext.map(|e| FEATURE_FILES | if e.files_only { 0 } else { FEATURE_CLIPBOARD });
     if ext.is_some_and(|e| e.files_only) {
         tracing::info!("client '{name}' ({fingerprint}) connected for files from {}", conn.remote_address());
         return serve_files_only(conn, send, fingerprint, &name, &shared, features).await;
@@ -276,7 +280,8 @@ async fn handle_connection(incoming: quinn::Incoming, shared: Arc<Shared>) -> Re
         old.conn.close(1u32.into(), b"another device took over");
     }
 
-    let peer = Peer { shared: shared.clone(), name: name.clone(), fingerprint };
+    let clipboard = ext.is_some_and(|e| e.clipboard).then(|| share_clipboard(&conn)).flatten();
+    let peer = Peer { shared: shared.clone(), name: name.clone(), fingerprint, clipboard };
     let result = run_session(&conn, send, recv, &shared, features, peer).await;
 
     shared.input.send(InputCmd::ReleaseAll);
@@ -285,6 +290,29 @@ async fn handle_connection(incoming: quinn::Incoming, shared: Arc<Shared>) -> Re
         *active = None;
     }
     result
+}
+
+/// Shares this computer's clipboard with the device on `conn` for the session: what is copied
+/// here goes to it on a stream of its own; what it sends goes through the returned sender.
+fn share_clipboard(conn: &quinn::Connection) -> Option<std::sync::mpsc::Sender<velora_clipboard::Clip>> {
+    let (conn, runtime) = (conn.clone(), tokio::runtime::Handle::current());
+    velora_clipboard::spawn(move |clip| {
+        let encoded = match clip.encode() {
+            Ok(encoded) => encoded,
+            Err(e) => return tracing::warn!("cannot share the clipboard: {e:#}"),
+        };
+        let conn = conn.clone();
+        runtime.spawn(async move {
+            let sent = async {
+                let (mut send, _recv) = conn.open_bi().await?;
+                wire_files::send_clipboard(&mut send, encoded.0, &encoded.1).await
+            };
+            match sent.await {
+                Ok(()) => tracing::debug!("clipboard sent to the device ({} bytes)", encoded.1.len()),
+                Err(e) => tracing::debug!("clipboard not sent: {e:#}"),
+            }
+        });
+    })
 }
 
 /// A connection for file transfers only: nothing is captured, and the current session stays.
@@ -307,7 +335,7 @@ async fn serve_files_only(
     send.write_all(&welcome.encode()).await?;
     shared.files.lock().unwrap().push(FilesConn { conn: conn.clone(), fingerprint });
     let result = tokio::select! {
-        r = crate::transfer::accept(conn.clone(), Peer { shared: shared.clone(), name: name.into(), fingerprint }) => r,
+        r = crate::transfer::accept(conn.clone(), Peer { shared: shared.clone(), name: name.into(), fingerprint, clipboard: None }) => r,
         e = conn.closed() => Err(e.into()),
     };
     shared.files.lock().unwrap().retain(|c| c.conn.stable_id() != conn.stable_id());

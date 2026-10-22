@@ -215,6 +215,12 @@ service, only administrators can pair or remove devices and change the password.
 When a second paired device connects, it takes over the session. Switching from the phone to
 the laptop just works.
 
+### Shared clipboard
+
+During a session, text and images copied on one computer can be pasted on the other, both
+ways. Images travel as PNG (up to 32 MB). Turn it off under **Settings → Share the
+clipboard**. Both computers need this version; with an older one, the clipboard stays apart.
+
 ### Files between computers
 
 Both computers need this version or later.
@@ -322,7 +328,7 @@ Windows limitations: without the service, input can't reach elevated windows unl
    pinch to zoom, a direct-touch mode, and Play Store publishing.
 4. **NAT traversal.** A self-hostable rendezvous server, UDP hole punching, and a relay fallback.
 5. Wayland capture (xdg-desktop-portal + PipeWire), multi-monitor selection, cursor shape sync,
-   clipboard, audio, relative mouse mode for games, adaptive bitrate.
+   audio, relative mouse mode for games, adaptive bitrate.
 6. A systemd user service; installers.
 
 ## Releasing (maintainers)

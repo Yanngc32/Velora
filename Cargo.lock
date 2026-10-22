@@ -4705,6 +4705,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "velora-client-core",
+ "velora-clipboard",
  "velora-protocol",
  "velora-update",
  "windows",
@@ -4723,6 +4724,16 @@ dependencies = [
  "tokio",
  "tracing",
  "velora-protocol",
+ "windows",
+]
+
+[[package]]
+name = "velora-clipboard"
+version = "0.3.1"
+dependencies = [
+ "anyhow",
+ "arboard",
+ "png",
  "windows",
 ]
 
@@ -4746,6 +4757,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "velora-clipboard",
  "velora-protocol",
  "velora-update",
  "windows",
