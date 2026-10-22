@@ -191,18 +191,6 @@ pub fn status(ui: &mut Ui, text: &str, color: Color32) {
     });
 }
 
-/// A shell command in monospace on a recessed chip.
-pub fn command(ui: &mut Ui, text: &str) {
-    egui::Frame::new()
-        .fill(BG)
-        .stroke(Stroke::new(1.0, BORDER))
-        .corner_radius(4)
-        .inner_margin(egui::Margin::symmetric(8, 4))
-        .show(ui, |ui| {
-            ui.label(RichText::new(text).font(mono(12.5)).color(LIVE));
-        });
-}
-
 /// A circle with the initials of `name`, like a profile picture placeholder.
 pub fn avatar(ui: &mut Ui, name: &str, size: f32) {
     let initials: String = name

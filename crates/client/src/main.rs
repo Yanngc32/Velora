@@ -4,6 +4,7 @@
 mod autostart;
 mod gui;
 mod keymap;
+mod port_owner;
 mod render;
 mod send_to;
 mod settings;
