@@ -76,6 +76,9 @@ enum Command {
         /// Name this device is registered under on the host.
         #[arg(long)]
         name: Option<String>,
+        /// Pairing link to this computer's own host, offered so the host's computer pairs back.
+        #[arg(long)]
+        offer: Option<String>,
     },
     /// Connect to a paired host by name or address.
     Connect { host: String },
@@ -175,13 +178,16 @@ fn run() -> Result<()> {
             }
             Ok(())
         }
-        Command::Pair { address, code, name } => {
+        Command::Pair { address, code, name, offer } => {
             let (proxy, event_loop) = new_event_loop()?;
             let slot = Arc::new(FrameSlot::default());
             let output = VideoOutput::Decoded { slot: slot.clone(), on_frame: redraw_callback(proxy) };
             let name = name.unwrap_or(device_name);
             let session = runtime.block_on(hosts::pair(&state, &address, &code, &name, password, output))?;
             println!("Paired with '{}'. Next time: velora connect {}", session.host_name, session.host_name);
+            if let Some(link) = offer {
+                session.input.offer_pairing(&link);
+            }
             run_window(&runtime, event_loop, session, slot)
         }
         Command::Connect { host } => {

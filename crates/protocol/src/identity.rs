@@ -41,6 +41,9 @@ pub struct AuthorizedClient {
     pub name: String,
     pub fingerprint: String,
     pub added_unix: u64,
+    /// Files it sends are saved without asking ("always accept from this device").
+    #[serde(default)]
+    pub trust_files: bool,
 }
 
 /// Host this client has paired with.

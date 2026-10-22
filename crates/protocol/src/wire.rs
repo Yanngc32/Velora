@@ -27,6 +27,8 @@ pub const PAIRING_SECRET_LEN: usize = 16;
 pub const MAX_NAME_LEN: usize = 256;
 /// Longest text carried by one [`ClientMsg::Text`]; longer input is split by [`split_text`].
 pub const MAX_TEXT_LEN: usize = 4096;
+/// Longest pairing link in [`ClientMsg::OfferPairing`], in bytes.
+pub const MAX_LINK_LEN: usize = 1024;
 /// Longest access password, in bytes.
 pub const MAX_PASSWORD_LEN: usize = 256;
 
@@ -144,6 +146,11 @@ pub enum ClientMsg {
     /// Characters to type on the host, independent of its keyboard layout (soft keyboards).
     Text {
         text: String,
+    },
+    /// A `velora://pair?..` link to the client's own host, so the host's computer can pair back
+    /// and reach the client's too. Hosts that predate it ignore it.
+    OfferPairing {
+        link: String,
     },
     /// A message from a newer client that this version does not know; ignored.
     Unsupported {
@@ -406,6 +413,11 @@ impl ClientMsg {
                 w.str_max(text, MAX_TEXT_LEN);
                 w.finish()
             }
+            Self::OfferPairing { link } => {
+                let mut w = Writer::new(9);
+                w.str_max(link, MAX_LINK_LEN);
+                w.finish()
+            }
             Self::Unsupported { tag } => Writer::new(*tag).finish(),
         }
     }
@@ -434,6 +446,7 @@ impl ClientMsg {
             6 => Self::RequestKeyframe,
             7 => Self::ReleaseAll,
             8 => Self::Text { text: r.str()? },
+            9 => Self::OfferPairing { link: r.str()? },
             // Forward compatibility: skip messages added by newer clients.
             tag => return Ok(Self::Unsupported { tag }),
         };
@@ -563,6 +576,7 @@ mod tests {
         roundtrip_client(ClientMsg::RequestKeyframe);
         roundtrip_client(ClientMsg::ReleaseAll);
         roundtrip_client(ClientMsg::Text { text: "olá, ação ✓".into() });
+        roundtrip_client(ClientMsg::OfferPairing { link: "velora://pair?address=10.0.0.2%3A7420&code=VL1-x".into() });
     }
 
     #[test]

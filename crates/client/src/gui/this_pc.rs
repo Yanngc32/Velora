@@ -25,6 +25,9 @@ const QR_SIZE: f32 = 232.0;
 /// How long a host started from here may take to answer before the launcher says so.
 const START_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Offers acted on: the offered link, and the computer's name or why pairing back failed.
+pub type PairedBack = Arc<Mutex<Vec<(String, Result<String, String>)>>>;
+
 /// A host started from here that has not answered yet.
 pub struct StartedHost {
     child: Child,
@@ -255,6 +258,129 @@ impl Launcher {
         } else if started.since.elapsed() > START_TIMEOUT {
             self.error = Some(fill(self.s.host_no_answer, &[&started.log.display().to_string()]));
             self.host_child = None;
+        }
+    }
+
+    /// Pairs with computers that paired with this one and offered to be reached from here too.
+    /// Quietly, over a file connection; the result shows like any new computer in Devices.
+    pub(super) fn pair_back(&mut self, view: &HostView) {
+        let done: Vec<_> = std::mem::take(&mut *self.offers_done.lock().unwrap());
+        for (uri, result) in done {
+            self.host.send(Request::DismissOffer { uri });
+            match result {
+                Ok(_) => self.refresh_hosts(),
+                Err(e) => self.error = Some(e),
+            }
+        }
+        let Some(status) = &view.status else { return };
+        for offer in &status.offers {
+            if self.offers_taken.contains(&offer.uri) {
+                continue;
+            }
+            self.offers_taken.push(offer.uri.clone());
+            let Some((address, code)) = velora_protocol::pairing::parse_pairing_uri(&offer.uri) else { continue };
+            let (name, done, uri) = (self.settings.device_name.clone(), self.offers_done.clone(), offer.uri.clone());
+            let (from, s, config_dir) = (offer.name.clone(), self.s, self.config_dir.clone());
+            std::thread::spawn(move || {
+                let result = (|| -> anyhow::Result<String> {
+                    // The launcher's own paired list, as in `run`.
+                    let state = StateDir::open(config_dir, "client")?;
+                    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+                    runtime.block_on(velora_client_core::hosts::pair_quietly(
+                        &state,
+                        &address,
+                        &code.encode(),
+                        &name,
+                        None,
+                    ))
+                })();
+                let result = result.map_err(|e| {
+                    let why = match e.downcast_ref::<velora_client_core::PasswordRequired>() {
+                        Some(_) => s.offer_needs_password.to_string(),
+                        None => format!("{e:#}"),
+                    };
+                    fill(s.pair_back_failed, &[&from, &why])
+                });
+                done.lock().unwrap().push((uri, result));
+            });
+        }
+    }
+
+    /// Devices asking to send files here, on top of every page: accept or decline, and
+    /// optionally always accept that device. A new request also flashes the window.
+    pub(super) fn file_requests(&mut self, ui: &mut egui::Ui, view: &HostView) {
+        let s = self.s;
+        let Some(status) = &view.status else { return };
+        let open: Vec<_> = status.requests.iter().filter(|r| !self.requests_answered.contains(&r.id)).collect();
+        if open.iter().any(|r| !self.requests_seen.contains(&r.id)) {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(egui::UserAttentionType::Critical));
+            self.requests_seen.extend(open.iter().map(|r| r.id));
+        }
+        let now = ui.input(|i| i.time);
+        let mut answers = Vec::new();
+        for request in &open {
+            let id = ui.scope_id().with(("request", request.id));
+            let since = ui.ctx().data_mut(|d| *d.get_temp_mut_or_insert_with(id, || now));
+            ui.scope(|ui| {
+                let t = super::motion::progress(now, since, 0.25);
+                ui.multiply_opacity(t);
+                ui.add_space((1.0 - t) * 8.0);
+                let frame = egui::Frame::new()
+                    .fill(CARD)
+                    .stroke(egui::Stroke::new(1.0, ACCENT.gamma_multiply(0.6)))
+                    .corner_radius(CARD_RADIUS)
+                    .inner_margin(egui::Margin::symmetric(18, 14));
+                frame.show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        let (badge, _) = ui.allocate_exact_size(Vec2::splat(40.0), Sense::hover());
+                        let bob = (now as f32 * 3.0).sin() * 1.5;
+                        super::file_icons::arrow_badge(
+                            ui.painter(),
+                            badge.center() + egui::vec2(0.0, bob),
+                            18.0,
+                            false,
+                            ACCENT_TEXT,
+                        );
+                        ui.add_space(6.0);
+                        ui.vertical(|ui| {
+                            ui.spacing_mut().item_spacing.y = 3.0;
+                            let title = fill(s.request_title, &[&request.name]);
+                            ui.label(RichText::new(title).font(font(14.5, semibold())));
+                            let size = super::files::human_size(request.bytes);
+                            ui.label(RichText::new(fill(s.request_text, &[&size, &request.folder])).color(WEAK));
+                            ui.horizontal(|ui| {
+                                let mut always = self.requests_always.contains(&request.id);
+                                if toggle(ui, &mut always, true).changed() {
+                                    self.requests_always.retain(|id| *id != request.id);
+                                    if always {
+                                        self.requests_always.push(request.id);
+                                    }
+                                }
+                                ui.label(RichText::new(fill(s.request_always, &[&request.name])).small().color(WEAK));
+                            });
+                        });
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if primary_button(ui, s.request_accept, 120.0, true).clicked() {
+                                answers.push((request.id, true));
+                            }
+                            if secondary_button(ui, s.request_decline).clicked() {
+                                answers.push((request.id, false));
+                            }
+                        });
+                    });
+                });
+            });
+            ui.add_space(12.0);
+        }
+        if !open.is_empty() {
+            // The badge bobs while a request waits.
+            ui.ctx().request_repaint_after(Duration::from_millis(33));
+        }
+        for (id, accept) in answers {
+            let always = accept && self.requests_always.contains(&id);
+            self.host.send(Request::AnswerFiles { id, accept, always });
+            self.requests_answered.push(id);
         }
     }
 
