@@ -308,6 +308,21 @@ impl VideoEncoder for Ffmpeg {
         &self.name
     }
 
+    /// NVENC and Quick Sync pick up a changed bitrate on the next frame.
+    fn set_bitrate(&mut self, kbps: u32) -> bool {
+        if self.ctx.is_null() {
+            return false;
+        }
+        let bitrate = kbps as i64 * 1000;
+        // SAFETY: the context is open and only used from this thread.
+        unsafe {
+            (*self.ctx).bit_rate = bitrate;
+            (*self.ctx).rc_max_rate = bitrate;
+        }
+        self.settings.bitrate_kbps = kbps;
+        true
+    }
+
     fn encode(&mut self, frame: Option<&Frame>, keyframe: bool) -> Result<Encoded> {
         let mut out = Encoded::default();
         let mut keyframe = keyframe;

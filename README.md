@@ -136,6 +136,11 @@ If none opens, it falls back to software. To force one, pass `--encoder nvenc|am
 or `--encoder ffmpeg:<name>` for any FFmpeg encoder. All hardware encoders are configured for
 low latency: no B-frames, CBR, no lookahead, and keyframes only on demand.
 
+The bitrate adapts to the network: `--bitrate` (12000 kbit/s by default) is the most. When
+frames take well longer than usual to be acknowledged, or the host has to hold frames back,
+it drops to 70% (down to a tenth of the most); once the path keeps up, it climbs back step by
+step. The change applies in place, with no keyframe. `--fixed-bitrate` turns this off.
+
 On the viewing side, `velora` draws on the GPU (OpenGL 3.3 / ES 3.0, software fallback). A
 build with `ffmpeg` also decodes on the GPU: on Windows, D3D11VA decodes and the D3D11 video
 processor converts the picture, which the window shows in place through `WGL_NV_DX_interop2`
@@ -328,7 +333,7 @@ Windows limitations: without the service, input can't reach elevated windows unl
    pinch to zoom, a direct-touch mode, and Play Store publishing.
 4. **NAT traversal.** A self-hostable rendezvous server, UDP hole punching, and a relay fallback.
 5. Wayland capture (xdg-desktop-portal + PipeWire), multi-monitor selection, cursor shape sync,
-   audio, relative mouse mode for games, adaptive bitrate.
+   audio, relative mouse mode for games.
 6. A systemd user service; installers.
 
 ## Releasing (maintainers)

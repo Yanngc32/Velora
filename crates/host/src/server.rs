@@ -34,6 +34,7 @@ use crate::{
     encode::{self, EncoderChoice, EncoderSettings},
     input::{InputCmd, InputHandle},
     password::Check,
+    rate::{self, RateControl},
     transfer::Peer,
 };
 
@@ -56,6 +57,8 @@ pub struct HostOptions {
     pub encoder: EncoderChoice,
     /// Running as the system service, which the launcher shows.
     pub service: bool,
+    /// Lower the bitrate when the network falls behind (see `rate`); `bitrate_kbps` is the most.
+    pub adaptive_bitrate: bool,
 }
 
 #[derive(Clone)]
@@ -689,10 +692,22 @@ fn authorize(
 struct Session {
     running: AtomicBool,
     keyframe_requested: AtomicBool,
+    /// Bitrate the encoder should use, set by the rate control.
+    bitrate_kbps: AtomicU32,
+    /// What the rate control looks at, since its last decision.
+    window: Mutex<RateWindow>,
     in_flight: AtomicU32,
     max_in_flight: AtomicU32,
     last_ack: Mutex<Instant>,
     stats: Mutex<Stats>,
+}
+
+/// Deliveries and waits of the current rate control period.
+#[derive(Default)]
+struct RateWindow {
+    delivery: Duration,
+    delivered: u32,
+    held_back: Duration,
 }
 
 struct OutFrame {
@@ -730,6 +745,8 @@ async fn run_session(
     let session = Arc::new(Session {
         running: AtomicBool::new(true),
         keyframe_requested: AtomicBool::new(true),
+        bitrate_kbps: AtomicU32::new(opts.bitrate_kbps),
+        window: Mutex::new(RateWindow::default()),
         in_flight: AtomicU32::new(0),
         max_in_flight: AtomicU32::new(MIN_IN_FLIGHT + 1),
         last_ack: Mutex::new(Instant::now()),
@@ -802,7 +819,11 @@ async fn run_session(
                 ClientMsg::FrameAck { frame_id } => {
                     session.ack_frame();
                     *session.last_ack.lock().unwrap() = Instant::now();
-                    session.stats.lock().unwrap().acked(frame_id);
+                    if let Some(delivery) = session.stats.lock().unwrap().acked(frame_id) {
+                        let mut window = session.window.lock().unwrap();
+                        window.delivery += delivery;
+                        window.delivered += 1;
+                    }
                 }
                 ClientMsg::Text { text } => shared.input.send(InputCmd::Text(text)),
                 ClientMsg::OfferPairing { link } => shared.offer(&client_name, link),
@@ -831,15 +852,33 @@ async fn run_session(
         let frame_interval = Duration::from_secs_f64(1.0 / opts.fps as f64);
         let mut tick = tokio::time::interval(Duration::from_millis(250));
         let mut last_log = Instant::now();
+        let mut rate = RateControl::new(opts.bitrate_kbps, Instant::now());
+        let mut last_rate = Instant::now();
         while session.running.load(Ordering::Relaxed) {
             tick.tick().await;
+            if opts.adaptive_bitrate && last_rate.elapsed() >= rate::PERIOD {
+                last_rate = Instant::now();
+                let window = std::mem::take(&mut *session.window.lock().unwrap());
+                let sample = rate::Sample {
+                    delivery: (window.delivered > 0).then(|| window.delivery / window.delivered),
+                    held_back: window.held_back,
+                };
+                if let Some(kbps) = rate.update(sample, Instant::now()) {
+                    tracing::info!(
+                        "bitrate {kbps} kbit/s (delivery {:.0} ms, held back {:.0} ms)",
+                        sample.delivery.unwrap_or_default().as_secs_f64() * 1000.0,
+                        sample.held_back.as_secs_f64() * 1000.0
+                    );
+                    session.bitrate_kbps.store(kbps, Ordering::Relaxed);
+                }
+            }
             let rtt = conn.rtt();
             let budget = (rtt.as_secs_f64() / frame_interval.as_secs_f64()).ceil() as u32 + MIN_IN_FLIGHT;
             session.max_in_flight.store(budget.clamp(MIN_IN_FLIGHT, MAX_IN_FLIGHT), Ordering::Relaxed);
             if last_log.elapsed() >= STATS_INTERVAL {
                 let elapsed = last_log.elapsed();
                 last_log = Instant::now();
-                session.stats.lock().unwrap().log(elapsed, rtt);
+                session.stats.lock().unwrap().log(elapsed, rtt, session.bitrate_kbps.load(Ordering::Relaxed));
             }
         }
         anyhow::Ok(())
@@ -884,6 +923,7 @@ fn capture_loop(
     let _ = ready.send(Ok(rect));
 
     let interval = Duration::from_secs_f64(1.0 / settings.fps.max(1) as f64);
+    let mut bitrate = settings.bitrate_kbps;
     let mut have_picture = false;
     let mut next_id = 0u32;
     let mut last_capture = Instant::now() - interval;
@@ -903,7 +943,9 @@ fn capture_loop(
                 *session.last_ack.lock().unwrap() = Instant::now();
             } else {
                 session.stats.lock().unwrap().throttled += 1;
+                let waited = Instant::now();
                 std::thread::sleep(Duration::from_millis(1));
+                session.window.lock().unwrap().held_back += waited.elapsed();
                 continue;
             }
         }
@@ -921,6 +963,18 @@ fn capture_loop(
         }
         have_picture = true;
 
+        // The rate control asked for another bitrate: in place, or by opening the encoder again
+        // (which then starts with a keyframe).
+        let target = session.bitrate_kbps.load(Ordering::Relaxed);
+        if target != bitrate {
+            bitrate = target;
+            if !encoder.set_bitrate(target) {
+                let settings = EncoderSettings { bitrate_kbps: target, ..settings };
+                encoder = encode::open(choice, settings, rect.width, rect.height)?;
+                session.keyframe_requested.store(true, Ordering::Relaxed);
+            }
+        }
+        let keyframe = keyframe || session.keyframe_requested.load(Ordering::Relaxed);
         session.keyframe_requested.store(false, Ordering::Relaxed);
         let encode_start = Instant::now();
         let encoded = encoder.encode(frame.as_ref(), keyframe)?;
@@ -977,7 +1031,8 @@ impl Stats {
         }
     }
 
-    fn acked(&mut self, id: u32) {
+    /// Notes a frame's acknowledgement; returns its capture-to-acknowledgement time.
+    fn acked(&mut self, id: u32) -> Option<Duration> {
         while let Some(&(pending, captured)) = self.pending.front() {
             self.pending.pop_front();
             if pending == id {
@@ -985,18 +1040,20 @@ impl Stats {
                 self.latency_sum += latency;
                 self.latency_max = self.latency_max.max(latency);
                 self.acked += 1;
-                break;
+                return Some(latency);
             }
         }
+        None
     }
 
-    fn log(&mut self, elapsed: Duration, rtt: Duration) {
+    fn log(&mut self, elapsed: Duration, rtt: Duration, bitrate_kbps: u32) {
         let secs = elapsed.as_secs_f64();
         let per_frame = |d: Duration, n: u32| if n == 0 { 0.0 } else { d.as_secs_f64() * 1000.0 / n as f64 };
         tracing::info!(
-            "video: {:.1} fps, {:.2} Mbit/s, convert {:.1} ms, encode {:.1} ms, capture->client {:.1} ms (max {:.1}), rtt {:.1} ms, throttled {}",
+            "video: {:.1} fps, {:.2} Mbit/s (target {:.1}), convert {:.1} ms, encode {:.1} ms, capture->client {:.1} ms (max {:.1}), rtt {:.1} ms, throttled {}",
             self.frames as f64 / secs,
             self.bytes as f64 * 8.0 / secs / 1e6,
+            bitrate_kbps as f64 / 1000.0,
             per_frame(self.convert_time, self.frames),
             per_frame(self.encode_time, self.frames),
             per_frame(self.latency_sum, self.acked),

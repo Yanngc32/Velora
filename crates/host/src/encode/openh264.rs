@@ -91,6 +91,22 @@ impl VideoEncoder for Software {
         "openh264 (software)"
     }
 
+    fn set_bitrate(&mut self, kbps: u32) -> bool {
+        /// `SBitrateInfo` of the OpenH264 API.
+        #[repr(C)]
+        struct BitrateInfo {
+            layer: std::ffi::c_int,
+            bitrate: std::ffi::c_int,
+        }
+        const ENCODER_OPTION_BITRATE: std::ffi::c_int = 5;
+        const SPATIAL_LAYER_ALL: std::ffi::c_int = 4;
+        let mut info = BitrateInfo { layer: SPATIAL_LAYER_ALL, bitrate: kbps.saturating_mul(1000) as std::ffi::c_int };
+        // SAFETY: the documented option with the struct it takes, on a live encoder.
+        unsafe {
+            self.encoder.raw_api().set_option(ENCODER_OPTION_BITRATE, &mut info as *mut _ as *mut std::ffi::c_void) == 0
+        }
+    }
+
     fn encode(&mut self, frame: Option<&Frame>, keyframe: bool) -> Result<Encoded> {
         let mut out = Encoded::default();
         if let Some(frame) = frame {

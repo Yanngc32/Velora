@@ -5,6 +5,7 @@ mod control;
 mod encode;
 mod input;
 mod password;
+mod rate;
 mod server;
 #[cfg(windows)]
 mod service;
@@ -49,9 +50,12 @@ enum Command {
         /// Maximum frames per second.
         #[arg(long, default_value_t = 60)]
         fps: u32,
-        /// Target video bitrate in kbit/s.
+        /// Target video bitrate in kbit/s: the most, as it adapts to the network.
         #[arg(long, default_value_t = 12_000)]
         bitrate: u32,
+        /// Keep the bitrate fixed instead of lowering it when the network falls behind.
+        #[arg(long)]
+        fixed_bitrate: bool,
         /// Print a one-time pairing code (valid for 10 minutes) to add a new device.
         #[arg(long)]
         pair: bool,
@@ -133,7 +137,7 @@ async fn main() -> Result<()> {
     let state = || StateDir::open(cli.config_dir.clone(), "host");
 
     match cli.command {
-        Command::Run { bind, name, fps, bitrate, pair, encoder, service, log_file: _ } => {
+        Command::Run { bind, name, fps, bitrate, fixed_bitrate, pair, encoder, service, log_file: _ } => {
             let options = server::HostOptions {
                 bind,
                 name: name.unwrap_or_else(hostname),
@@ -141,6 +145,7 @@ async fn main() -> Result<()> {
                 bitrate_kbps: bitrate.max(100),
                 encoder,
                 service,
+                adaptive_bitrate: !fixed_bitrate,
             };
             let auto_update = velora_update::auto_update_enabled(cli.no_update);
             let updated = server::run(options, state()?, pair, auto_update).await?;
