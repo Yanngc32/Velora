@@ -8,7 +8,7 @@ use std::{
     sync::Once,
 };
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use ffmpeg_sys_next as ff;
 
 use crate::video::{Chroma, Planes, VideoFrame};
@@ -178,7 +178,8 @@ impl HwDecoder {
         unsafe {
             let f = &*self.frame;
             let raw = f.data[0] as *mut std::ffi::c_void;
-            let texture = ID3D11Texture2D::from_raw_borrowed(&raw).context("no texture in the picture")?;
+            let texture =
+                anyhow::Context::context(ID3D11Texture2D::from_raw_borrowed(&raw), "no texture in the picture")?;
             let (w, h) = (f.width as u32, f.height as u32);
             if !self.converter.as_ref().is_some_and(|c| c.fits(texture, w, h)) {
                 self.converter = Some(crate::d3d11::Converter::new(texture, w, h)?);
