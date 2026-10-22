@@ -193,8 +193,10 @@ installs Velora as a Windows service. It copies the app to `C:\Program Files\Vel
 the host's state in `C:\ProgramData\Velora` (readable only by SYSTEM and administrators,
 paired devices and password are carried over), and starts the host as SYSTEM in the console
 session. The host then follows the lock screen, UAC prompts and the logon screen, and runs
-from boot. `velora-host service uninstall` removes it. Under the service, only administrators
-can pair or remove devices and change the password.
+from boot. Installing also adds a Windows Firewall rule, "Velora (service)", that lets the host
+receive UDP on port 7420 on private and domain networks: a service never gets Windows' "allow
+access" prompt. `velora-host service uninstall` removes the service and the rule. Under the
+service, only administrators can pair or remove devices and change the password.
 
 When a second paired device connects, it takes over the session. Switching from the phone to
 the laptop just works.
