@@ -89,8 +89,19 @@ enum UpdateState {
     Idle,
     Checking,
     UpToDate,
+    /// A newer release, and how many bytes it takes to download.
+    Available(String, u64),
+    /// Downloading a release: bytes so far and in total.
+    Downloading(String, u64, u64),
+    /// Installed on disk; the running processes are still the old version.
     Updated(String),
     Failed(String),
+}
+
+enum UpdateAction {
+    Check,
+    Install,
+    Restart,
 }
 
 struct Session {
@@ -129,6 +140,8 @@ struct Launcher {
     saved: bool,
     sessions: Vec<Session>,
     update: Arc<Mutex<UpdateState>>,
+    /// This executable, located before an update renames it, to start the new version.
+    exe: Option<PathBuf>,
     /// `ui.input` time of the current frame.
     now: f64,
     /// When the current page was opened, and where the sidebar highlight was at that moment.
@@ -189,6 +202,7 @@ impl Launcher {
             saved: false,
             sessions: Vec::new(),
             update: Arc::new(Mutex::new(UpdateState::Idle)),
+            exe: std::env::current_exe().ok(),
             now: 0.0,
             page_since: f64::NEG_INFINITY,
             nav_from: None,
@@ -211,7 +225,7 @@ impl Launcher {
             launcher.page = Page::Devices;
         }
         if launcher.settings.auto_update && velora_update::auto_update_enabled(no_update) {
-            launcher.check_updates(ctx);
+            launcher.check_updates(ctx, true);
         }
         launcher
     }
@@ -237,18 +251,54 @@ impl Launcher {
         }
     }
 
-    fn check_updates(&self, ctx: &egui::Context) {
+    /// Looks for a newer release in the background; with `install`, also downloads and
+    /// installs it, reporting progress.
+    fn check_updates(&self, ctx: &egui::Context, install: bool) {
         *self.update.lock().unwrap() = UpdateState::Checking;
-        let (update, ctx) = (self.update.clone(), ctx.clone());
+        let (state, ctx) = (self.update.clone(), ctx.clone());
         std::thread::spawn(move || {
-            let result = match velora_update::update_now() {
-                Ok(Some(v)) => UpdateState::Updated(v.to_string()),
-                Ok(None) => UpdateState::UpToDate,
-                Err(e) => UpdateState::Failed(format!("{e:#}")),
-            };
-            *update.lock().unwrap() = result;
+            let result = (|| -> Result<UpdateState> {
+                let updater = velora_update::Updater::for_current_exe()?;
+                let Some(update) = updater.check()? else { return Ok(UpdateState::UpToDate) };
+                let version = update.version.to_string();
+                // Nothing to fetch: the host sharing this folder installed it already.
+                if update.files.is_empty() {
+                    return Ok(UpdateState::Updated(version));
+                }
+                if !install {
+                    return Ok(UpdateState::Available(version, update.size()));
+                }
+                let mut progress = |done: u64, total: u64| {
+                    *state.lock().unwrap() = UpdateState::Downloading(version.clone(), done, total);
+                    ctx.request_repaint();
+                };
+                updater.install_with_progress(&update, &mut progress)?;
+                Ok(UpdateState::Updated(version))
+            })();
+            *state.lock().unwrap() = result.unwrap_or_else(|e| UpdateState::Failed(format!("{e:#}")));
             ctx.request_repaint();
         });
+    }
+
+    /// Starts the installed version: the host first when it runs from this folder (not as the
+    /// service, which updates itself), then the launcher, which exits.
+    fn restart_updated(&mut self) {
+        let Some(exe) = self.exe.clone() else { return };
+        if self.host.view().status.as_ref().is_some_and(|st| !st.service) {
+            let _ = velora_protocol::control::request(&velora_protocol::control::Request::Shutdown);
+            // The new host can only bind once the old one let go of the port.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while crate::port_owner::udp_owner(velora_protocol::wire::DEFAULT_PORT).is_some()
+                && Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            if let Err(e) = spawn_host(self.config_dir.as_deref(), self.s.host_missing) {
+                self.error = Some(format!("{e:#}"));
+                return;
+            }
+        }
+        velora_update::restart(&exe);
     }
 
     /// Starts a session window: `velora [--config-dir ..] --no-update <args>`. A password
@@ -661,6 +711,7 @@ impl Launcher {
         let s = self.s;
         page_header(ui, s.about_label, "Velora", Some(s.about_text));
         let state = self.update.lock().unwrap().clone();
+        let mut action = None;
         card(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
             let row = |ui: &mut egui::Ui, key: &str, value: &mut dyn FnMut(&mut egui::Ui)| {
@@ -675,25 +726,50 @@ impl Launcher {
             };
             row(ui, s.version, &mut |ui| {
                 ui.label(RichText::new(velora_update::Version::current().to_string()).font(mono(13.0)));
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let checking = matches!(state, UpdateState::Checking);
-                    if secondary_button(ui, s.check_updates).clicked() && !checking {
-                        self.check_updates(ui.ctx());
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| match &state {
+                    UpdateState::Idle | UpdateState::UpToDate | UpdateState::Failed(_) => {
+                        if secondary_button(ui, s.check_updates).clicked() {
+                            action = Some(UpdateAction::Check);
+                        }
+                        match &state {
+                            UpdateState::UpToDate => status(ui, s.up_to_date, LIVE),
+                            UpdateState::Failed(e) => {
+                                ui.add(egui::Label::new(RichText::new(e).color(ERROR).small()).truncate());
+                            }
+                            _ => {}
+                        }
                     }
-                    match &state {
-                        UpdateState::Idle => {}
-                        UpdateState::Checking => {
-                            ui.label(RichText::new(s.checking).color(WEAK));
-                            ui.spinner();
+                    UpdateState::Checking => {
+                        ui.label(RichText::new(s.checking).color(WEAK));
+                        ui.spinner();
+                    }
+                    UpdateState::Available(v, size) => {
+                        if primary_button(ui, s.download_install, 180.0, true).clicked() {
+                            action = Some(UpdateAction::Install);
                         }
-                        UpdateState::UpToDate => status(ui, s.up_to_date, LIVE),
-                        UpdateState::Updated(v) => status(ui, &fill(s.updated_restart, &[v]), LIVE),
-                        UpdateState::Failed(e) => {
-                            ui.add(egui::Label::new(RichText::new(e).color(ERROR).small()).truncate());
+                        status(ui, &fill(s.update_available, &[v, &files::human_size(*size)]), LIVE);
+                    }
+                    UpdateState::Downloading(_, done, total) => {
+                        let percent = if *total > 0 { done * 100 / total } else { 0 };
+                        ui.label(RichText::new(format!("{percent}%")).font(mono(13.0)).color(WEAK));
+                    }
+                    UpdateState::Updated(v) => {
+                        if primary_button(ui, s.restart_now, 160.0, true).clicked() {
+                            action = Some(UpdateAction::Restart);
                         }
+                        status(ui, &fill(s.updated_restart, &[v]), LIVE);
                     }
                 });
             });
+            if let UpdateState::Downloading(v, done, total) = &state {
+                ui.add_space(4.0);
+                let fraction = if *total > 0 { *done as f32 / *total as f32 } else { 0.0 };
+                progress_bar(ui, fraction, ui.available_width());
+                ui.add_space(8.0);
+                let line = fill(s.downloading, &[v, &files::human_size(*done), &files::human_size(*total)]);
+                ui.label(RichText::new(line).small().color(WEAK));
+                ui.add_space(8.0);
+            }
             divider(ui);
             row(ui, s.license, &mut |ui| {
                 ui.label("MIT");
@@ -703,6 +779,12 @@ impl Launcher {
                 ui.hyperlink_to(RichText::new("github.com/Yanngc32/Velora").font(mono(13.0)), REPO_URL);
             });
         });
+        match action {
+            Some(UpdateAction::Check) => self.check_updates(ui.ctx(), false),
+            Some(UpdateAction::Install) => self.check_updates(ui.ctx(), true),
+            Some(UpdateAction::Restart) => self.restart_updated(),
+            None => {}
+        }
     }
 
     fn sidebar(&mut self, ui: &mut egui::Ui) {

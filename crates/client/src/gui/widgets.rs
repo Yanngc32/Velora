@@ -191,6 +191,14 @@ pub fn status(ui: &mut Ui, text: &str, color: Color32) {
     });
 }
 
+/// A thin bar filled to `fraction` (0 to 1).
+pub fn progress_bar(ui: &mut Ui, fraction: f32, width: f32) {
+    let (rect, _) = ui.allocate_exact_size(vec2(width, 6.0), Sense::hover());
+    ui.painter().rect_filled(rect, 3.0, BORDER);
+    let done = egui::Rect::from_min_size(rect.min, vec2(rect.width() * fraction.clamp(0.0, 1.0), rect.height()));
+    ui.painter().rect_filled(done, 3.0, ACCENT);
+}
+
 /// A circle with the initials of `name`, like a profile picture placeholder.
 pub fn avatar(ui: &mut Ui, name: &str, size: f32) {
     let initials: String = name

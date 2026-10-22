@@ -145,7 +145,12 @@ fn updates_only_changed_files() {
     let paths: Vec<_> = update.files.iter().map(|f| f.path.as_str()).collect();
     assert_eq!(paths, ["velora-host", "velora"], "unchanged files are skipped");
 
-    updater.install(&update).unwrap();
+    assert_eq!(update.size(), 7 + 9);
+    let mut reported = Vec::new();
+    updater.install_with_progress(&update, &mut |done, total| reported.push((done, total))).unwrap();
+    assert_eq!(reported.first(), Some(&(0, 16)));
+    assert_eq!(reported.last(), Some(&(16, 16)));
+    assert!(reported.windows(2).all(|w| w[0].0 <= w[1].0), "progress only grows");
     assert_eq!(fs::read_to_string(dir.join("velora-host")).unwrap(), "host v2");
     assert_eq!(fs::read_to_string(dir.join("velora")).unwrap(), "client v2");
     assert_eq!(fs::read_to_string(dir.join("velora-host.old")).unwrap(), "host v1");
@@ -157,6 +162,10 @@ fn updates_only_changed_files() {
     }
     cleanup(&dir);
     assert!(!dir.join("velora-host.old").exists());
+
+    // Installed by another process: still newer than this one, with nothing left to fetch.
+    let stale = updater.check().unwrap().expect("still newer than the running version");
+    assert!(stale.files.is_empty());
 
     // Same version is not offered again; a newer local build ignores older releases.
     let current = Updater::new(base.clone(), TARGET.into(), dir.clone(), Version(0, 9, 0));
