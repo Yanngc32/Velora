@@ -269,13 +269,16 @@ Windows limitations: without the service, input can't reach elevated windows unl
 
 ## Releasing (maintainers)
 
-To publish a release, bump `version` in the workspace `Cargo.toml`, merge, then push a
-matching tag (`git tag v0.2.0 && git push origin v0.2.0`). The Release workflow then:
+To publish a release, bump `version` in the workspace `Cargo.toml` and merge to `main`. When
+`main` has a version without a matching `v<version>` tag, the Release workflow (pushing that
+tag by hand does the same):
 
 1. builds Windows and Linux with FFmpeg (Linux on Ubuntu 22.04, for a low glibc requirement);
 2. smoke-tests the packaged binaries;
 3. writes the update manifest;
-4. publishes the GitHub release.
+4. publishes the GitHub release and creates the tag.
+
+Merges that keep the version publish nothing.
 
 Every installed copy picks the release up automatically, so treat push access to this
 repository (and its tags) as access to every installation.
