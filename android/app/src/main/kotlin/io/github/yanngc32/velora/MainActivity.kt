@@ -48,12 +48,16 @@ import androidx.compose.ui.window.Dialog
 import com.google.mlkit.vision.barcode.common.Barcode
 import com.google.mlkit.vision.codescanner.GmsBarcodeScannerOptions
 import com.google.mlkit.vision.codescanner.GmsBarcodeScanning
+import kotlin.concurrent.thread
 import uniffi.velora_mobile.HostEntry
 
 class MainActivity : ComponentActivity() {
     private val hosts = mutableStateListOf<HostEntry>()
     /** Pairing form contents; non-null while the form is shown. */
     private var pairing by mutableStateOf<PairingLink?>(null)
+    private var update by mutableStateOf<Updater.Update?>(null)
+    /** Download progress (0..1) while an update is being fetched. */
+    private var updateProgress by mutableStateOf<Float?>(null)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge()
@@ -67,6 +71,9 @@ class MainActivity : ComponentActivity() {
                         onForget = { forget(it) },
                         onScan = ::scan,
                         onManual = { pairing = PairingLink("", "") },
+                        update = update,
+                        updateProgress = updateProgress,
+                        onUpdate = ::installUpdate,
                     )
                     pairing?.let { link ->
                         PairDialog(
@@ -79,6 +86,27 @@ class MainActivity : ComponentActivity() {
                         )
                     }
                 }
+            }
+        }
+        if (savedInstanceState == null) checkForUpdate()
+    }
+
+    private fun checkForUpdate() {
+        thread {
+            // Offline or rate-limited: try again next launch.
+            val found = runCatching { Updater.check() }.getOrNull()
+            runOnUiThread { update = found }
+        }
+    }
+
+    private fun installUpdate() {
+        val target = update ?: return
+        updateProgress = 0f
+        thread {
+            val result = runCatching { Updater.install(applicationContext, target) { p -> runOnUiThread { updateProgress = p } } }
+            runOnUiThread {
+                updateProgress = null
+                result.onFailure { toast(getString(R.string.update_failed, it.message ?: "")) }
             }
         }
     }
@@ -118,11 +146,18 @@ private fun HostsScreen(
     onForget: (HostEntry) -> Unit,
     onScan: () -> Unit,
     onManual: () -> Unit,
+    update: Updater.Update?,
+    updateProgress: Float?,
+    onUpdate: () -> Unit,
 ) {
     var confirmForget by remember { mutableStateOf<HostEntry?>(null) }
     Column(Modifier.fillMaxSize().safeDrawingPadding().padding(horizontal = 20.dp, vertical = 16.dp)) {
         Brand()
         Spacer(Modifier.height(28.dp))
+        update?.let {
+            UpdateBanner(it, updateProgress, onUpdate)
+            Spacer(Modifier.height(20.dp))
+        }
         val count = if (hosts.isEmpty()) null else pluralStringResource(R.plurals.devices_count, hosts.size, hosts.size)
         PageHeader(stringResource(R.string.devices_label), stringResource(R.string.devices_title), count)
         Spacer(Modifier.height(20.dp))
@@ -186,6 +221,25 @@ private fun DeviceList(hosts: List<HostEntry>, onConnect: (HostEntry) -> Unit, o
                     PrimaryButton(stringResource(R.string.connect), { onConnect(host) })
                 }
             }
+        }
+    }
+}
+
+@Composable
+private fun UpdateBanner(update: Updater.Update, progress: Float?, onUpdate: () -> Unit) {
+    VeloraCard(padding = androidx.compose.foundation.layout.PaddingValues(16.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                Text(stringResource(R.string.update_title, update.version), style = MaterialTheme.typography.titleSmall.copy(fontSize = 15.sp))
+                Text(
+                    if (progress == null) stringResource(R.string.update_text)
+                    else stringResource(R.string.update_downloading, (progress * 100).toInt()),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = Velora.Weak,
+                )
+            }
+            Spacer(Modifier.width(8.dp))
+            PrimaryButton(stringResource(R.string.update), onUpdate, enabled = progress == null)
         }
     }
 }

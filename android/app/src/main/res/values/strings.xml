@@ -30,4 +30,9 @@
     <string name="password_needed">This computer asks for an access password.</string>
     <string name="password_wrong">Wrong password. Try again.</string>
     <string name="connect">Connect</string>
+    <string name="update_title">Velora %1$s is available</string>
+    <string name="update_text">Install it now. Paired computers are kept.</string>
+    <string name="update_downloading">Downloading… %1$d%%</string>
+    <string name="update">Update</string>
+    <string name="update_failed">Update failed: %1$s</string>
 </resources>

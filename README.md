@@ -203,9 +203,12 @@ the laptop just works.
 
 ### Android
 
-Until the app is published, install the APK built by the **Android** workflow: open the latest
-run in the repository's Actions tab, download the `velora-debug-apk` artifact, and
-install it (allow installing from unknown sources).
+Download `velora-<version>-android.apk` from the
+[releases page](https://github.com/Yanngc32/Velora/releases) and install it (allow installing
+from unknown sources). When a newer release is out, the app offers to update when it starts:
+tap **Update** and confirm. Paired computers are kept. Debug builds, such as the
+`velora-debug-apk` artifact of the **Android** workflow, are signed with another key: they
+never update, and switching between them and a release means reinstalling (and pairing again).
 
 1. On the computer, run `velora-host run --pair`. It prints a QR code.
 2. In the app, tap **Scan QR code**. You can also type the address and code.
@@ -271,7 +274,7 @@ Windows limitations: without the service, input can't reach elevated windows unl
 2. **GPU presentation on the client.** YUV textures and shader conversion/scaling instead of the
    CPU path, plus hardware decoding.
 3. **Mobile:** an iOS app (Swift + VideoToolbox) on the same `velora-mobile` core. On Android:
-   pinch to zoom, a direct-touch mode, and publishing (signed APK in releases).
+   pinch to zoom, a direct-touch mode, and Play Store publishing.
 4. **NAT traversal.** A self-hostable rendezvous server, UDP hole punching, and a relay fallback.
 5. Wayland capture (xdg-desktop-portal + PipeWire), multi-monitor selection, cursor shape sync,
    clipboard, audio, relative mouse mode for games, adaptive bitrate.
@@ -285,8 +288,14 @@ tag by hand does the same):
 
 1. builds Windows and Linux with FFmpeg (Linux on Ubuntu 22.04, for a low glibc requirement);
 2. smoke-tests the packaged binaries;
-3. writes the update manifest;
-4. publishes the GitHub release and creates the tag.
+3. builds the Android APK, signed with the release key, and checks the key;
+4. writes the update manifest;
+5. publishes the GitHub release and creates the tag.
+
+The Android release key lives in the `ANDROID_KEYSTORE_BASE64` (a base64 PKCS#12 keystore,
+alias `velora`) and `ANDROID_KEYSTORE_PASSWORD` repository secrets. Keep a copy of it: installed
+apps only accept updates signed with the same key, whose certificate fingerprint is pinned in
+the Release workflow.
 
 Merges that keep the version publish nothing.
 

@@ -28,4 +28,9 @@
     <string name="password_needed">Este computador pede uma senha de acesso.</string>
     <string name="password_wrong">Senha incorreta. Tente de novo.</string>
     <string name="connect">Conectar</string>
+    <string name="update_title">Velora %1$s disponível</string>
+    <string name="update_text">Instale agora. Os computadores pareados são mantidos.</string>
+    <string name="update_downloading">Baixando… %1$d%%</string>
+    <string name="update">Atualizar</string>
+    <string name="update_failed">Falha na atualização: %1$s</string>
 </resources>
