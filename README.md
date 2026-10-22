@@ -63,8 +63,16 @@ project yet (no GPU in CI).
 
 ## Installing
 
-Download `velora-<version>-<target>.zip` for Windows or Linux (x86-64) from the
-[releases page](https://github.com/Yanngc32/Velora/releases). Extract it to a
+On Windows, run `velora-<version>-x86_64-pc-windows-msvc-setup.exe` from the
+[releases page](https://github.com/Yanngc32/Velora/releases). It installs for your user, without
+administrator rights, into `%LOCALAPPDATA%\Programs\Velora`, and adds Velora to the Start menu
+and to Installed apps. The installer is not code-signed, so SmartScreen warns about it the first
+time: choose **More info → Run anyway**. After an automatic update, Installed apps may still show
+the version first installed. Uninstalling removes the app and its "Start with Windows" entry, but
+not the lock screen service: turn **This PC → Access on the lock screen** off first, or run
+`velora-host service uninstall` as administrator.
+
+Otherwise, download `velora-<version>-<target>.zip` for Windows or Linux (x86-64). Extract it to a
 directory **your user can write to**, so updates can be installed, for example
 `%LOCALAPPDATA%\Velora` or `~/.local/share/velora`. The archive contains
 both `velora-host` and `velora` and the FFmpeg libraries for hardware encoding.

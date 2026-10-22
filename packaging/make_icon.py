@@ -144,4 +144,14 @@ try:
     )
 except ImportError:
     print("cairosvg not installed: crates/client/assets/velora-icon.png not regenerated")
+
+# Windows installer and shortcut icon, from the PNG above (pip install pillow).
+try:
+    from PIL import Image
+
+    Image.open(ROOT / "crates/client/assets/velora-icon.png").convert("RGBA").save(
+        ROOT / "packaging/velora.ico", sizes=[(n, n) for n in (16, 24, 32, 48, 64, 128, 256)]
+    )
+except ImportError:
+    print("pillow not installed: packaging/velora.ico not regenerated")
 print("icon written")
