@@ -4471,7 +4471,7 @@ dependencies = [
 
 [[package]]
 name = "uniffi-bindgen"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "uniffi",
 ]
@@ -4698,7 +4698,7 @@ dependencies = [
 
 [[package]]
 name = "velora"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -4724,7 +4724,7 @@ dependencies = [
 
 [[package]]
 name = "velora-client-core"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -4739,7 +4739,7 @@ dependencies = [
 
 [[package]]
 name = "velora-clipboard"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "arboard",
@@ -4749,7 +4749,7 @@ dependencies = [
 
 [[package]]
 name = "velora-host"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -4778,7 +4778,7 @@ dependencies = [
 
 [[package]]
 name = "velora-mobile"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "openh264",
@@ -4794,7 +4794,7 @@ dependencies = [
 
 [[package]]
 name = "velora-protocol"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -4811,7 +4811,7 @@ dependencies = [
 
 [[package]]
 name = "velora-release"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -4822,7 +4822,7 @@ dependencies = [
 
 [[package]]
 name = "velora-update"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "ring",
