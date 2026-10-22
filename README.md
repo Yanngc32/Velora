@@ -1,24 +1,318 @@
-<p align="center"><img src="packaging/velora-icon.svg" width="96" alt="Velora"></p>
+<p align="center"><img src="packaging/velora-icon.svg" width="112" alt="Velora"></p>
 
 <h1 align="center">Velora</h1>
-<p align="center"><b>Your screen. Anywhere.</b></p>
+
+<p align="center">
+  <b>Your screen. Anywhere.</b><br>
+  Open-source, low-latency remote control for your own computers.
+</p>
+
+<p align="center">
+  <a href="https://github.com/Yanngc32/Velora/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/Yanngc32/Velora?style=flat-square&color=7B4DFF&label=release"></a>
+  <a href="https://github.com/Yanngc32/Velora/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/Yanngc32/Velora/ci.yml?branch=main&style=flat-square&label=CI"></a>
+  <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/github/license/Yanngc32/Velora?style=flat-square&color=4EE1C3"></a>
+  <img alt="Windows, Linux and Android" src="https://img.shields.io/badge/platforms-Windows%20%C2%B7%20Linux%20%C2%B7%20Android-1A1B22?style=flat-square">
+  <img alt="Built with Rust" src="https://img.shields.io/badge/built%20with-Rust-B7410E?style=flat-square&logo=rust&logoColor=white">
+</p>
+
+<p align="center">
+  <a href="https://github.com/Yanngc32/Velora/releases/latest"><b>Download</b></a> ·
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#features">Features</a> ·
+  <a href="#how-it-works">How it works</a> ·
+  <a href="#building">Building</a> ·
+  <a href="#roadmap">Roadmap</a>
+</p>
 
 <p align="center">
   <a href="docs/media/velora-tour.mp4"><img src="docs/media/velora-tour.gif" width="800"
     alt="A file request arrives on the laptop, Accept is clicked, and two transfers finish"></a>
   <br>
-  <sub><a href="docs/media/velora-tour.mp4">Watch the full tour (38 s, with sound)</a> ·
+  <sub><a href="docs/media/velora-tour.mp4">▶ Watch the full tour (38 s, with sound)</a> ·
   Music: “Happy Beats / Business Moves” by ende.app,
   <a href="https://creativecommons.org/licenses/by/4.0/">CC BY 4.0</a></sub>
 </p>
 
-Open-source, low-latency remote control for your own computers: view and drive a Windows or
-Linux PC from another PC or from your Android phone. It is designed around input
-responsiveness and a picture that is always current, not around maximum image quality.
+View and drive a Windows or Linux PC from another PC or from your Android phone. Velora is
+designed around input responsiveness and a picture that is always current, not around maximum
+image quality.
 
+> [!NOTE]
 > **Status: early MVP.** Desktop host (Windows, Linux/X11), desktop client and Android app:
 > pairing (QR code on phones), encrypted streaming, keyboard/mouse/touch, hardware encoding
 > and decoding, signed auto-updates. iOS and NAT traversal are next (see [Roadmap](#roadmap)).
+
+## Features
+
+<table>
+  <tr>
+    <td width="33%" valign="top">
+      <b>⚡ Low latency by design</b><br>
+      QUIC over UDP. Pointer moves are datagrams, frames never queue up, and your own cursor
+      is drawn locally.
+    </td>
+    <td width="33%" valign="top">
+      <b>🎮 GPU end to end</b><br>
+      NVENC, AMF, Quick Sync or VA-API encoding. On Windows, GPU decoding shown in place:
+      2.7 ms per frame at 1080p.
+    </td>
+    <td width="33%" valign="top">
+      <b>📶 Adaptive bitrate</b><br>
+      When the network falls behind, the bitrate drops to 70%, then climbs back step by step,
+      with no keyframe.
+    </td>
+  </tr>
+  <tr>
+    <td valign="top">
+      <b>🔐 Pair once, no accounts</b><br>
+      A single-use code or QR code. Mutual TLS 1.3 with pinned certificates, no account
+      server.
+    </td>
+    <td valign="top">
+      <b>📁 Files between computers</b><br>
+      Drop files on a device card or use the two-sided file manager, even between two remote
+      computers. The receiver asks first.
+    </td>
+    <td valign="top">
+      <b>📋 Shared clipboard</b><br>
+      Text and images copied on one computer paste on the other, both ways.
+    </td>
+  </tr>
+  <tr>
+    <td valign="top">
+      <b>🌍 Anywhere</b><br>
+      With Tailscale or Netbird, nothing else is needed: the LAN and VPN addresses race, and
+      the first to answer wins.
+    </td>
+    <td valign="top">
+      <b>🔒 Lock screen access</b><br>
+      As a Windows service, the host follows the lock screen, UAC prompts and the logon screen,
+      and runs from boot.
+    </td>
+    <td valign="top">
+      <b>📱 Android app</b><br>
+      A laptop-style trackpad, soft and physical keyboards, and hardware decoding with
+      MediaCodec.
+    </td>
+  </tr>
+</table>
+
+### Platforms
+
+|  | Windows | Linux | Android | iOS |
+|---|:---:|:---:|:---:|:---:|
+| **Share this computer** (host) | ✅ | ✅ X11 | — | — |
+| **Control another computer** (client) | ✅ | ✅ | ✅ | planned |
+
+## Quick start
+
+1. **Install** Velora on both devices from the
+   [releases page](https://github.com/Yanngc32/Velora/releases/latest) (see
+   [Installing](#installing)).
+2. **Share:** on the computer to control, open **Velora → This PC**, turn sharing on and
+   choose **Show QR code**.
+3. **Pair:** on the other computer, paste the code or the `velora://` link under
+   **New pairing**. On a phone, tap **Scan QR code**.
+4. **Connect:** paired computers are listed under **Devices**, one click away.
+
+## Installing
+
+### Windows
+
+Run `velora-<version>-x86_64-pc-windows-msvc-setup.exe` from the
+[releases page](https://github.com/Yanngc32/Velora/releases). It installs for your user, without
+administrator rights, into `%LOCALAPPDATA%\Programs\Velora`, and adds Velora to the Start menu
+and to Installed apps. At the end it asks once for administrator rights (UAC) to add a Windows
+Firewall rule, "Velora", that lets other devices reach the host on UDP port 7420 on any
+network, Public ones included; declining leaves sharing reachable only where Windows' own
+prompt allowed it.
+
+> [!NOTE]
+> The installer is not code-signed, so SmartScreen warns about it the first time: choose
+> **More info → Run anyway**.
+
+After an automatic update, Installed apps may still show the version first installed.
+Uninstalling removes the app, its firewall rule and its "Start with Windows" entry, but not the
+lock screen service: turn **This PC → Access on the lock screen** off first, or run
+`velora-host service uninstall` as administrator.
+
+### Windows and Linux archives
+
+Download `velora-<version>-<target>.zip` for Windows or Linux (x86-64). Extract it to a
+directory **your user can write to**, so updates can be installed, for example
+`%LOCALAPPDATA%\Velora` or `~/.local/share/velora`. The archive contains both `velora-host`
+and `velora` and the FFmpeg libraries for hardware encoding.
+
+### Android
+
+Download `velora-<version>-android.apk` from the
+[releases page](https://github.com/Yanngc32/Velora/releases) and install it (allow installing
+from unknown sources). See [Android](#android-1) for how to use it.
+
+### Updates
+
+Release builds keep themselves up to date:
+
+- `velora-host run` checks one minute after start and then every 6 hours. When it finds a new
+  version, it installs it and restarts once nobody is connected and no pairing code is open.
+- `velora` checks in the background when it connects. The new version is used the next
+  time it starts.
+- `velora-host update` and `velora update` update immediately. Pass `--no-update` or set
+  `VELORA_NO_UPDATE=1` to turn background updates off. Builds made from source never update
+  themselves.
+
+<details>
+<summary><b>How updates are checked</b></summary>
+<br>
+
+Each release carries `manifest.json`, which lists every file with its SHA-256. Updates come
+over HTTPS from this repository's releases only, which are trusted as published (there is no
+separate signing key). Before installing anything, an update checks:
+
+- that the version is newer than the installed one (no downgrades);
+- that every path stays inside the install directory;
+- each file's hash and size.
+
+Only files that changed are downloaded, so the FFmpeg libraries aren't fetched again unless
+they changed. Files are swapped in by renaming. If any step fails, the update is rolled back,
+and the previous files are removed on the next start.
+
+</details>
+
+## Usage
+
+### Desktop
+
+On a desktop, open **Velora** (`velora` with no arguments) on the computer to control, go to
+**This PC**, turn sharing on and choose **Show QR code**; on the other computer, paste the code
+or the `velora://` link under **New pairing**. With **Also let it access this PC** on (and
+sharing on here), the other computer pairs back by itself, so each can reach the other.
+Paired computers are listed under **Devices** as cards, one click away; each session opens in
+its own window.
+
+**This PC** also shows which devices are paired and connected, removes them, and sets the
+access password. **Settings → Start with Windows** opens the app and/or turns sharing on at
+sign-in.
+
+Client shortcuts: <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>F</kbd> toggles
+fullscreen, <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>Q</kbd> quits.
+
+When a second paired device connects, it takes over the session. Switching from the phone to
+the laptop just works.
+
+### Command line
+
+On the computer to control:
+
+```sh
+velora-host run --pair
+```
+
+This prints a single-use pairing code, valid for 10 minutes, a QR code for the phone, and the
+exact command to run on the other device:
+
+```sh
+velora pair 192.168.0.10:7420 VL1-...      # first time: pairs, saves the host and connects
+velora connect <host-name>                 # afterwards
+velora list                                # paired hosts
+velora bench <host-name> --seconds 10      # headless throughput/latency check
+```
+
+Host management:
+
+```sh
+velora-host clients                 # paired devices
+velora-host revoke <name|fingerprint>
+velora-host password [--clear]      # password paired devices must also type to connect
+velora-host run --fps 60 --bitrate 12000 --bind 0.0.0.0:7420 --encoder auto
+```
+
+### Lock screen access (Windows)
+
+**This PC → Access on the lock screen** (or `velora-host service install` as administrator)
+installs Velora as a Windows service. It copies the app to `C:\Program Files\Velora`, keeps
+the host's state in `C:\ProgramData\Velora` (readable only by SYSTEM and administrators,
+paired devices and password are carried over), and starts the host as SYSTEM in the console
+session. The host then follows the lock screen, UAC prompts and the logon screen, and runs
+from boot. Installing also adds a Windows Firewall rule, "Velora (service)", that lets the host
+receive UDP on port 7420 on any network, Public ones included: a service never gets Windows'
+"allow access" prompt. `velora-host service uninstall` removes the service and the rule. Under
+the service, only administrators can pair or remove devices and change the password.
+
+### Shared clipboard
+
+During a session, text and images copied on one computer can be pasted on the other, both
+ways. Images travel as PNG (up to 32 MB). Turn it off under **Settings → Share the
+clipboard**. Both computers need this version; with an older one, the clipboard stays apart.
+
+### Files between computers
+
+Both computers need this version or later.
+
+- **In a session**, drop files or folders on the window: they go to the remote computer's
+  Downloads folder. On the remote computer, **Send to → Velora** in Explorer sends the
+  selection back to your Downloads folder. The window title shows the progress.
+- **Devices**: drop files from Explorer on a computer's card to send them to its Downloads.
+- **Devices → Files** opens a file manager with a computer on each side, this one or any paired
+  one (pick it with the name at the top of the side). Select and use **Send to**, drag rows
+  from one side to the other, or drop files from Explorer on the side that receives. Between
+  two remote computers, files pass through this one (a temporary folder, removed afterwards).
+  It connects for files only, without video, so it also works while a session is open, and
+  leaves that session alone.
+
+The computer receiving files asks first: "*X is asking to send files to this PC*", with the size
+and where they go, **Accept** or **Decline**, and **Always accept from X** to skip the question
+for that device from then on. Unanswered requests are declined after two minutes.
+
+Nothing is ever overwritten: a name that is taken gets a number (`photo (1).jpg`). Files are
+written under a temporary name and appear only once complete; a cancelled or interrupted
+transfer leaves nothing behind. Symbolic links are not followed.
+
+Any paired device can browse and move files, as the user signed in on that computer: it could
+already do so through the screen. Under the lock screen service, file access runs in a helper
+process started as the signed-in user, never as SYSTEM, and is unavailable while nobody is
+signed in.
+
+### Android
+
+1. On the computer, run `velora-host run --pair`. It prints a QR code.
+2. In the app, tap **Scan QR code**. You can also type the address and code.
+3. Next time, tap the computer in the list. Long-press it to forget it.
+
+The screen works like a laptop trackpad, and the cursor is drawn on the phone, so it follows
+your finger with no network delay:
+
+| Gesture | Action |
+|---|---|
+| Drag one finger | Move the cursor |
+| Tap | Left click |
+| Tap, then touch again and drag | Hold the left button (drag and drop, select text) |
+| Two-finger tap | Right click |
+| Two-finger drag | Scroll |
+
+The toolbar shows or hides the keyboard and has Esc, Tab, the arrows and Del. Ctrl, Alt, Win
+and Shift latch: tap Ctrl, then `c`, to send Ctrl+C. Text from the soft keyboard is typed in
+whatever layout the host uses, including accents through dead keys on Linux (`á`, `ã`, `ç`).
+USB and Bluetooth keyboards send physical keys. The video is decoded in hardware by
+MediaCodec, straight to the screen.
+
+When a newer release is out, the app offers to update when it starts: tap **Update** and
+confirm. Paired computers are kept. Debug builds, such as the `velora-debug-apk` artifact of the
+**Android** workflow, are signed with another key: they never update, and switching between
+them and a release means reinstalling (and pairing again).
+
+### Access over the internet
+
+With a mesh VPN such as **Tailscale** or **Netbird** on both computers, nothing else is
+needed. The host finds its addresses on the mesh (100.64.0.0/10, and Tailscale's
+fd7a:115c:a1e0::/48), shows them under **This PC**, puts them in the pairing link, and tells
+every client that connects. The client keeps them with the computer and, on the next
+connection, tries them along with the usual address (that one first, each other one 250 ms
+later): at home the LAN answers, away the VPN does, with no address to change. Only the
+secure handshake races; the session opens on the address that answered first.
+
+Without a mesh VPN, forward **UDP** port 7420 on the host's router. Every connection is
+authenticated and encrypted either way. Built-in NAT traversal is not implemented.
 
 ## How it works
 
@@ -56,7 +350,7 @@ full-screen scrolling text at 1080p (worst case for the encoder): about 40 fps a
 from capture to decoded frame with CPU encoders. GPU encoders haven't been benchmarked by the
 project yet (no GPU in CI).
 
-## Project layout
+### Project layout
 
 | Crate | Purpose |
 |---|---|
@@ -69,49 +363,6 @@ project yet (no GPU in CI).
 | `android/` | Android app (Kotlin): MediaCodec hardware decoding, trackpad, soft and physical keyboards |
 | `crates/update` | Self-updates from GitHub Releases |
 | `crates/release` (`velora-release`) | Release tooling used by CI: packaging and the update manifest |
-
-## Installing
-
-On Windows, run `velora-<version>-x86_64-pc-windows-msvc-setup.exe` from the
-[releases page](https://github.com/Yanngc32/Velora/releases). It installs for your user, without
-administrator rights, into `%LOCALAPPDATA%\Programs\Velora`, and adds Velora to the Start menu
-and to Installed apps. The installer is not code-signed, so SmartScreen warns about it the first
-time: choose **More info → Run anyway**. At the end it asks once for administrator rights (UAC) to
-add a Windows Firewall rule, "Velora", that lets other devices reach the host on UDP port 7420 on
-any network, Public ones included; declining leaves sharing reachable only where Windows' own
-prompt allowed it. After an automatic update, Installed apps may still show
-the version first installed. Uninstalling removes the app, its firewall rule and its "Start with Windows" entry, but
-not the lock screen service: turn **This PC → Access on the lock screen** off first, or run
-`velora-host service uninstall` as administrator.
-
-Otherwise, download `velora-<version>-<target>.zip` for Windows or Linux (x86-64). Extract it to a
-directory **your user can write to**, so updates can be installed, for example
-`%LOCALAPPDATA%\Velora` or `~/.local/share/velora`. The archive contains
-both `velora-host` and `velora` and the FFmpeg libraries for hardware encoding.
-
-### Updates
-
-Release builds keep themselves up to date:
-
-- `velora-host run` checks one minute after start and then every 6 hours. When it finds a new
-  version, it installs it and restarts once nobody is connected and no pairing code is open.
-- `velora` checks in the background when it connects. The new version is used the next
-  time it starts.
-- `velora-host update` and `velora update` update immediately. Pass `--no-update` or set
-  `VELORA_NO_UPDATE=1` to turn background updates off. Builds made from source never update
-  themselves.
-
-Each release carries `manifest.json`, which lists every file with its SHA-256. Updates come
-over HTTPS from this repository's releases only, which are trusted as published (there is no
-separate signing key). Before installing anything, an update checks:
-
-- that the version is newer than the installed one (no downgrades);
-- that every path stays inside the install directory;
-- each file's hash and size.
-
-Only files that changed are downloaded, so the FFmpeg libraries aren't fetched again unless
-they changed. Files are swapped in by renaming. If any step fails, the update is rolled back,
-and the previous files are removed on the next start.
 
 ## Building
 
@@ -161,10 +412,13 @@ per frame, say at 4K). `VELORA_DECODER=gpu` or `software` forces one.
 On Linux, VA-API needs the driver for your GPU (`intel-media-driver` or `mesa-va-drivers`)
 and access to `/dev/dri/renderD128` (the `render` group).
 
-Linux runtime requirements:
+### Linux runtime requirements
 
-- Host: an **X11** session (Wayland is not supported yet), plus write access to `/dev/uinput`
-  for input injection. Without it the host runs view-only. Example udev rule:
+> [!IMPORTANT]
+> The host needs an **X11** session: Wayland is not supported yet.
+
+- Host: write access to `/dev/uinput` for input injection. Without it the host runs
+  view-only. Example udev rule:
 
   ```sh
   echo 'KERNEL=="uinput", GROUP="input", MODE="0660", OPTIONS+="static_node=uinput"' \
@@ -174,142 +428,12 @@ Linux runtime requirements:
 
 - Client: `libxkbcommon-x11` (X11) or a Wayland compositor.
 
-## Usage
-
-On the computer to control:
-
-```sh
-velora-host run --pair
-```
-
-This prints a single-use pairing code, valid for 10 minutes, a QR code for the phone, and the
-exact command to run on the other device.
-
-On a desktop, open **Velora** (`velora` with no arguments) on the computer to control, go to
-**This PC**, turn sharing on and choose **Show QR code**; on the other computer, paste the code
-or the `velora://` link under **New pairing**. With **Also let it access this PC** on (and
-sharing on here), the other computer pairs back by itself, so each can reach the other.
-Paired computers are listed under **Devices** as cards, one click away; each session opens in
-its own window. The same is available from the command line:
-
-```sh
-velora pair 192.168.0.10:7420 VL1-...      # first time: pairs, saves the host and connects
-velora connect <host-name>                 # afterwards
-velora list                                # paired hosts
-velora bench <host-name> --seconds 10      # headless throughput/latency check
-```
-
-Client shortcuts: **Ctrl+Alt+Shift+F** toggles fullscreen, **Ctrl+Alt+Shift+Q** quits.
-
-Host management:
-
-```sh
-velora-host clients                 # paired devices
-velora-host revoke <name|fingerprint>
-velora-host password [--clear]      # password paired devices must also type to connect
-velora-host run --fps 60 --bitrate 12000 --bind 0.0.0.0:7420 --encoder auto
-```
-
-The Velora app does the same under **This PC**: turn sharing on, show the pairing QR code,
-see which devices are paired and connected, remove them, and set the access password.
-**Settings → Start with Windows** opens the app and/or turns sharing on at sign-in.
-
-### Lock screen access (Windows)
-
-**This PC → Access on the lock screen** (or `velora-host service install` as administrator)
-installs Velora as a Windows service. It copies the app to `C:\Program Files\Velora`, keeps
-the host's state in `C:\ProgramData\Velora` (readable only by SYSTEM and administrators,
-paired devices and password are carried over), and starts the host as SYSTEM in the console
-session. The host then follows the lock screen, UAC prompts and the logon screen, and runs
-from boot. Installing also adds a Windows Firewall rule, "Velora (service)", that lets the host
-receive UDP on port 7420 on any network, Public ones included: a service never gets Windows' "allow
-access" prompt. `velora-host service uninstall` removes the service and the rule. Under the
-service, only administrators can pair or remove devices and change the password.
-
-When a second paired device connects, it takes over the session. Switching from the phone to
-the laptop just works.
-
-### Shared clipboard
-
-During a session, text and images copied on one computer can be pasted on the other, both
-ways. Images travel as PNG (up to 32 MB). Turn it off under **Settings → Share the
-clipboard**. Both computers need this version; with an older one, the clipboard stays apart.
-
-### Files between computers
-
-Both computers need this version or later.
-
-- **In a session**, drop files or folders on the window: they go to the remote computer's
-  Downloads folder. On the remote computer, **Send to → Velora** in Explorer sends the
-  selection back to your Downloads folder. The window title shows the progress.
-- **Devices**: drop files from Explorer on a computer's card to send them to its Downloads.
-- **Devices → Files** opens a file manager with a computer on each side, this one or any paired
-  one (pick it with the name at the top of the side). Select and use **Send to**, drag rows
-  from one side to the other, or drop files from Explorer on the side that receives. Between
-  two remote computers, files pass through this one (a temporary folder, removed afterwards).
-  It connects for files only, without video, so it also works while a session is open, and
-  leaves that session alone.
-
-The computer receiving files asks first: "*X is asking to send files to this PC*", with the size
-and where they go, **Accept** or **Decline**, and **Always accept from X** to skip the question
-for that device from then on. Unanswered requests are declined after two minutes.
-
-Nothing is ever overwritten: a name that is taken gets a number (`photo (1).jpg`). Files are
-written under a temporary name and appear only once complete; a cancelled or interrupted
-transfer leaves nothing behind. Symbolic links are not followed.
-
-Any paired device can browse and move files, as the user signed in on that computer: it could
-already do so through the screen. Under the lock screen service, file access runs in a helper
-process started as the signed-in user, never as SYSTEM, and is unavailable while nobody is
-signed in.
-
-### Android
-
-Download `velora-<version>-android.apk` from the
-[releases page](https://github.com/Yanngc32/Velora/releases) and install it (allow installing
-from unknown sources). When a newer release is out, the app offers to update when it starts:
-tap **Update** and confirm. Paired computers are kept. Debug builds, such as the
-`velora-debug-apk` artifact of the **Android** workflow, are signed with another key: they
-never update, and switching between them and a release means reinstalling (and pairing again).
-
-1. On the computer, run `velora-host run --pair`. It prints a QR code.
-2. In the app, tap **Scan QR code**. You can also type the address and code.
-3. Next time, tap the computer in the list. Long-press it to forget it.
-
-The screen works like a laptop trackpad, and the cursor is drawn on the phone, so it follows
-your finger with no network delay:
-
-| Gesture | Action |
-|---|---|
-| Drag one finger | Move the cursor |
-| Tap | Left click |
-| Tap, then touch again and drag | Hold the left button (drag and drop, select text) |
-| Two-finger tap | Right click |
-| Two-finger drag | Scroll |
-
-The toolbar shows or hides the keyboard and has Esc, Tab, the arrows and Del. Ctrl, Alt, Win
-and Shift latch: tap Ctrl, then `c`, to send Ctrl+C. Text from the soft keyboard is typed in
-whatever layout the host uses, including accents through dead keys on Linux (`á`, `ã`, `ç`).
-USB and Bluetooth keyboards send physical keys. The video is decoded in hardware by
-MediaCodec, straight to the screen.
+### Android app
 
 Building the app yourself needs the Android SDK and NDK, Rust with the
 `aarch64-linux-android` and `x86_64-linux-android` targets, and
 `cargo install cargo-ndk`. Then run `cd android && ./gradlew assembleDebug`. Gradle compiles
 the Rust core and generates its Kotlin bindings.
-
-### Access over the internet
-
-With a mesh VPN such as **Tailscale** or **Netbird** on both computers, nothing else is
-needed. The host finds its addresses on the mesh (100.64.0.0/10, and Tailscale's
-fd7a:115c:a1e0::/48), shows them under **This PC**, puts them in the pairing link, and tells
-every client that connects. The client keeps them with the computer and, on the next
-connection, tries them along with the usual address (that one first, each other one 250 ms
-later): at home the LAN answers, away the VPN does, with no address to change. Only the
-secure handshake races; the session opens on the address that answered first.
-
-Without a mesh VPN, forward **UDP** port 7420 on the host's router. Every connection is
-authenticated and encrypted either way. Built-in NAT traversal is not implemented.
 
 ## Security model
 
@@ -331,8 +455,9 @@ authenticated and encrypted either way. Built-in NAT traversal is not implemente
   can be written outside the chosen folder (no `..`, absolute paths, drive letters, alternate
   data streams or device names).
 
-Windows limitations: without the service, input can't reach elevated windows unless
-`velora-host` runs elevated, nor the secure desktop (UAC prompts, lock screen).
+> [!WARNING]
+> On Windows, without the service, input can't reach elevated windows unless `velora-host`
+> runs elevated, nor the secure desktop (UAC prompts, lock screen).
 
 ## Roadmap
 
@@ -350,6 +475,10 @@ Windows limitations: without the service, input can't reach elevated windows unl
 
 ## Releasing (maintainers)
 
+<details>
+<summary><b>How a release is published</b></summary>
+<br>
+
 To publish a release, bump `version` in the workspace `Cargo.toml` and merge to `main`. When
 `main` has a version without a matching `v<version>` tag, the Release workflow (pushing that
 tag by hand does the same):
@@ -366,21 +495,26 @@ alias `velora`) and `ANDROID_KEYSTORE_PASSWORD` secrets of the `release` environ
 apps only accept updates signed with the same key, whose certificate fingerprint is pinned in
 the Release workflow.
 
-Merges that keep the version publish nothing.
+Merges that keep the version publish nothing. Pull requests that touch the release machinery
+run the same build as a dry run.
 
-Every installed copy picks the release up automatically, so treat push access to this
-repository (and its tags) as access to every installation.
+</details>
 
-Pull requests that touch the release machinery run the same build as a dry run.
+> [!CAUTION]
+> Every installed copy picks a release up automatically, so treat push access to this
+> repository (and its tags) as access to every installation.
 
 ## License
 
 MIT, see [LICENSE](LICENSE).
 
 The desktop launcher bundles Inter and JetBrains Mono (SIL Open Font License) and Lucide icons
-(ISC); their licenses are next to them in `crates/client/assets`.
+(ISC); their licenses are next to them in `crates/client/assets`. The tour video's music is
+“Happy Beats / Business Moves” by ende.app, under
+[CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
 
-H.264 is covered by patents. Cisco pays the royalties for OpenH264 only when users download
-Cisco's prebuilt binary. This project compiles OpenH264 from source, which isn't covered.
-Check your situation before distributing binaries. AV1, which is royalty-free, is on the
-roadmap. FFmpeg is used under the LGPL: link it dynamically and use an LGPL build.
+> [!NOTE]
+> H.264 is covered by patents. Cisco pays the royalties for OpenH264 only when users download
+> Cisco's prebuilt binary. This project compiles OpenH264 from source, which isn't covered.
+> Check your situation before distributing binaries. AV1, which is royalty-free, is on the
+> roadmap. FFmpeg is used under the LGPL: link it dynamically and use an LGPL build.
