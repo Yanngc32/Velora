@@ -11,6 +11,17 @@ val rustLibs = layout.buildDirectory.dir("rustJniLibs")
 val uniffiKotlin = layout.buildDirectory.dir("generated/uniffi")
 val abis = listOf("arm64-v8a", "x86_64")
 
+// One version for the whole project: the workspace Cargo.toml. The version code is
+// major.minor.patch as MMmmpp, so every release installs over the previous one.
+val appVersion: String = Regex("""(?m)^version = "(.+)"""")
+    .find(repoRoot.resolve("Cargo.toml").readText())!!.groupValues[1]
+val appVersionCode: Int = appVersion.substringBefore('-').split('.').map(String::toInt)
+    .let { (major, minor, patch) -> major * 10000 + minor * 100 + patch }
+
+// Release signing key, provided by CI (see .github/workflows/release.yml). Without it the
+// release APK is left unsigned. Updates install only over an app signed with the same key.
+val keystore: String? = System.getenv("VELORA_KEYSTORE")
+
 val cargoBuild by tasks.registering(Exec::class) {
     group = "rust"
     workingDir = repoRoot
@@ -46,14 +57,26 @@ android {
         applicationId = "io.github.yanngc32.velora"
         minSdk = 26
         targetSdk = 35
-        versionCode = 2
-        versionName = "0.2.0"
+        versionCode = appVersionCode
+        versionName = appVersion
         ndk { abiFilters += abis }
+    }
+
+    signingConfigs {
+        if (keystore != null) {
+            create("release") {
+                storeFile = file(keystore)
+                storePassword = System.getenv("VELORA_KEYSTORE_PASSWORD")
+                keyAlias = "velora"
+                keyPassword = storePassword
+            }
+        }
     }
 
     buildTypes {
         release {
             isMinifyEnabled = false
+            signingConfig = signingConfigs.findByName("release")
         }
     }
 
@@ -62,7 +85,10 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
     kotlinOptions { jvmTarget = "17" }
-    buildFeatures { compose = true }
+    buildFeatures {
+        compose = true
+        buildConfig = true
+    }
 
     sourceSets["main"].java.srcDir(uniffiKotlin)
     sourceSets["main"].jniLibs.srcDir(rustLibs)

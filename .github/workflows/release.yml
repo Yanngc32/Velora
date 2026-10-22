@@ -13,6 +13,7 @@ on:
       - crates/update/**
       - crates/release/**
       - packaging/**
+      - android/app/build.gradle.kts
   workflow_dispatch:
 
 permissions:
@@ -24,6 +25,9 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # SHA-256 of the Android signing certificate. Installed apps accept updates only from this
+  # key, so a release signed with any other key is refused here rather than on every phone.
+  ANDROID_CERT_SHA256: 2e0cb4780d483bc01189cb0c78eb36f2bb6bcb7052d508df8b306b4b235b7956
   # LGPL shared FFmpeg builds; see packaging/NOTICE.txt.
   FFMPEG_URL: https://github.com/BtbN/FFmpeg-Builds/releases/download/latest
 
@@ -158,8 +162,58 @@ jobs:
           name: dist-${{ matrix.target }}
           path: dist/
 
+  android:
+    needs: version
+    if: needs.version.outputs.publish == 'true' || github.event_name != 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android, x86_64-linux-android
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: android
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+
+      # Signed with the release key from the repository secrets. A dry run without them builds
+      # an unsigned APK; a release refuses to.
+      - name: Release APK
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          VELORA_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          PUBLISH: ${{ needs.version.outputs.publish }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.p12"
+            export VELORA_KEYSTORE="$RUNNER_TEMP/release.p12"
+          elif [ "$PUBLISH" = true ]; then
+            echo "ANDROID_KEYSTORE_BASE64 is not set; a release APK must be signed"; exit 1
+          fi
+          (cd android && ./gradlew --no-daemon assembleRelease)
+          rm -f "$RUNNER_TEMP/release.p12"
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          mkdir -p dist
+          cp android/app/build/outputs/apk/release/*.apk "dist/velora-$version-android.apk"
+          if [ -n "${VELORA_KEYSTORE:-}" ]; then
+            apksigner=$(ls "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -1)
+            "$apksigner" verify --print-certs "dist/velora-$version-android.apk" | tee certs.txt
+            grep -q "SHA-256 digest: $ANDROID_CERT_SHA256" certs.txt || { echo "APK not signed with the release key"; exit 1; }
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-android
+          path: dist/
+
   publish:
-    needs: [version, build]
+    needs: [version, build, android]
     runs-on: ubuntu-latest
     permissions:
       contents: write
