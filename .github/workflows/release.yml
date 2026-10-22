@@ -105,6 +105,18 @@ jobs:
       - name: Package
         run: cargo run --release --locked -p velora-release -- package --target ${{ matrix.target }} --root stage --dist dist
 
+      # PowerShell: Git Bash would rewrite ISCC's /D and /O options as paths.
+      - name: Installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress; if ($LASTEXITCODE) { exit $LASTEXITCODE } }
+          & $iscc "/DAppVersion=$version" "/DStage=$PWD\stage" "/O$PWD\dist" packaging\velora.iss
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          Get-ChildItem dist\*-setup.exe
+
       - uses: actions/upload-artifact@v4
         with:
           name: dist-${{ matrix.target }}
