@@ -201,6 +201,27 @@ service, only administrators can pair or remove devices and change the password.
 When a second paired device connects, it takes over the session. Switching from the phone to
 the laptop just works.
 
+### Files between computers
+
+Both computers need this version or later.
+
+- **In a session**, drop files or folders on the window: they go to the remote computer's
+  Downloads folder. On the remote computer, **Send to → Velora** in Explorer sends the
+  selection back to your Downloads folder. The window title shows the progress.
+- **Devices → Files** opens a file manager: this computer and the remote one side by side.
+  Select and use **Send** or **Download**, drag rows from one side to the other, or drop files
+  from Explorer on the window. It connects for files only, without video, so it also works
+  while a session is open, and leaves that session alone.
+
+Nothing is ever overwritten: a name that is taken gets a number (`photo (1).jpg`). Files are
+written under a temporary name and appear only once complete; a cancelled or interrupted
+transfer leaves nothing behind. Symbolic links are not followed.
+
+Any paired device can browse and move files, as the user signed in on that computer: it could
+already do so through the screen. Under the lock screen service, file access runs in a helper
+process started as the signed-in user, never as SYSTEM, and is unavailable while nobody is
+signed in.
+
 ### Android
 
 Download `velora-<version>-android.apk` from the
@@ -262,6 +283,9 @@ Every connection is authenticated and encrypted either way.
   a growing time.
 - The launcher talks to the local host over a named pipe (Windows) or a Unix socket, open
   only to the user it serves, SYSTEM and administrators.
+- File transfers use the same connection. The receiver checks every path it is sent: nothing
+  can be written outside the chosen folder (no `..`, absolute paths, drive letters, alternate
+  data streams or device names).
 
 Windows limitations: without the service, input can't reach elevated windows unless
 `velora-host` runs elevated, nor the secure desktop (UAC prompts, lock screen).

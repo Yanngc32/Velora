@@ -59,3 +59,5 @@ Filename: "{app}\velora.exe"; Description: "{cm:LaunchProgram,Velora}"; Flags: n
 [UninstallDelete]
 ; Files the updater adds or leaves behind (new versions' files, renamed old executables).
 Type: filesandordirs; Name: "{app}"
+; Send To entry the app adds when it starts (see crates/client/src/send_to.rs).
+Type: files; Name: "{usersendto}\Velora.lnk"

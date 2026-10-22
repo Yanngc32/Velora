@@ -87,8 +87,9 @@ fn cert_and_key(identity: &Identity) -> (Vec<CertificateDer<'static>>, PrivateKe
 
 /// Transport tuned for interactive streaming: fast loss detection and frequent keep-alives so
 /// NAT mappings stay open. Limits are per direction: only the client receives video (large
-/// windows, many streams), while the host accepts just the control stream and datagrams, so an
-/// unauthenticated peer cannot make it buffer much.
+/// windows, many streams), while the host accepts the control stream, datagrams and a few file
+/// streams. Its connection-wide receive window bounds what any peer, authenticated or not, can
+/// make it buffer.
 fn transport_config(receives_video: bool) -> quinn::TransportConfig {
     let mut t = quinn::TransportConfig::default();
     t.max_idle_timeout(Some(Duration::from_secs(15).try_into().unwrap()))
@@ -96,20 +97,24 @@ fn transport_config(receives_video: bool) -> quinn::TransportConfig {
         .initial_rtt(Duration::from_millis(50))
         .datagram_receive_buffer_size(Some(64 * 1024));
     if receives_video {
-        // Room for a 4K keyframe in flight.
+        // Room for a 4K keyframe in flight; file streams the host opens (Send To).
         t.max_concurrent_uni_streams(256u32.into())
-            .max_concurrent_bidi_streams(0u32.into())
+            .max_concurrent_bidi_streams(FILE_STREAMS.into())
             .stream_receive_window((8u32 * 1024 * 1024).into())
             .receive_window((32u32 * 1024 * 1024).into());
     } else {
+        // The control stream plus file streams; uploads need windows that cover the round trip.
         t.max_concurrent_uni_streams(0u32.into())
-            .max_concurrent_bidi_streams(1u32.into())
-            .stream_receive_window((256u32 * 1024).into())
-            .receive_window((512u32 * 1024).into())
+            .max_concurrent_bidi_streams((1 + FILE_STREAMS).into())
+            .stream_receive_window((1024u32 * 1024).into())
+            .receive_window((4u32 * 1024 * 1024).into())
             .send_window(32 * 1024 * 1024);
     }
     t
 }
+
+/// File operations (listings, transfers) that may run at once in each direction.
+const FILE_STREAMS: u32 = 16;
 
 pub fn server_config(identity: &Identity) -> Result<quinn::ServerConfig> {
     let provider = provider();

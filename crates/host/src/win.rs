@@ -99,6 +99,15 @@ fn desktop_name(desk: HDESK) -> String {
 /// A kernel handle closed on drop.
 pub struct Handle(pub HANDLE);
 
+impl Handle {
+    /// Gives up ownership without closing the handle.
+    pub fn into_raw(self) -> HANDLE {
+        let handle = self.0;
+        std::mem::forget(self);
+        handle
+    }
+}
+
 impl Drop for Handle {
     fn drop(&mut self) {
         // SAFETY: owned handle, closed once.

@@ -1,3 +1,5 @@
+#[cfg(windows)]
+mod agent;
 mod capture;
 mod control;
 mod encode;
@@ -6,6 +8,7 @@ mod password;
 mod server;
 #[cfg(windows)]
 mod service;
+mod transfer;
 #[cfg(windows)]
 mod win;
 
@@ -75,6 +78,14 @@ enum Command {
     },
     /// Install the latest release now (restart a running host to use it).
     Update,
+    /// Serve one file stream on standard input and output (started by the service's host as
+    /// the user signed in at the console).
+    #[command(hide = true)]
+    FilesAgent {
+        /// Offer these files and folders to the connected device instead.
+        #[arg(long, num_args = 1..)]
+        send: Vec<PathBuf>,
+    },
     /// Run as a Windows service, to be reachable on the lock screen and before logon.
     #[cfg(windows)]
     Service {
@@ -139,6 +150,7 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
+        Command::FilesAgent { send } => transfer::agent(send).await,
         Command::Update => {
             match velora_update::update_now()? {
                 Some(v) => println!("Updated to {v}. Restart velora-host to use it."),
