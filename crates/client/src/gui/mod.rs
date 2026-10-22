@@ -149,8 +149,10 @@ struct Launcher {
     new_client: Option<(String, f64)>,
     /// The host view at the last poll that changed something.
     host_view: Option<Arc<this_pc::HostView>>,
-    /// A host started from here that has not answered yet, and its log.
-    host_child: Option<(Child, PathBuf)>,
+    /// A host started from here that has not answered yet.
+    host_child: Option<this_pc::StartedHost>,
+    /// Another copy of the host holding the port, which "This PC" offers to stop.
+    port_blocker: Option<crate::port_owner::PortOwner>,
     /// Installing or removing the Windows service.
     service_job: Arc<Mutex<ServiceJob>>,
     /// The access password being typed on "This PC".
@@ -198,6 +200,7 @@ impl Launcher {
             clients_seen: None,
             new_client: None,
             host_child: None,
+            port_blocker: None,
             host_view: None,
             service_job: Arc::default(),
             draft_password: String::new(),
@@ -1007,10 +1010,6 @@ fn connect_steps(ui: &mut egui::Ui, s: &Strings) {
                 ui.add_space(3.0);
                 ui.label(RichText::new(title).font(font(14.0, semibold())));
                 ui.add(egui::Label::new(RichText::new(text).color(WEAK)).wrap());
-                if first {
-                    ui.add_space(2.0);
-                    command(ui, "velora-host run --pair");
-                }
             });
             dot
         });

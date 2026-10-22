@@ -5,21 +5,32 @@ use std::{
     path::PathBuf,
     process::{Child, Command, Stdio},
     sync::{mpsc, Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use eframe::egui::{self, Align, Color32, Layout, RichText, Sense, TextureHandle, Vec2};
 use velora_protocol::{
     control::{self, Device, Request, Status},
     identity::StateDir,
+    wire::DEFAULT_PORT,
 };
 
 use super::{icons::Icon, strings::fill, theme::*, widgets::*, Launcher};
+use crate::port_owner;
 
 const POLL: Duration = Duration::from_secs(1);
 /// Output of a host started by the launcher, in the host's state directory.
 const HOST_LOG: &str = "host.log";
 const QR_SIZE: f32 = 232.0;
+/// How long a host started from here may take to answer before the launcher says so.
+const START_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// A host started from here that has not answered yet.
+pub struct StartedHost {
+    child: Child,
+    log: PathBuf,
+    since: Instant,
+}
 
 /// What the launcher knows about the local host, refreshed by a background thread.
 #[derive(Clone, Default, PartialEq)]
@@ -92,6 +103,8 @@ fn host_exe() -> Option<PathBuf> {
 
 enum Action {
     Start,
+    /// Stop the other copy of the host holding the port, then start this one.
+    StopBlockerAndStart(u32),
     Stop,
     Pair,
     CancelPairing,
@@ -186,27 +199,61 @@ pub fn spawn_host(config_dir: Option<&std::path::Path>, missing: &str) -> anyhow
 
 impl Launcher {
     fn start_host(&mut self) {
+        self.port_blocker = None;
+        // Starting a host that cannot bind only ends in an error: say who holds the port now.
+        if let Some(owner) = port_owner::udp_owner(DEFAULT_PORT) {
+            return self.port_in_use(owner);
+        }
         match spawn_host(self.config_dir.as_deref(), self.s.host_missing) {
-            Ok(started) => {
+            Ok((child, log)) => {
                 self.error = None;
-                self.host_child = Some(started);
+                self.host_child = Some(StartedHost { child, log, since: Instant::now() });
             }
             Err(e) => self.error = Some(format!("{e:#}")),
         }
     }
 
-    /// Reports a host started from here that exits before it answers (port in use, ...).
+    fn port_in_use(&mut self, owner: port_owner::PortOwner) {
+        let (pid, port) = (owner.pid.to_string(), DEFAULT_PORT.to_string());
+        if owner.is_host() {
+            self.error = Some(fill(self.s.port_in_use_host, &[&owner.name, &pid, &port]));
+            self.port_blocker = Some(owner);
+        } else {
+            self.error = Some(fill(self.s.port_in_use, &[&port, &owner.name, &pid]));
+        }
+    }
+
+    fn stop_blocker_and_start(&mut self, pid: u32) {
+        match port_owner::stop(pid) {
+            Ok(()) => self.start_host(),
+            Err(e) => self.error = Some(format!("{e:#}")),
+        }
+    }
+
+    /// Reports a host started from here that exits before it answers (port in use, ...), or
+    /// that runs without answering.
     fn watch_started_host(&mut self, view: &HostView) {
-        let Some((child, log)) = &mut self.host_child else { return };
+        let Some(started) = &mut self.host_child else { return };
         if view.status.is_some() {
             self.host_child = None;
+            self.port_blocker = None;
             return;
         }
-        if let Ok(Some(status)) = child.try_wait() {
-            if !status.success() {
-                let log = std::fs::read_to_string(log).unwrap_or_default();
-                self.error = Some(fill(self.s.host_failed, &[&super::last_error(&log)]));
+        if let Ok(Some(status)) = started.child.try_wait() {
+            let log = std::fs::read_to_string(&started.log).unwrap_or_default();
+            self.host_child = None;
+            if status.success() {
+                return;
             }
+            // Something took the port in between: name it rather than show the OS error.
+            if log.contains("binding") {
+                if let Some(owner) = port_owner::udp_owner(DEFAULT_PORT) {
+                    return self.port_in_use(owner);
+                }
+            }
+            self.error = Some(fill(self.s.host_failed, &[&super::last_error(&log)]));
+        } else if started.since.elapsed() > START_TIMEOUT {
+            self.error = Some(fill(self.s.host_no_answer, &[&started.log.display().to_string()]));
             self.host_child = None;
         }
     }
@@ -261,8 +308,19 @@ impl Launcher {
                     ui.add_space(14.0);
                     // Not twice while a host just started has not answered yet.
                     let starting = self.host_child.is_some();
-                    if primary_button(ui, s.share_start, 200.0, !starting).clicked() {
-                        action = Some(Action::Start);
+                    if let Some(blocker) = &self.port_blocker {
+                        if primary_button(ui, s.stop_and_start, 200.0, !starting).clicked() {
+                            action = Some(Action::StopBlockerAndStart(blocker.pid));
+                        }
+                    } else {
+                        let label = if starting { s.share_starting } else { s.share_start };
+                        if primary_button(ui, label, 200.0, !starting).clicked() {
+                            action = Some(Action::Start);
+                        }
+                    }
+                    if starting {
+                        // Keep polling the child even when nothing else repaints.
+                        ui.ctx().request_repaint_after(Duration::from_millis(250));
                     }
                 })
                 .inner
@@ -311,6 +369,7 @@ impl Launcher {
 
         match action {
             Some(Action::Start) => self.start_host(),
+            Some(Action::StopBlockerAndStart(pid)) => self.stop_blocker_and_start(pid),
             Some(Action::Stop) => self.host.send(Request::Shutdown),
             Some(Action::Pair) => self.host.send(Request::StartPairing),
             Some(Action::CancelPairing) => self.host.send(Request::CancelPairing),
