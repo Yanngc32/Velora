@@ -1,5 +1,5 @@
-//! Software presentation: letterboxed nearest-neighbour scaling into the window buffer.
-//! A GPU path (YUV textures + shader scaling) should replace this.
+//! Software presentation, when OpenGL is not available (see `gpu`): letterboxed
+//! nearest-neighbour scaling into the window buffer.
 
 /// Where the remote picture sits inside the window, for mapping pointer coordinates.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]

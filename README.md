@@ -295,8 +295,9 @@ Windows limitations: without the service, input can't reach elevated windows unl
 1. **Zero-copy GPU pipeline.** Hardware encoders work today, but frames still go through CPU
    color conversion and an upload. Next: convert on the GPU (D3D11 video processor, VA-API VPP)
    and hand the DXGI texture straight to the encoder.
-2. **GPU presentation on the client.** YUV textures and shader conversion/scaling instead of the
-   CPU path, plus hardware decoding.
+2. **Hardware decoding on the client.** The session window already draws on the GPU (YUV
+   textures, shader conversion and bilinear scaling, software fallback); decoding is still
+   OpenH264 on the CPU. Next: D3D11VA / VA-API through FFmpeg.
 3. **Mobile:** an iOS app (Swift + VideoToolbox) on the same `velora-mobile` core. On Android:
    pinch to zoom, a direct-touch mode, and Play Store publishing.
 4. **NAT traversal.** A self-hostable rendezvous server, UDP hole punching, and a relay fallback.

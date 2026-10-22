@@ -2,7 +2,8 @@
 //!
 //! Each frame is acknowledged only after it has been decoded, so the host's in-flight limit
 //! also throttles to the client's decode speed and no queue can build up anywhere between
-//! capture and display.
+//! capture and display. Frames stay YUV: the window converts them on the GPU, or with
+//! [`VideoFrame::to_xrgb`] when it draws in software.
 
 use std::{
     sync::{mpsc, Arc, Mutex},
@@ -17,20 +18,40 @@ use crate::reorder::{Packet, Reorder};
 
 const STATS_INTERVAL: Duration = Duration::from_secs(5);
 
-/// A decoded picture as `0x00RRGGBB` pixels.
+/// A decoded picture, I420: full-size luma, then the two chroma planes at half width and height
+/// (rounded up), each packed without padding.
 pub struct VideoFrame {
     pub frame_id: u32,
     pub width: u32,
     pub height: u32,
-    pub pixels: Vec<u32>,
+    pub y: Vec<u8>,
+    pub u: Vec<u8>,
+    pub v: Vec<u8>,
 }
+
+impl VideoFrame {
+    /// Width and height of the chroma planes.
+    pub fn chroma_size(&self) -> (u32, u32) {
+        (self.width.div_ceil(2), self.height.div_ceil(2))
+    }
+
+    /// The picture as `0x00RRGGBB` pixels, for drawing without a GPU.
+    pub fn to_xrgb(&self, out: &mut Vec<u32>) {
+        let (w, h) = (self.width as usize, self.height as usize);
+        let cw = self.chroma_size().0 as usize;
+        i420_to_xrgb((&self.y, &self.u, &self.v), (w, cw, cw), (w, h), out);
+    }
+}
+
+/// Planes of a frame, kept for reuse.
+type Planes = (Vec<u8>, Vec<u8>, Vec<u8>);
 
 /// Single-slot mailbox: the UI always gets the most recent picture; older undisplayed ones are
 /// dropped instead of queued.
 #[derive(Default)]
 pub struct FrameSlot {
     latest: Mutex<Option<VideoFrame>>,
-    spare: Mutex<Vec<Vec<u32>>>,
+    spare: Mutex<Vec<Planes>>,
 }
 
 impl FrameSlot {
@@ -38,15 +59,15 @@ impl FrameSlot {
         self.latest.lock().unwrap().take()
     }
 
-    /// Returns a displayed frame's buffer for reuse, avoiding a large allocation per frame.
+    /// Returns a displayed frame's buffers for reuse, avoiding large allocations per frame.
     pub fn recycle(&self, frame: VideoFrame) {
         let mut spare = self.spare.lock().unwrap();
         if spare.len() < 2 {
-            spare.push(frame.pixels);
+            spare.push((frame.y, frame.u, frame.v));
         }
     }
 
-    fn buffer(&self) -> Vec<u32> {
+    fn buffers(&self) -> Planes {
         self.spare.lock().unwrap().pop().unwrap_or_default()
     }
 
@@ -103,10 +124,14 @@ fn decode_loop(
                     need_keyframe = false;
                     let (w, h) = yuv.dimensions();
                     let decoded = start.elapsed();
-                    let mut pixels = slot.buffer();
-                    yuv_to_xrgb(&yuv, &mut pixels);
+                    let (mut y, mut u, mut v) = slot.buffers();
+                    let (sy, su, sv) = yuv.strides();
+                    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+                    pack(yuv.y(), sy, w, h, &mut y);
+                    pack(yuv.u(), su, cw, ch, &mut u);
+                    pack(yuv.v(), sv, cw, ch, &mut v);
                     stats.convert += start.elapsed() - decoded;
-                    slot.publish(VideoFrame { frame_id: id, width: w as u32, height: h as u32, pixels });
+                    slot.publish(VideoFrame { frame_id: id, width: w as u32, height: h as u32, y, u, v });
                     stats.decoded(start.elapsed(), packet.data.len());
                     on_frame();
                 }
@@ -124,11 +149,22 @@ fn decode_loop(
     Ok(())
 }
 
+/// Copies a `width` × `height` plane with rows `stride` apart into `out`, rows back to back.
+fn pack(plane: &[u8], stride: usize, width: usize, height: usize, out: &mut Vec<u8>) {
+    out.clear();
+    out.reserve(width * height);
+    for row in plane.chunks(stride).take(height) {
+        out.extend_from_slice(&row[..width]);
+    }
+}
+
 /// BT.601 limited-range I420 to `0x00RRGGBB`, matching the host's conversion.
-fn yuv_to_xrgb(yuv: &impl YUVSource, out: &mut Vec<u32>) {
-    let (w, h) = yuv.dimensions();
-    let (sy, su, sv) = yuv.strides();
-    let (yp, up, vp) = (yuv.y(), yuv.u(), yuv.v());
+fn i420_to_xrgb(
+    (yp, up, vp): (&[u8], &[u8], &[u8]),
+    (sy, su, sv): (usize, usize, usize),
+    (w, h): (usize, usize),
+    out: &mut Vec<u32>,
+) {
     out.resize(w * h, 0);
 
     // Per-pixel chroma contributions for the current pair of rows; expanding them first keeps
@@ -186,7 +222,7 @@ impl Stats {
         let secs = elapsed.as_secs_f64();
         let ms = |d: Duration| if self.frames == 0 { 0.0 } else { d.as_secs_f64() * 1000.0 / self.frames as f64 };
         tracing::info!(
-            "decoded {:.1} fps, {:.2} Mbit/s, decode {:.1} ms, convert {:.1} ms",
+            "decoded {:.1} fps, {:.2} Mbit/s, decode {:.1} ms, copy {:.1} ms",
             self.frames as f64 / secs,
             self.bytes as f64 * 8.0 / secs / 1e6,
             ms(self.decode - self.convert),
@@ -199,17 +235,15 @@ impl Stats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openh264::formats::YUVSlices;
 
     #[test]
     fn converts_reference_colors() {
         for ((y, u, v), rgb) in
             [((16u8, 128u8, 128u8), 0x000000u32), ((235, 128, 128), 0xFFFFFF), ((82, 90, 240), 0xFF0000)]
         {
-            let (yp, up, vp) = ([y; 4], [u; 1], [v; 1]);
-            let src = YUVSlices::new((&yp, &up, &vp), (2, 2), (2, 1, 1));
+            let frame = VideoFrame { frame_id: 0, width: 2, height: 2, y: vec![y; 4], u: vec![u], v: vec![v] };
             let mut out = Vec::new();
-            yuv_to_xrgb(&src, &mut out);
+            frame.to_xrgb(&mut out);
             for px in out {
                 for shift in [0, 8, 16] {
                     let (a, b) = ((px >> shift) & 0xFF, (rgb >> shift) & 0xFF);
@@ -217,5 +251,13 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn packs_strided_planes() {
+        let plane = [1, 2, 9, 9, 3, 4, 9, 9];
+        let mut out = vec![7; 10];
+        pack(&plane, 4, 2, 2, &mut out);
+        assert_eq!(out, [1, 2, 3, 4]);
     }
 }

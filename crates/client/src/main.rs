@@ -2,6 +2,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod autostart;
+mod gpu;
 mod gui;
 mod keymap;
 mod port_owner;
@@ -286,7 +287,7 @@ fn run_window(
         remote_size: (session.width as u32, session.height as u32),
         session,
         window: None,
-        surface: None,
+        renderer: None,
         current: None,
         viewport: render::Viewport::default(),
         cursor: (0.0, 0.0),
@@ -297,6 +298,35 @@ fn run_window(
 }
 
 type Surface = softbuffer::Surface<Rc<Window>, Rc<Window>>;
+
+/// How the session window draws: on the GPU, or in software (with the converted picture).
+enum Renderer {
+    Gpu(Box<gpu::Gpu>),
+    Cpu(Surface, Vec<u32>),
+}
+
+impl Renderer {
+    /// The GPU unless it fails or `VELORA_RENDERER=cpu` asks for software.
+    fn new(window: &Rc<Window>) -> Result<Self> {
+        if std::env::var("VELORA_RENDERER").is_ok_and(|v| v.eq_ignore_ascii_case("cpu")) {
+            return Self::software(window);
+        }
+        match gpu::Gpu::new(window) {
+            Ok(gpu) => Ok(Self::Gpu(Box::new(gpu))),
+            Err(e) => {
+                tracing::warn!("drawing in software, OpenGL is not available: {e:#}");
+                Self::software(window)
+            }
+        }
+    }
+
+    fn software(window: &Rc<Window>) -> Result<Self> {
+        let surface = softbuffer::Context::new(window.clone())
+            .and_then(|ctx| Surface::new(&ctx, window.clone()))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok(Self::Cpu(surface, Vec::new()))
+    }
+}
 
 /// File transfers of a session, shown in its window title.
 #[derive(Default)]
@@ -356,7 +386,7 @@ struct App {
     shown_title: String,
     remote_size: (u32, u32),
     window: Option<Rc<Window>>,
-    surface: Option<Surface>,
+    renderer: Option<Renderer>,
     current: Option<VideoFrame>,
     viewport: render::Viewport,
     cursor: (f64, f64),
@@ -414,21 +444,35 @@ impl App {
     }
 
     fn redraw(&mut self) -> Result<()> {
-        let (Some(window), Some(surface)) = (&self.window, &mut self.surface) else { return Ok(()) };
-        if let Some(frame) = self.frames.take() {
-            if let Some(old) = self.current.replace(frame) {
-                self.frames.recycle(old);
-            }
-        }
+        let (Some(window), Some(renderer)) = (&self.window, &mut self.renderer) else { return Ok(()) };
+        let fresh = self.frames.take();
         let size = window.inner_size();
         let (Some(w), Some(h)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) else { return Ok(()) };
-        surface.resize(w, h).map_err(|e| anyhow::anyhow!("{e}"))?;
-        let mut buffer = surface.buffer_mut().map_err(|e| anyhow::anyhow!("{e}"))?;
-        match &self.current {
-            Some(f) => self.viewport = render::draw(&f.pixels, f.width, f.height, &mut buffer, w.get(), h.get()),
-            None => buffer.fill(0),
+        match renderer {
+            Renderer::Gpu(gpu) => {
+                // The textures hold the picture now: its buffers can go back to the decoder.
+                if let Some(frame) = fresh {
+                    gpu.upload(&frame);
+                    self.frames.recycle(frame);
+                }
+                self.viewport = gpu.draw(w.get(), h.get())?;
+            }
+            Renderer::Cpu(surface, rgb) => {
+                if let Some(frame) = fresh {
+                    frame.to_xrgb(rgb);
+                    if let Some(old) = self.current.replace(frame) {
+                        self.frames.recycle(old);
+                    }
+                }
+                surface.resize(w, h).map_err(|e| anyhow::anyhow!("{e}"))?;
+                let mut buffer = surface.buffer_mut().map_err(|e| anyhow::anyhow!("{e}"))?;
+                match &self.current {
+                    Some(f) => self.viewport = render::draw(rgb, f.width, f.height, &mut buffer, w.get(), h.get()),
+                    None => buffer.fill(0),
+                }
+                buffer.present().map_err(|e| anyhow::anyhow!("{e}"))?;
+            }
         }
-        buffer.present().map_err(|e| anyhow::anyhow!("{e}"))?;
         Ok(())
     }
 
@@ -480,11 +524,10 @@ impl ApplicationHandler for App {
                 return;
             }
         };
-        let surface = softbuffer::Context::new(window.clone()).and_then(|ctx| Surface::new(&ctx, window.clone()));
-        match surface {
-            Ok(s) => self.surface = Some(s),
+        match Renderer::new(&window) {
+            Ok(renderer) => self.renderer = Some(renderer),
             Err(e) => {
-                eprintln!("cannot create drawing surface: {e}");
+                eprintln!("cannot create drawing surface: {e:#}");
                 event_loop.exit();
                 return;
             }
