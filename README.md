@@ -291,13 +291,16 @@ the Rust core and generates its Kotlin bindings.
 
 ### Access over the internet
 
-Built-in NAT traversal is not implemented yet. Until then, either:
+With a mesh VPN such as **Tailscale** or **Netbird** on both computers, nothing else is
+needed. The host finds its addresses on the mesh (100.64.0.0/10, and Tailscale's
+fd7a:115c:a1e0::/48), shows them under **This PC**, puts them in the pairing link, and tells
+every client that connects. The client keeps them with the computer and, on the next
+connection, tries them along with the usual address (that one first, each other one 250 ms
+later): at home the LAN answers, away the VPN does, with no address to change. Only the
+secure handshake races; the session opens on the address that answered first.
 
-- use a mesh VPN such as Tailscale or WireGuard and connect to the host's VPN address
-  (recommended), or
-- forward **UDP** port 7420 on the host's router.
-
-Every connection is authenticated and encrypted either way.
+Without a mesh VPN, forward **UDP** port 7420 on the host's router. Every connection is
+authenticated and encrypted either way. Built-in NAT traversal is not implemented.
 
 ## Security model
 

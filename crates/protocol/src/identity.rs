@@ -52,6 +52,9 @@ pub struct KnownHost {
     pub name: String,
     pub address: String,
     pub fingerprint: String,
+    /// Other addresses the host told about (LAN, VPN mesh), tried along with `address`.
+    #[serde(default)]
+    pub also: Vec<String>,
 }
 
 /// Per-role state directory (`<config>/host` or `<config>/client`).

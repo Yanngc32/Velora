@@ -10,6 +10,8 @@ repository.workspace = true
 velora-protocol.workspace = true
 velora-update.workspace = true
 velora-clipboard.workspace = true
+# This computer's addresses on a VPN mesh (Tailscale, Netbird), to announce them.
+if-addrs = "0.13"
 anyhow.workspace = true
 serde_json.workspace = true
 serde.workspace = true

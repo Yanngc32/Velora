@@ -22,7 +22,7 @@ use velora_protocol::{
     control::{self, Reply, Request},
     files as wire_files,
     identity::{AuthorizedClient, StateDir},
-    pairing::{pairing_uri, parse_pairing_uri, PairingCode},
+    pairing::{pairing_uri_with, parse_pairing_uri, PairingCode},
     tls::{self, Fingerprint},
     wire::{
         self, ClientMsg, Codec, FrameHeader, HostMsg, MouseMove, FEATURE_CLIPBOARD, FEATURE_FILES, PROTOCOL_VERSION,
@@ -66,6 +66,8 @@ pub struct PendingPairing {
     pub code: PairingCode,
     /// Address advertised in the pairing link.
     pub address: String,
+    /// Addresses on a VPN mesh, in the link too.
+    pub also: Vec<String>,
     expires: Instant,
 }
 
@@ -134,7 +136,7 @@ pub async fn run(options: HostOptions, state: StateDir, pair: bool, auto_update:
     });
     if pair {
         let pairing = shared.start_pairing()?;
-        crate::print_pairing(&pairing.code, &pairing.address);
+        crate::print_pairing(&pairing.code, &pairing.address, &pairing.also);
     }
     // The launcher's view of this host. Without it the host still works from the command line.
     {
@@ -268,12 +270,15 @@ async fn handle_connection(incoming: quinn::Incoming, shared: Arc<Shared>) -> Re
         let _ = send.stopped().await;
         bail!("refused client '{name}' ({fingerprint}): {why}");
     }
+    // Where else this host answers, for clients that ask: tried along with this address later.
+    let addresses =
+        if ext.is_some_and(|e| e.addresses) { reachable_addresses(shared.options.bind) } else { Vec::new() };
     // Only clients that know about extensions understand the features field. Sessions share
     // the clipboard; a connection for files alone does not.
     let features = ext.map(|e| FEATURE_FILES | if e.files_only { 0 } else { FEATURE_CLIPBOARD });
     if ext.is_some_and(|e| e.files_only) {
         tracing::info!("client '{name}' ({fingerprint}) connected for files from {}", conn.remote_address());
-        return serve_files_only(conn, send, fingerprint, &name, &shared, features).await;
+        return serve_files_only(conn, send, fingerprint, &name, &shared, features, addresses).await;
     }
     tracing::info!("client '{name}' ({fingerprint}) connected from {}", conn.remote_address());
 
@@ -285,7 +290,7 @@ async fn handle_connection(incoming: quinn::Incoming, shared: Arc<Shared>) -> Re
 
     let clipboard = ext.is_some_and(|e| e.clipboard).then(|| share_clipboard(&conn)).flatten();
     let peer = Peer { shared: shared.clone(), name: name.clone(), fingerprint, clipboard };
-    let result = run_session(&conn, send, recv, &shared, features, peer).await;
+    let result = run_session(&conn, send, recv, &shared, features, addresses, peer).await;
 
     shared.input.send(InputCmd::ReleaseAll);
     let mut active = shared.active.lock().unwrap();
@@ -326,6 +331,7 @@ async fn serve_files_only(
     name: &str,
     shared: &Arc<Shared>,
     features: Option<u32>,
+    addresses: Vec<String>,
 ) -> Result<()> {
     let welcome = HostMsg::Welcome {
         version: PROTOCOL_VERSION,
@@ -334,6 +340,7 @@ async fn serve_files_only(
         width: 0,
         height: 0,
         features,
+        addresses,
     };
     send.write_all(&welcome.encode()).await?;
     shared.files.lock().unwrap().push(FilesConn { conn: conn.clone(), fingerprint });
@@ -355,6 +362,7 @@ impl Shared {
         let pairing = PendingPairing {
             code: PairingCode::generate(self.fingerprint)?,
             address: advertised_address(self.options.bind),
+            also: vpn_addresses(self.options.bind.port()),
             expires: Instant::now() + PAIRING_TTL,
         };
         *self.pairing.lock().unwrap() = Some(pairing.clone());
@@ -456,7 +464,7 @@ impl Shared {
         let pairing = self.pairing.lock().unwrap().as_ref().and_then(|p| {
             let left = p.expires.checked_duration_since(Instant::now())?;
             Some(control::Pairing {
-                uri: pairing_uri(&p.address, &p.code),
+                uri: pairing_uri_with(&p.address, &p.also, &p.code),
                 code: p.code.encode(),
                 address: p.address.clone(),
                 expires_in_secs: left.as_secs(),
@@ -468,6 +476,7 @@ impl Shared {
             version: velora_update::Version::current().to_string(),
             fingerprint: self.fingerprint.short(),
             address: (!address.starts_with('<')).then_some(address),
+            also: vpn_addresses(self.options.bind.port()),
             service: self.options.service,
             password_set: crate::password::is_set(&self.state)?,
             devices,
@@ -612,6 +621,41 @@ pub fn advertised_address(bind: SocketAddr) -> String {
     }
 }
 
+/// `ip:port` addresses on a VPN mesh: Tailscale and Netbird both hand out addresses from the
+/// shared address space 100.64.0.0/10, and Tailscale IPv6 ones from fd7a:115c:a1e0::/48. Other
+/// devices of the mesh reach this computer there from anywhere.
+pub fn vpn_addresses(port: u16) -> Vec<String> {
+    let Ok(interfaces) = if_addrs::get_if_addrs() else { return Vec::new() };
+    let mut out: Vec<String> = interfaces
+        .into_iter()
+        .map(|i| i.ip())
+        .filter(is_vpn_mesh)
+        .map(|ip| SocketAddr::new(ip, port).to_string())
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Whether `ip` is in the ranges Tailscale and Netbird assign (see [`vpn_addresses`]).
+fn is_vpn_mesh(ip: &std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let [a, b, ..] = v4.octets();
+            a == 100 && (64..128).contains(&b)
+        }
+        std::net::IpAddr::V6(v6) => v6.segments()[..3] == [0xfd7a, 0x115c, 0xa1e0],
+    }
+}
+
+/// Every address to announce to a client: the LAN one, then those on a VPN mesh.
+fn reachable_addresses(bind: SocketAddr) -> Vec<String> {
+    let lan = advertised_address(bind);
+    let mut out: Vec<String> = (!lan.starts_with('<')).then_some(lan).into_iter().collect();
+    out.extend(vpn_addresses(bind.port()));
+    out
+}
+
 /// Primary LAN address, found by asking the OS which interface would route to a public IP
 /// (no packet is sent).
 fn local_ip() -> Option<std::net::IpAddr> {
@@ -738,6 +782,7 @@ async fn run_session(
     mut control_recv: quinn::RecvStream,
     shared: &Arc<Shared>,
     features: Option<u32>,
+    addresses: Vec<String>,
     peer: Peer,
 ) -> Result<()> {
     let client_name = peer.name.clone();
@@ -788,6 +833,7 @@ async fn run_session(
                 width: (rect.width & !1) as u16,
                 height: (rect.height & !1) as u16,
                 features,
+                addresses,
             }
             .encode(),
         )
@@ -1063,5 +1109,21 @@ impl Stats {
         );
         let pending = std::mem::take(&mut self.pending);
         *self = Self { pending, ..Self::default() };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_vpn_mesh;
+
+    #[test]
+    fn recognizes_vpn_mesh_addresses() {
+        let vpn = |s: &str| is_vpn_mesh(&s.parse().unwrap());
+        assert!(vpn("100.101.102.103"), "Tailscale / Netbird");
+        assert!(vpn("100.64.0.1") && vpn("100.127.255.254"));
+        assert!(!vpn("100.63.0.1") && !vpn("100.128.0.1"), "outside 100.64.0.0/10");
+        assert!(!vpn("192.168.1.9") && !vpn("10.0.0.2"));
+        assert!(vpn("fd7a:115c:a1e0::1234"));
+        assert!(!vpn("fe80::1"));
     }
 }
