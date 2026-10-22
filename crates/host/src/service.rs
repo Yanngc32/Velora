@@ -197,7 +197,8 @@ fn allow_through_firewall(exe: &Path) -> Result<()> {
         &format!("program=\"{}\"", exe.display()),
         "protocol=UDP",
         &format!("localport={DEFAULT_PORT}"),
-        "profile=private,domain",
+        // Public networks too: the PC's network may be one its user cannot mark as Private.
+        "profile=any",
         "enable=yes",
     ])
 }

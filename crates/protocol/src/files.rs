@@ -306,16 +306,15 @@ pub async fn receive_tree<R: AsyncRead + Unpin>(r: &mut R, dest: &Path, progress
         match next(r).await? {
             FileMsg::Dir { path } => {
                 let target = place(dest, &path, &mut renamed, &mut saved)?;
-                tokio::fs::create_dir_all(&target).await.with_context(|| format!("creating {}", target.display()))?;
+                tokio::fs::create_dir_all(&target).await.map_err(|e| create_error(e, &target))?;
             }
             FileMsg::File { path, size } => {
                 let target = place(dest, &path, &mut renamed, &mut saved)?;
                 if let Some(parent) = target.parent() {
-                    tokio::fs::create_dir_all(parent).await?;
+                    tokio::fs::create_dir_all(parent).await.map_err(|e| create_error(e, parent))?;
                 }
                 let part = PartFile::new(&target);
-                let mut file =
-                    tokio::fs::File::create(&part.0).await.with_context(|| format!("creating {}", target.display()))?;
+                let mut file = tokio::fs::File::create(&part.0).await.map_err(|e| create_error(e, &target))?;
                 let mut left = size;
                 while left > 0 {
                     let n = r.read(&mut buf[..left.min(BUFFER as u64) as usize]).await?;
@@ -364,6 +363,17 @@ impl Drop for PartFile {
 
 /// Where an item goes: under `dest`, with its top-level name made unique the first time it is
 /// seen, so nothing that was already there is overwritten.
+/// Why `target` could not be created. A folder the user may not write to (such as the root of
+/// C:) gets a hint rather than the bare OS error.
+fn create_error(e: std::io::Error, target: &Path) -> anyhow::Error {
+    if e.kind() == std::io::ErrorKind::PermissionDenied {
+        let dir = target.parent().unwrap_or(target);
+        anyhow!("no permission to save in {}: choose another folder, such as Downloads", dir.display())
+    } else {
+        anyhow::Error::new(e).context(format!("creating {}", target.display()))
+    }
+}
+
 fn place(dest: &Path, rel: &str, renamed: &mut HashMap<String, String>, saved: &mut Vec<String>) -> Result<PathBuf> {
     let parts = relative_components(rel)?;
     let top = match renamed.get(parts[0]) {
@@ -674,6 +684,15 @@ mod tests {
     fn roundtrip(msg: FileMsg) {
         let enc = msg.encode();
         assert_eq!(FileMsg::decode(&enc[4..]).unwrap(), msg);
+    }
+
+    #[test]
+    fn explains_folders_without_permission() {
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let err = create_error(denied, Path::new("root/report.xlsx"));
+        assert_eq!(err.to_string(), "no permission to save in root: choose another folder, such as Downloads");
+        let other = create_error(std::io::Error::from(std::io::ErrorKind::NotFound), Path::new("root/report.xlsx"));
+        assert_eq!(other.to_string(), "creating root/report.xlsx");
     }
 
     #[test]

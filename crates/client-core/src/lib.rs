@@ -341,6 +341,12 @@ impl InputSender {
         self.send(ClientMsg::RequestKeyframe);
     }
 
+    /// Offers the host a `velora://pair?..` link to this computer's own host, so the other
+    /// computer can pair back. Hosts that predate offers ignore it.
+    pub fn offer_pairing(&self, link: &str) {
+        self.send(ClientMsg::OfferPairing { link: link.to_string() });
+    }
+
     /// Types text on the host (layout-independent), for soft keyboards that produce
     /// characters rather than key presses.
     pub fn text(&self, text: &str) {
