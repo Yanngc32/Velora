@@ -435,6 +435,10 @@ enum Outcome {
 fn supervise(events: &mpsc::Receiver<Event>, stopping: impl Fn()) -> Outcome {
     let exe = std::env::current_exe().expect("service executable path");
     let installed = modified(&exe);
+    // Also here: installs that update themselves never run `install` again.
+    if let Err(e) = allow_through_firewall(&exe) {
+        tracing::warn!("could not add the firewall rule: {e:#}");
+    }
     let mut host: Option<Host> = None;
     let mut backoff = Duration::from_secs(1);
     let mut next_start = Instant::now();
