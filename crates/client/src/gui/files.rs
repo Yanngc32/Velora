@@ -654,13 +654,6 @@ fn small_button(ui: &mut egui::Ui, text: &str, enabled: bool) -> egui::Response 
     }
 }
 
-fn progress_bar(ui: &mut egui::Ui, fraction: f32, width: f32) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 6.0), Sense::hover());
-    ui.painter().rect_filled(rect, 3.0, BORDER);
-    let done = egui::Rect::from_min_size(rect.min, Vec2::new(rect.width() * fraction.clamp(0.0, 1.0), rect.height()));
-    ui.painter().rect_filled(done, 3.0, ACCENT);
-}
-
 /// Small outline glyphs: a folder, a page, or a drive.
 fn paint_kind(painter: &egui::Painter, rect: egui::Rect, kind: EntryKind) {
     let stroke = Stroke::new(1.4, WEAK);

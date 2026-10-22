@@ -141,6 +141,16 @@ pub struct Update {
     pub files: Vec<FileEntry>,
 }
 
+impl Update {
+    /// Bytes to download.
+    pub fn size(&self) -> u64 {
+        self.files.iter().map(|f| f.size).sum()
+    }
+}
+
+/// Bytes downloaded so far and the total, as an install goes.
+pub type Progress<'a> = &'a mut (dyn FnMut(u64, u64) + Send);
+
 pub struct Updater {
     base_url: String,
     target: String,
@@ -203,13 +213,21 @@ impl Updater {
 
     /// Downloads, verifies and swaps in the changed files. On error nothing is left replaced.
     pub fn install(&self, update: &Update) -> Result<()> {
+        self.install_with_progress(update, &mut |_, _| {})
+    }
+
+    /// [`Self::install`], reporting downloaded bytes as it goes.
+    pub fn install_with_progress(&self, update: &Update, progress: Progress) -> Result<()> {
         let _lock = Lock::acquire(&self.install_dir)?;
-        let staged = self.download(update)?;
+        let staged = self.download(update, progress)?;
         swap_in(&self.install_dir, &staged)
     }
 
-    fn download(&self, update: &Update) -> Result<Vec<PathBuf>> {
+    fn download(&self, update: &Update, progress: Progress) -> Result<Vec<PathBuf>> {
         let mut staged = Vec::new();
+        let size = update.size();
+        let mut done = 0u64;
+        progress(0, size);
         let result = (|| {
             for f in &update.files {
                 let target = self.install_dir.join(safe_relative_path(&f.path)?);
@@ -235,6 +253,8 @@ impl Updater {
                     ctx.update(&buf[..n]);
                     out.write_all(&buf[..n])?;
                     total += n as u64;
+                    done += n as u64;
+                    progress(done, size);
                 }
                 out.sync_all()?;
                 drop(out);
@@ -398,11 +418,15 @@ pub fn auto_update_enabled(disabled_by_flag: bool) -> bool {
 pub fn update_now() -> Result<Option<Version>> {
     let updater = Updater::for_current_exe()?;
     match updater.check()? {
-        Some(update) if !update.files.is_empty() => {
-            updater.install(&update)?;
+        Some(update) => {
+            // No files to fetch: another process sharing the install directory (the launcher
+            // or the host) already installed it, and this one still has to restart.
+            if !update.files.is_empty() {
+                updater.install(&update)?;
+            }
             Ok(Some(update.version))
         }
-        _ => Ok(None),
+        None => Ok(None),
     }
 }
 
