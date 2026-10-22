@@ -4,6 +4,8 @@
 //! `main.rs`). That window needs raw physical keys, which egui does not expose, and a separate
 //! process keeps a misbehaving session from taking the launcher down.
 
+mod drop;
+mod file_icons;
 mod files;
 mod icons;
 mod motion;
@@ -164,6 +166,16 @@ struct Launcher {
     host_view: Option<Arc<this_pc::HostView>>,
     /// A host started from here that has not answered yet.
     host_child: Option<this_pc::StartedHost>,
+    /// Pairing a new computer also lets it reach this one.
+    offer_back: bool,
+    /// File requests already answered or announced, by id, and those to always accept.
+    requests_answered: Vec<u64>,
+    requests_seen: Vec<u64>,
+    requests_always: Vec<u64>,
+    /// Offers from paired devices already being acted on, by link.
+    offers_taken: Vec<String>,
+    /// Pairing back with offered computers, once done: link, and host name or error.
+    offers_done: this_pc::PairedBack,
     /// Another copy of the host holding the port, which "This PC" offers to stop.
     port_blocker: Option<crate::port_owner::PortOwner>,
     /// Installing or removing the Windows service.
@@ -214,6 +226,12 @@ impl Launcher {
             clients_seen: None,
             new_client: None,
             host_child: None,
+            offer_back: true,
+            requests_answered: Vec::new(),
+            requests_seen: Vec::new(),
+            requests_always: Vec::new(),
+            offers_taken: Vec::new(),
+            offers_done: Arc::default(),
             port_blocker: None,
             host_view: None,
             service_job: Arc::default(),
@@ -396,16 +414,40 @@ impl Launcher {
     }
 
     fn connect_page(&mut self, ui: &mut egui::Ui) {
+        const FORM_WIDTH: f32 = 360.0;
+        const GAP: f32 = 48.0;
+        const STEPS_WIDTH: f32 = 420.0;
+        // Header, form and steps as one block, centered in the window, a little above the
+        // middle (measured on the previous frame).
+        let width = (FORM_WIDTH + GAP + STEPS_WIDTH).min(ui.available_width());
+        let id = ui.scope_id().with("connect-height");
+        let height = ui.ctx().data(|d| d.get_temp::<f32>(id)).unwrap_or(0.0);
+        let left = ((ui.available_width() - width) / 2.0).max(0.0);
+        // The visible height: inside the page's scroll area the available one has no end.
+        let visible = ui.clip_rect().bottom() - ui.cursor().min.y;
+        let top = ((visible - height) * 0.4).max(0.0);
+        let rect =
+            egui::Rect::from_min_size(ui.cursor().min + egui::vec2(left, top), egui::vec2(width, height.max(1.0)));
+        let block =
+            ui.scope_builder(egui::UiBuilder::new().max_rect(rect).layout(Layout::top_down(Align::Min)), |ui| {
+                self.connect_block(ui, FORM_WIDTH, GAP);
+            });
+        let measured = block.response.rect.height();
+        if (measured - height).abs() > 0.5 {
+            ui.ctx().data_mut(|d| d.insert_temp(id, measured));
+            ui.ctx().request_repaint();
+        }
+    }
+
+    fn connect_block(&mut self, ui: &mut egui::Ui, form_width: f32, gap: f32) {
         let s = self.s;
         page_header(ui, s.connect_label, s.connect_title, Some(s.connect_hint));
-        const FORM_WIDTH: f32 = 360.0;
-        const GAP: f32 = 40.0;
-        if ui.available_width() >= FORM_WIDTH + GAP + 240.0 {
+        if ui.available_width() >= form_width + gap + 240.0 {
             ui.horizontal_top(|ui| {
-                ui.allocate_ui_with_layout(egui::vec2(FORM_WIDTH, 0.0), Layout::top_down(Align::Min), |ui| {
+                ui.allocate_ui_with_layout(egui::vec2(form_width, 0.0), Layout::top_down(Align::Min), |ui| {
                     self.connect_form(ui)
                 });
-                ui.add_space(GAP - ui.spacing().item_spacing.x);
+                ui.add_space(gap - ui.spacing().item_spacing.x);
                 let width = ui.available_width();
                 ui.allocate_ui_with_layout(egui::vec2(width, 0.0), Layout::top_down(Align::Min), |ui| {
                     connect_steps(ui, s)
@@ -434,6 +476,21 @@ impl Launcher {
             field_label(ui, s.address);
             ui.add(field(&mut self.address, s.address_hint, true));
             ui.add_space(16.0);
+            // Only a running host can hand out a code for the other computer.
+            let sharing = self.host.view().status.is_some();
+            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                let mut on = self.offer_back && sharing;
+                if toggle(ui, &mut on, sharing).changed() {
+                    self.offer_back = on;
+                }
+                ui.add_space(4.0);
+                ui.add(egui::Label::new(RichText::new(s.offer_back).font(font(13.5, medium()))).wrap());
+            });
+            if !sharing {
+                ui.add_space(2.0);
+                ui.add(egui::Label::new(RichText::new(s.offer_back_off).small().color(WEAK)).wrap());
+            }
+            ui.add_space(16.0);
 
             let ready = !self.address.trim().is_empty() && !self.code.trim().is_empty();
             if primary_button(ui, s.connect, ui.available_width(), ready).clicked() {
@@ -444,7 +501,24 @@ impl Launcher {
                             self.code.trim().to_string(),
                             self.settings.device_name.clone(),
                         );
-                        self.spawn(address.clone(), &["pair", &address, &code, "--name", &name], None);
+                        let mut args = vec!["pair".to_string(), address.clone(), code, "--name".into(), name];
+                        let mut offer_error = None;
+                        if self.offer_back && sharing {
+                            // A fresh code from this computer's host, for the other one to pair back.
+                            // Without one (a service host refuses non-administrators), pair one way.
+                            let request = velora_protocol::control::Request::StartPairing;
+                            let link = velora_protocol::control::request(&request)
+                                .and_then(|st| st.pairing.map(|p| p.uri).ok_or_else(|| anyhow!("no pairing code")));
+                            match link {
+                                Ok(link) => args.extend(["--offer".to_string(), link]),
+                                Err(e) => offer_error = Some(fill(s.offer_failed, &[&format!("{e:#}")])),
+                            }
+                        }
+                        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+                        self.spawn(address.clone(), &args, None);
+                        if offer_error.is_some() {
+                            self.error = offer_error;
+                        }
                         self.code.clear();
                     }
                     Err(_) => self.error = Some(s.invalid_code.into()),
@@ -478,33 +552,57 @@ impl Launcher {
         }
 
         let mut action = None;
+        // Files dragged in from the system go to the computer they are dropped on.
+        let ctx = ui.ctx().clone();
+        let (hovering, pointer, dropped) = (drop::hovering(&ctx), drop::pointer(&ctx), drop::dropped(&ctx));
+        let mut drop_on = None;
+        if hovering {
+            ctx.request_repaint();
+        }
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             ui.set_max_width(ui.available_width() - 14.0);
-            egui::Frame::new().fill(CARD).stroke(egui::Stroke::new(1.0, BORDER)).corner_radius(CARD_RADIUS).show(
-                ui,
-                |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.spacing_mut().item_spacing.y = 0.0;
-                    let count = self.hosts.len();
-                    for (i, host) in self.hosts.iter().enumerate() {
+            // Room above the first row: a card lifts under the pointer and must not be clipped.
+            ui.add_space(6.0);
+            // Cards in as many columns as fit.
+            const MIN_CARD: f32 = 340.0;
+            const GAP: f32 = 16.0;
+            let width = ui.available_width();
+            let columns = (((width + GAP) / (MIN_CARD + GAP)).floor() as usize).max(1);
+            let card_width = (width - GAP * (columns - 1) as f32) / columns as f32;
+            for row in self.hosts.chunks(columns) {
+                ui.horizontal_top(|ui| {
+                    ui.spacing_mut().item_spacing.x = GAP;
+                    for host in row {
                         let fresh = match &self.new_host {
                             Some((name, since)) if *name == host.name => Some(*since),
                             _ => None,
                         };
                         // A pairing session is labelled with the address it dialed.
                         let running = self.sessions.iter().any(|x| x.label == host.name || x.label == host.address);
-                        let corners = (i == 0, i + 1 == count);
-                        let row = animated_row(ui, &host.name, fresh, self.now, corners, |ui| {
-                            device_row(ui, s, &self.icons, host, running)
-                        });
-                        if let Some(a) = row {
+                        let card = DeviceCard { host, running, fresh, now: self.now, width: card_width };
+                        let (picked, rect) = card.show(ui, s, &self.icons);
+                        if let Some(a) = picked {
                             action = Some((a, host.name.clone()));
                         }
+                        let over = pointer.is_some_and(|p| rect.contains(p));
+                        let id = ui.scope_id().with(("device-drop", &host.name));
+                        let t = ctx.animate_bool_with_time(id, hovering && over, 0.15);
+                        drop::row_target(ui.painter(), rect, &fill(s.devices_drop, &[&host.name]), self.now, t);
+                        if over && !dropped.is_empty() {
+                            drop_on = Some(host.name.clone());
+                        }
                     }
-                },
-            );
+                });
+                ui.add_space(GAP);
+            }
             ui.add_space(24.0);
         });
+        if let Some(name) = drop_on {
+            self.open_files(name.clone(), &ctx);
+            if let Some(manager) = &mut self.files {
+                manager.send_when_ready(name, dropped, &ctx);
+            }
+        }
         match action {
             Some((DeviceAction::Connect, name)) => self.spawn(name.clone(), &["connect", &name], None),
             Some((DeviceAction::Files, name)) => self.open_files(name, ui.ctx()),
@@ -519,12 +617,16 @@ impl Launcher {
     }
 
     fn open_files(&mut self, host: String, ctx: &egui::Context) {
-        if self.files.as_ref().is_none_or(|f| f.host != host) {
-            let manager =
-                files::FileManager::open(host, self.config_dir.clone(), self.settings.device_name.clone(), ctx);
-            match manager {
-                Ok(manager) => self.files = Some(manager),
-                Err(e) => return self.error = Some(format!("{e:#}")),
+        match &mut self.files {
+            // Keeps its transfers: the computer just shows on the right.
+            Some(manager) => manager.show_host(host, ctx),
+            None => {
+                let manager =
+                    files::FileManager::open(host, self.config_dir.clone(), self.settings.device_name.clone(), ctx);
+                match manager {
+                    Ok(manager) => self.files = Some(manager),
+                    Err(e) => return self.error = Some(format!("{e:#}")),
+                }
             }
         }
         self.go(Page::Files);
@@ -533,8 +635,22 @@ impl Launcher {
     fn files_page(&mut self, ui: &mut egui::Ui) {
         let s = self.s;
         let Some(manager) = &mut self.files else { return self.go(Page::Devices) };
-        page_header(ui, s.files_label, &fill(s.files_title, &[&manager.host]), Some(s.files_hint));
-        manager.ui(ui, s);
+        let top = ui.cursor().min;
+        page_header(ui, s.files_label, s.files_title, Some(s.files_hint));
+        // Back to Devices sits at the right of the header, level with the title, as "Pair
+        // computer" does there.
+        let right = ui.max_rect().right();
+        let area = egui::Rect::from_min_max(
+            egui::pos2(right - 320.0, top.y + 28.0),
+            egui::pos2(right, top.y + 28.0 + CONTROL_HEIGHT),
+        );
+        let mut corner = ui.new_child(egui::UiBuilder::new().max_rect(area).layout(Layout::right_to_left(Align::Min)));
+        let back = secondary_button(&mut corner, s.files_to_devices).clicked();
+        let hosts: Vec<String> = self.hosts.iter().map(|h| h.name.clone()).collect();
+        manager.ui(ui, s, &hosts);
+        if back {
+            self.go(Page::Devices);
+        }
     }
 
     fn empty_devices(&mut self, ui: &mut egui::Ui) {
@@ -877,6 +993,7 @@ impl eframe::App for Launcher {
         }
         let host = self.host.view();
         self.track_clients(&host);
+        self.pair_back(&host);
         if self.new_client.as_ref().is_some_and(|(_, since)| self.now - since > motion::SUCCESS_SECONDS) {
             self.new_client = None;
         }
@@ -895,7 +1012,10 @@ impl eframe::App for Launcher {
         egui::CentralPanel::no_frame()
             .frame(egui::Frame::new().fill(BG).inner_margin(egui::Margin { left: 48, right: 34, top: 36, bottom: 0 }))
             .show(ui, |ui| {
-                ui.set_max_width(ui.available_width().min(860.0));
+                // Pages read best in a column; pairing centers its own.
+                if self.page != Page::Connect {
+                    ui.set_max_width(ui.available_width().min(860.0));
+                }
                 let mut notices = Vec::new();
                 if let UpdateState::Updated(v) = &*self.update.lock().unwrap() {
                     notices.push((fill(self.s.updated_restart, &[v]), LIVE));
@@ -930,6 +1050,7 @@ impl eframe::App for Launcher {
                 if !notices.is_empty() || self.new_host.is_some() || self.new_client.is_some() {
                     ui.add_space(12.0);
                 }
+                self.file_requests(ui, &host);
 
                 // New pages fade in while rising a few points.
                 let t = motion::progress(now, self.page_since, 0.18);
@@ -973,93 +1094,145 @@ enum DeviceAction {
     Forget,
 }
 
-fn device_row(ui: &mut egui::Ui, s: &Strings, icons: &Icons, host: &KnownHost, running: bool) -> Option<DeviceAction> {
-    let mut action = None;
-    egui::Frame::new().inner_margin(egui::Margin::symmetric(18, 14)).show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        ui.horizontal(|ui| {
-            let (tile, _) = ui.allocate_exact_size(Vec2::splat(40.0), Sense::hover());
-            ui.painter().rect(tile, RADIUS, BG, egui::Stroke::new(1.0, BORDER), egui::StrokeKind::Inside);
-            icons.paint(ui.painter(), Icon::Monitor, tile.center(), 20.0, WEAK);
-            ui.add_space(6.0);
-            ui.vertical(|ui| {
-                ui.spacing_mut().item_spacing.y = 3.0;
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(&host.name).font(font(14.5, semibold())));
-                    if running {
-                        ui.add_space(4.0);
-                        status(ui, s.connected, LIVE);
-                    }
-                });
-                ui.label(RichText::new(&host.address).font(mono(12.5)).color(WEAK));
-            });
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if primary_button(ui, s.connect, 110.0, true).clicked() {
-                    action = Some(DeviceAction::Connect);
-                }
-                if secondary_button(ui, s.files).clicked() {
-                    action = Some(DeviceAction::Files);
-                }
-                if secondary_button(ui, s.forget).clicked() {
-                    action = Some(DeviceAction::Forget);
-                }
-            });
-        });
+/// A button that removes something only when held: grey at rest, red under the pointer
+/// (where it says to hold), and a red fill sweeps across while it is held. Letting go early
+/// cancels. True once held to the end.
+fn hold_to_forget(ui: &mut egui::Ui, s: &Strings) -> bool {
+    const HOLD: f64 = 1.2;
+    let font_id = font(12.5, semibold());
+    let rest = ui.painter().layout_no_wrap(s.forget.to_string(), font_id.clone(), FAINT);
+    let hint = ui.painter().layout_no_wrap(s.hold_to_forget.to_string(), font_id, ERROR);
+    // As wide as the longer label, so nothing moves when it changes.
+    let size = egui::vec2(rest.size().x.max(hint.size().x) + 24.0, CONTROL_HEIGHT - 6.0);
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    let id = response.id.with("held-since");
+    let now = ui.input(|i| i.time);
+    let held = response.is_pointer_button_down_on();
+    let since = ui.ctx().data_mut(|d| {
+        let since = d.get_temp_mut_or_default::<Option<f64>>(id);
+        *since = if held { Some(since.unwrap_or(now)) } else { None };
+        *since
     });
-    action
+    let progress = since.map_or(0.0, |t| ((now - t) / HOLD).clamp(0.0, 1.0)) as f32;
+    let hover = ui.ctx().animate_bool_with_time(response.id.with("hover"), response.hovered() || held, HOVER_SECONDS);
+
+    let painter = ui.painter();
+    painter.rect_filled(rect, RADIUS, ERROR.gamma_multiply(0.16 * hover));
+    painter.rect_stroke(
+        rect,
+        RADIUS,
+        egui::Stroke::new(1.0, ERROR.gamma_multiply(0.55 * hover)),
+        egui::StrokeKind::Inside,
+    );
+    if progress > 0.0 {
+        let fill = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width() * progress, rect.height()));
+        painter.with_clip_rect(fill).rect_filled(rect, RADIUS, ERROR.gamma_multiply(0.55));
+    }
+    let galley = if hover > 0.5 { hint } else { rest };
+    let color = FAINT.lerp_to_gamma(ERROR, hover).lerp_to_gamma(TEXT, progress);
+    painter.galley(rect.center() - galley.size() / 2.0, galley, color);
+    response.on_hover_cursor(egui::CursorIcon::PointingHand);
+
+    if held {
+        ui.ctx().request_repaint();
+    }
+    if progress >= 1.0 {
+        ui.ctx().data_mut(|d| d.remove::<Option<f64>>(id));
+        return true;
+    }
+    false
 }
 
-/// A row of the device list, with a hover fade. A `fresh` row (just paired, at that time)
-/// unfolds from nothing and keeps a teal wash that drains over a few seconds.
-fn animated_row<R>(
-    ui: &mut egui::Ui,
-    key: &str,
+/// A paired computer as a card: its name and address, whether a session is open, and its
+/// actions. The card lifts a little under the pointer; a `fresh` one (just paired, at that
+/// time) grows in and keeps a teal edge that fades over a few seconds.
+struct DeviceCard<'a> {
+    host: &'a KnownHost,
+    running: bool,
     fresh: Option<f64>,
     now: f64,
-    (first, last): (bool, bool),
-    add: impl FnOnce(&mut egui::Ui) -> R,
-) -> R {
-    let id = ui.scope_id().with(key);
-    let width = ui.available_width();
-    // Measured on the previous frame.
-    let full = ui.ctx().data(|d| d.get_temp::<f32>(id)).unwrap_or(68.0);
-    let (unfold, wash) = match fresh {
-        Some(since) => (motion::progress(now, since, 0.35), 1.0 - motion::progress(now, since + 0.6, 2.5)),
-        None => (1.0, 0.0),
-    };
-    let (slot, _) = ui.allocate_exact_size(egui::vec2(width, full * unfold), Sense::hover());
-    if !first {
-        ui.painter().hline(slot.x_range(), slot.top(), egui::Stroke::new(1.0, BORDER));
-    }
-    let r = CARD_RADIUS.nw;
-    let radius = egui::CornerRadius {
-        nw: if first { r } else { 0 },
-        ne: if first { r } else { 0 },
-        sw: if last { r } else { 0 },
-        se: if last { r } else { 0 },
-    };
-    let hover = ui.ctx().animate_bool_with_time(id.with("hover"), ui.rect_contains_pointer(slot), HOVER_SECONDS);
-    let mut row = ui.new_child(
-        egui::UiBuilder::new()
-            .max_rect(egui::Rect::from_min_size(slot.min, egui::vec2(width, full)))
-            .layout(Layout::top_down(Align::Min)),
-    );
-    row.set_clip_rect(slot.intersect(ui.clip_rect()));
-    row.multiply_opacity(unfold);
-    let background = Color32::from_white_alpha((4.0 * hover) as u8);
-    row.painter().rect_filled(slot.shrink(0.5), radius, background);
-    if wash > 0.0 {
-        row.painter().rect_filled(slot.shrink(0.5), radius, LIVE.gamma_multiply(0.08 * wash));
-        let bar = egui::Rect::from_min_size(
-            slot.min + egui::vec2(0.5, 10.0),
-            egui::vec2(2.0, (slot.height() - 20.0).max(0.0)),
+    width: f32,
+}
+
+impl DeviceCard<'_> {
+    const HEIGHT: f32 = 150.0;
+
+    fn show(self, ui: &mut egui::Ui, s: &Strings, icons: &Icons) -> (Option<DeviceAction>, egui::Rect) {
+        let (slot, _) = ui.allocate_exact_size(egui::vec2(self.width, Self::HEIGHT), Sense::hover());
+        let id = ui.scope_id().with(("device", &self.host.name));
+        let hover = ui.ctx().animate_bool_with_time(id.with("hover"), ui.rect_contains_pointer(slot), HOVER_SECONDS);
+        let (grow, wash) = match self.fresh {
+            Some(since) => {
+                (motion::progress(self.now, since, 0.35), 1.0 - motion::progress(self.now, since + 0.6, 2.5))
+            }
+            None => (1.0, 0.0),
+        };
+        let rect = egui::Rect::from_center_size(slot.center(), slot.size() * (0.94 + 0.06 * grow))
+            .translate(egui::vec2(0.0, -2.0 * hover));
+        let painter = ui.painter();
+        painter.add(
+            egui::Shadow {
+                offset: [0, (4.0 + 6.0 * hover) as i8],
+                blur: (12.0 + 12.0 * hover) as u8,
+                spread: 0,
+                color: Color32::from_black_alpha((40.0 + 40.0 * hover) as u8),
+            }
+            .as_shape(rect, CARD_RADIUS),
         );
-        row.painter().rect_filled(bar, 1.0, LIVE.gamma_multiply(wash));
+        painter.rect_filled(rect, CARD_RADIUS, CARD);
+        let edge = BORDER.lerp_to_gamma(BORDER_STRONG, hover).lerp_to_gamma(LIVE, wash);
+        painter.rect_stroke(rect, CARD_RADIUS, egui::Stroke::new(1.0, edge), egui::StrokeKind::Inside);
+
+        let mut action = None;
+        let mut card =
+            ui.new_child(egui::UiBuilder::new().max_rect(rect.shrink(18.0)).layout(Layout::top_down(Align::Min)));
+        card.multiply_opacity(grow);
+        card.horizontal(|ui| {
+            let (tile, _) = ui.allocate_exact_size(Vec2::splat(44.0), Sense::hover());
+            let tint = if self.running { LIVE } else { WEAK.lerp_to_gamma(ACCENT_TEXT, hover) };
+            ui.painter().rect(tile, RADIUS, BG, egui::Stroke::new(1.0, BORDER), egui::StrokeKind::Inside);
+            icons.paint(ui.painter(), Icon::Monitor, tile.center(), 22.0, tint);
+            ui.add_space(6.0);
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 4.0;
+                ui.add(egui::Label::new(RichText::new(&self.host.name).font(font(15.0, semibold()))).truncate());
+                ui.label(RichText::new(&self.host.address).font(mono(12.5)).color(WEAK));
+            });
+        });
+        if self.running {
+            let mut corner = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(egui::Rect::from_min_max(
+                        rect.right_top() + egui::vec2(-160.0, 18.0),
+                        rect.right_top() + egui::vec2(-18.0, 40.0),
+                    ))
+                    .layout(Layout::right_to_left(Align::Center)),
+            );
+            status(&mut corner, s.connected, LIVE);
+        }
+        let bar = egui::Rect::from_min_max(
+            rect.left_bottom() + egui::vec2(18.0, -18.0 - CONTROL_HEIGHT),
+            rect.right_bottom() - egui::vec2(18.0, 18.0),
+        );
+        let mut buttons =
+            ui.new_child(egui::UiBuilder::new().max_rect(bar).layout(Layout::right_to_left(Align::Center)));
+        buttons.multiply_opacity(grow);
+        if primary_button(&mut buttons, s.connect, 110.0, true).clicked() {
+            action = Some(DeviceAction::Connect);
+        }
+        if secondary_button(&mut buttons, s.files).clicked() {
+            action = Some(DeviceAction::Files);
+        }
+        buttons.with_layout(Layout::left_to_right(Align::Center), |ui| {
+            if hold_to_forget(ui, s) {
+                action = Some(DeviceAction::Forget);
+            }
+        });
+        if self.fresh.is_some() && wash > 0.0 {
+            ui.ctx().request_repaint();
+        }
+        (action, rect)
     }
-    let out = add(&mut row);
-    let measured = row.min_rect().height();
-    ui.ctx().data_mut(|d| d.insert_temp(id, measured));
-    out
 }
 
 fn divider(ui: &mut egui::Ui) {

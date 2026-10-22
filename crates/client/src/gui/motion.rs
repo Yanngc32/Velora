@@ -80,6 +80,33 @@ fn partial(points: &[Pos2], fraction: f32) -> Vec<Pos2> {
     out
 }
 
+/// A finished transfer: the ring draws itself, then the check mark, `age` seconds after it
+/// ended.
+pub fn done_mark(painter: &egui::Painter, center: Pos2, radius: f32, age: f64) {
+    let ring = progress(age, 0.0, 0.35);
+    let check = progress(age, 0.25, 0.25);
+    painter.circle_filled(center, radius, LIVE.gamma_multiply(0.14 * ring));
+    painter.add(egui::Shape::line(arc(center, radius, ring), Stroke::new(1.6, LIVE)));
+    let s = radius / 10.0;
+    let mark = [center + vec2(-4.5, 0.2) * s, center + vec2(-1.4, 3.3) * s, center + vec2(4.6, -3.2) * s];
+    if check > 0.0 {
+        painter.add(egui::Shape::line(partial(&mark, check), Stroke::new(1.8, LIVE)));
+    }
+}
+
+/// A failed transfer: a red ring with a cross that pops in, `age` seconds after it ended.
+pub fn failed_mark(painter: &egui::Painter, center: Pos2, radius: f32, age: f64) {
+    let t = progress(age, 0.0, 0.25);
+    // Overshoots a little, then settles: a small shake of the head.
+    let r = radius * (1.0 + 0.15 * (1.0 - t) * (age as f32 * 30.0).sin());
+    painter.circle_filled(center, r, ERROR.gamma_multiply(0.14 * t));
+    painter.circle_stroke(center, r, Stroke::new(1.6, ERROR.gamma_multiply(t)));
+    let d = r * 0.38;
+    let stroke = Stroke::new(1.8, ERROR.gamma_multiply(t));
+    painter.line_segment([center + vec2(-d, -d), center + vec2(d, d)], stroke);
+    painter.line_segment([center + vec2(-d, d), center + vec2(d, -d)], stroke);
+}
+
 /// A count badge that swells and flashes teal while `pulse` rises and falls.
 pub fn badge(painter: &egui::Painter, right_center: Pos2, count: usize, pulse: f32) {
     let text = count.to_string();

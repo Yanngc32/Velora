@@ -10,7 +10,7 @@ use std::{
     net::SocketAddr,
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         Arc, Mutex,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -21,7 +21,7 @@ use tokio::sync::{mpsc, oneshot};
 use velora_protocol::{
     control::{self, Reply, Request},
     identity::{AuthorizedClient, StateDir},
-    pairing::{pairing_uri, PairingCode},
+    pairing::{pairing_uri, parse_pairing_uri, PairingCode},
     tls::{self, Fingerprint},
     wire::{self, ClientMsg, Codec, FrameHeader, HostMsg, MouseMove, FEATURE_FILES, PROTOCOL_VERSION},
 };
@@ -31,6 +31,7 @@ use crate::{
     encode::{self, EncoderChoice, EncoderSettings},
     input::{InputCmd, InputHandle},
     password::Check,
+    transfer::Peer,
 };
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -81,6 +82,11 @@ pub struct Shared {
     fingerprint: Fingerprint,
     input: InputHandle,
     pairing: Mutex<Option<PendingPairing>>,
+    /// Paired devices that offered to be reached from here too, for the launcher to act on.
+    offers: Mutex<Vec<PendingOffer>>,
+    /// Devices waiting for the user here to accept their files.
+    requests: Mutex<Vec<PendingRequest>>,
+    next_request: AtomicU64,
     /// Held across every read-modify-write of the paired list, so pairing and removing a
     /// device at the same moment cannot undo each other.
     clients: Mutex<()>,
@@ -112,6 +118,9 @@ pub async fn run(options: HostOptions, state: StateDir, pair: bool, auto_update:
         fingerprint: identity.fingerprint(),
         input: crate::input::spawn(),
         pairing: Mutex::new(None),
+        offers: Mutex::new(Vec::new()),
+        requests: Mutex::new(Vec::new()),
+        next_request: AtomicU64::new(1),
         clients: Mutex::new(()),
         active: Mutex::new(None),
         files: Mutex::new(Vec::new()),
@@ -257,7 +266,7 @@ async fn handle_connection(incoming: quinn::Incoming, shared: Arc<Shared>) -> Re
     let features = ext.map(|_| FEATURE_FILES);
     if ext.is_some_and(|e| e.files_only) {
         tracing::info!("client '{name}' ({fingerprint}) connected for files from {}", conn.remote_address());
-        return serve_files_only(conn, send, fingerprint, &shared, features).await;
+        return serve_files_only(conn, send, fingerprint, &name, &shared, features).await;
     }
     tracing::info!("client '{name}' ({fingerprint}) connected from {}", conn.remote_address());
 
@@ -267,7 +276,8 @@ async fn handle_connection(incoming: quinn::Incoming, shared: Arc<Shared>) -> Re
         old.conn.close(1u32.into(), b"another device took over");
     }
 
-    let result = run_session(&conn, send, recv, &shared, features).await;
+    let peer = Peer { shared: shared.clone(), name: name.clone(), fingerprint };
+    let result = run_session(&conn, send, recv, &shared, features, peer).await;
 
     shared.input.send(InputCmd::ReleaseAll);
     let mut active = shared.active.lock().unwrap();
@@ -282,6 +292,7 @@ async fn serve_files_only(
     conn: quinn::Connection,
     mut send: quinn::SendStream,
     fingerprint: Fingerprint,
+    name: &str,
     shared: &Arc<Shared>,
     features: Option<u32>,
 ) -> Result<()> {
@@ -296,7 +307,7 @@ async fn serve_files_only(
     send.write_all(&welcome.encode()).await?;
     shared.files.lock().unwrap().push(FilesConn { conn: conn.clone(), fingerprint });
     let result = tokio::select! {
-        r = crate::transfer::accept(conn.clone(), shared.options.service) => r,
+        r = crate::transfer::accept(conn.clone(), Peer { shared: shared.clone(), name: name.into(), fingerprint }) => r,
         e = conn.closed() => Err(e.into()),
     };
     shared.files.lock().unwrap().retain(|c| c.conn.stable_id() != conn.stable_id());
@@ -327,7 +338,12 @@ impl Shared {
             return Err("this host runs as the Velora service; turn the service off instead".into());
         }
         // Sending files changes nothing about access, and reads them as the user at the console.
-        let harmless = matches!(request, Request::Status | Request::SendFiles { .. });
+        // Dismissing an offer only forgets it: access to this computer stays as it was. Answering
+        // a device's files is the user's call: it can reach their screen already.
+        let harmless = matches!(
+            request,
+            Request::Status | Request::SendFiles { .. } | Request::DismissOffer { .. } | Request::AnswerFiles { .. }
+        );
         if self.options.service && !privileged && !harmless {
             return Err("only an administrator can change this computer's access".into());
         }
@@ -339,6 +355,11 @@ impl Shared {
                 Ok(())
             }
             Request::Revoke { fingerprint } => self.revoke(&fingerprint),
+            Request::DismissOffer { uri } => {
+                self.offers.lock().unwrap().retain(|o| o.uri != uri);
+                Ok(())
+            }
+            Request::AnswerFiles { id, accept, always } => self.answer_files(id, accept, always),
             Request::SetPassword { password } => {
                 crate::password::set(&self.state, password.as_deref()).map(|()| self.password.reset())
             }
@@ -420,9 +441,119 @@ impl Shared {
             password_set: crate::password::is_set(&self.state)?,
             devices,
             pairing,
+            offers: self.current_offers(),
+            requests: self
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|r| control::FileRequest {
+                    id: r.id,
+                    name: r.name.clone(),
+                    bytes: r.bytes,
+                    folder: r.folder.clone(),
+                })
+                .collect(),
         })
     }
+
+    /// Asks the user here, through the launcher, before files from a device are saved; devices
+    /// marked "always accept" skip the question. Fails with the reason to give the device.
+    pub async fn ask_to_receive(
+        &self,
+        name: &str,
+        fingerprint: &Fingerprint,
+        bytes: u64,
+        folder: String,
+    ) -> std::result::Result<(), &'static str> {
+        let fp = fingerprint.to_base64();
+        let trusted = self
+            .state
+            .load::<Vec<AuthorizedClient>>(StateDir::AUTHORIZED_CLIENTS)
+            .is_ok_and(|clients| clients.iter().any(|c| c.fingerprint == fp && c.trust_files));
+        if trusted {
+            return Ok(());
+        }
+        let (answer, answered) = oneshot::channel();
+        let id = self.next_request.fetch_add(1, Ordering::Relaxed);
+        tracing::info!("client '{name}' asks to send {bytes} bytes to {folder}");
+        self.requests.lock().unwrap().push(PendingRequest {
+            id,
+            name: name.to_string(),
+            fingerprint: fp,
+            bytes,
+            folder,
+            answer: Some(answer),
+        });
+        let result = tokio::time::timeout(REQUEST_TTL, answered).await;
+        self.requests.lock().unwrap().retain(|r| r.id != id);
+        match result {
+            Ok(Ok(true)) => Ok(()),
+            Ok(Ok(false)) => Err("the other computer declined the files"),
+            _ => Err("nobody accepted the files on the other computer in time"),
+        }
+    }
+
+    fn answer_files(&self, id: u64, accept: bool, always: bool) -> Result<()> {
+        let mut requests = self.requests.lock().unwrap();
+        let request = requests.iter_mut().find(|r| r.id == id).context("this request is no longer open")?;
+        if accept && always {
+            let _clients = self.clients.lock().unwrap();
+            let mut clients: Vec<AuthorizedClient> = self.state.load(StateDir::AUTHORIZED_CLIENTS)?;
+            for client in clients.iter_mut().filter(|c| c.fingerprint == request.fingerprint) {
+                client.trust_files = true;
+            }
+            self.state.save(StateDir::AUTHORIZED_CLIENTS, &clients)?;
+        }
+        if let Some(answer) = request.answer.take() {
+            let _ = answer.send(accept);
+        }
+        Ok(())
+    }
+
+    /// Keeps a paired device's offer to be reached from here too, replacing its earlier one.
+    /// It lives as long as the pairing code it carries.
+    fn offer(&self, name: &str, link: String) {
+        if parse_pairing_uri(&link).is_none() {
+            tracing::warn!("client '{name}' offered an invalid pairing link");
+            return;
+        }
+        tracing::info!("client '{name}' offered to pair back");
+        let mut offers = self.offers.lock().unwrap();
+        offers.retain(|o| o.name != name && o.expires > Instant::now());
+        offers.truncate(MAX_OFFERS - 1);
+        offers.push(PendingOffer { name: name.to_string(), uri: link, expires: Instant::now() + PAIRING_TTL });
+    }
+
+    fn current_offers(&self) -> Vec<control::Offer> {
+        let mut offers = self.offers.lock().unwrap();
+        offers.retain(|o| o.expires > Instant::now());
+        offers.iter().map(|o| control::Offer { name: o.name.clone(), uri: o.uri.clone() }).collect()
+    }
 }
+
+/// See [`Shared::ask_to_receive`].
+struct PendingRequest {
+    id: u64,
+    name: String,
+    fingerprint: String,
+    bytes: u64,
+    folder: String,
+    answer: Option<oneshot::Sender<bool>>,
+}
+
+/// How long a device's files wait for an answer before they are declined.
+const REQUEST_TTL: Duration = Duration::from_secs(120);
+
+/// See [`Shared::offer`].
+struct PendingOffer {
+    name: String,
+    uri: String,
+    expires: Instant,
+}
+
+/// Offers kept at once; a device has at most one.
+const MAX_OFFERS: usize = 8;
 
 /// Removes the paired devices matching `device` (name, or full or short fingerprint) and
 /// returns how many. Every handshake re-reads the list, so this applies without a restart.
@@ -519,6 +650,7 @@ fn authorize(
         name: name.to_string(),
         fingerprint: fp,
         added_unix: SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
+        trust_files: false,
     });
     shared.state.save(StateDir::AUTHORIZED_CLIENTS, &clients)?;
     tracing::info!("paired new client '{name}' ({fingerprint})");
@@ -563,7 +695,9 @@ async fn run_session(
     mut control_recv: quinn::RecvStream,
     shared: &Arc<Shared>,
     features: Option<u32>,
+    peer: Peer,
 ) -> Result<()> {
+    let client_name = peer.name.clone();
     let opts = &shared.options;
     let session = Arc::new(Session {
         running: AtomicBool::new(true),
@@ -643,6 +777,7 @@ async fn run_session(
                     session.stats.lock().unwrap().acked(frame_id);
                 }
                 ClientMsg::Text { text } => shared.input.send(InputCmd::Text(text)),
+                ClientMsg::OfferPairing { link } => shared.offer(&client_name, link),
                 ClientMsg::Unsupported { tag } => tracing::debug!("ignoring unsupported message {tag}"),
                 ClientMsg::Hello { .. } => bail!("unexpected hello"),
             }
@@ -687,7 +822,7 @@ async fn run_session(
         r = control => r,
         r = pointer => r,
         r = monitor => r,
-        r = crate::transfer::accept(conn.clone(), opts.service) => r,
+        r = crate::transfer::accept(conn.clone(), peer) => r,
         e = conn.closed() => Err(e.into()),
     };
     session.running.store(false, Ordering::Relaxed);

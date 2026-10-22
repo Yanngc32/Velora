@@ -40,6 +40,17 @@ pub enum Request {
     SendFiles {
         paths: Vec<PathBuf>,
     },
+    /// Forgets a pairing offer once the launcher has acted on it (see [`Status::offers`]).
+    DismissOffer {
+        uri: String,
+    },
+    /// Answers a device asking to send files here (see [`Status::requests`]). With `always`,
+    /// that device's files are saved without asking from now on.
+    AnswerFiles {
+        id: u64,
+        accept: bool,
+        always: bool,
+    },
 }
 
 pub type Reply = std::result::Result<Status, String>;
@@ -60,6 +71,33 @@ pub struct Status {
     pub password_set: bool,
     pub devices: Vec<Device>,
     pub pairing: Option<Pairing>,
+    /// Paired devices that offered to be reached from here too: the launcher pairs with each.
+    /// Absent from hosts that predate offers.
+    #[serde(default)]
+    pub offers: Vec<Offer>,
+    /// Devices waiting for an answer before their files are saved here. Absent from hosts
+    /// that predate requests.
+    #[serde(default)]
+    pub requests: Vec<FileRequest>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileRequest {
+    pub id: u64,
+    /// The device sending, as it is named in [`Status::devices`].
+    pub name: String,
+    /// Total size of the files.
+    pub bytes: u64,
+    /// Where they would be saved: a folder path, or "Downloads".
+    pub folder: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Offer {
+    /// The device that offered, as it is named in [`Status::devices`].
+    pub name: String,
+    /// `velora://pair?..` link to that device's host.
+    pub uri: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

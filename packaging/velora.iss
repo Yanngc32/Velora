@@ -2,7 +2,8 @@
 ;   ISCC /DAppVersion=0.2.0 /DStage=<staged install directory> /O<output dir> packaging\velora.iss
 ; Installs per user, without administrator rights, into a directory the user can write to, so
 ; the app can keep updating itself. The lock screen service (Program Files) is managed by the
-; app and is left alone on uninstall.
+; app and is left alone on uninstall. The firewall rule for the host needs administrator
+; rights: it is added and removed behind a UAC prompt (see [Code]).
 
 #ifndef AppVersion
   #error Pass /DAppVersion=<version>
@@ -55,6 +56,50 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 
 [Run]
 Filename: "{app}\velora.exe"; Description: "{cm:LaunchProgram,Velora}"; Flags: nowait postinstall skipifsilent
+
+[Code]
+const
+  FirewallRule = 'Velora';
+  HostPort = '7420';
+
+function Netsh(const Args: String): String;
+begin
+  Result := '"' + ExpandConstant('{sys}\netsh.exe') + '" advfirewall firewall ' + Args;
+end;
+
+{ Runs the commands elevated, behind a single UAC prompt. Declining it leaves the app
+  installed; only other devices can't reach this PC on networks Windows did not allow. }
+procedure RunElevated(const Commands: String);
+var
+  ResultCode: Integer;
+begin
+  { cmd strips the outer quotes and keeps the quoted paths inside. }
+  if not ShellExec('runas', ExpandConstant('{cmd}'), '/c "' + Commands + '"', '', SW_HIDE,
+    ewWaitUntilTerminated, ResultCode) then
+    Log('Firewall rule not changed: ' + SysErrorMessage(ResultCode));
+end;
+
+{ Lets other devices reach the host on any network, Public included (the Windows prompt
+  allows only Private networks). Rules Windows created for the host are removed first:
+  a block rule from that prompt would win over this one. }
+procedure CurStepChanged(CurStep: TSetupStep);
+var
+  Host: String;
+begin
+  if CurStep = ssPostInstall then
+  begin
+    Host := ExpandConstant('{app}\velora-host.exe');
+    RunElevated(Netsh('delete rule name=all program="' + Host + '"') + ' & ' +
+      Netsh('add rule name="' + FirewallRule + '" dir=in action=allow program="' + Host +
+        '" protocol=UDP localport=' + HostPort + ' profile=any enable=yes'));
+  end;
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+begin
+  if CurUninstallStep = usUninstall then
+    RunElevated(Netsh('delete rule name="' + FirewallRule + '"'));
+end;
 
 [UninstallDelete]
 ; Files the updater adds or leaves behind (new versions' files, renamed old executables).

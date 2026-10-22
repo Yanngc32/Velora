@@ -55,6 +55,29 @@ pub async fn pair(
     Ok(session)
 }
 
+/// Pairs like [`pair`] without opening a session: over a file connection, closed right away.
+/// Returns the host's name.
+pub async fn pair_quietly(
+    state: &StateDir,
+    address: &str,
+    code: &str,
+    device_name: &str,
+    password: Option<&str>,
+) -> Result<String> {
+    let code = PairingCode::parse(code)?;
+    let params = ConnectParams {
+        addr: resolve(address).await?,
+        host_fingerprint: code.host,
+        identity: state.load_or_create_identity()?,
+        device_name: device_name.to_string(),
+        pairing_secret: Some(code.secret),
+        password: password.map(str::to_string),
+    };
+    let session = crate::connect_files(params).await?;
+    remember(state, &session.host_name, address, code.host)?;
+    Ok(session.host_name.clone())
+}
+
 /// Connects to a paired host by name or address. Fails with [`crate::PasswordRequired`] like
 /// [`pair`].
 pub async fn connect(

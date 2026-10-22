@@ -67,8 +67,11 @@ On Windows, run `velora-<version>-x86_64-pc-windows-msvc-setup.exe` from the
 [releases page](https://github.com/Yanngc32/Velora/releases). It installs for your user, without
 administrator rights, into `%LOCALAPPDATA%\Programs\Velora`, and adds Velora to the Start menu
 and to Installed apps. The installer is not code-signed, so SmartScreen warns about it the first
-time: choose **More info → Run anyway**. After an automatic update, Installed apps may still show
-the version first installed. Uninstalling removes the app and its "Start with Windows" entry, but
+time: choose **More info → Run anyway**. At the end it asks once for administrator rights (UAC) to
+add a Windows Firewall rule, "Velora", that lets other devices reach the host on UDP port 7420 on
+any network, Public ones included; declining leaves sharing reachable only where Windows' own
+prompt allowed it. After an automatic update, Installed apps may still show
+the version first installed. Uninstalling removes the app, its firewall rule and its "Start with Windows" entry, but
 not the lock screen service: turn **This PC → Access on the lock screen** off first, or run
 `velora-host service uninstall` as administrator.
 
@@ -160,9 +163,12 @@ velora-host run --pair
 This prints a single-use pairing code, valid for 10 minutes, a QR code for the phone, and the
 exact command to run on the other device.
 
-On a desktop, open **Velora** (`velora` with no arguments) and paste the code or the
-`velora://` link under **Connect**. Paired computers are listed under **Devices**, one click
-away; each session opens in its own window. The same is available from the command line:
+On a desktop, open **Velora** (`velora` with no arguments) on the computer to control, go to
+**This PC**, turn sharing on and choose **Show QR code**; on the other computer, paste the code
+or the `velora://` link under **New pairing**. With **Also let it access this PC** on (and
+sharing on here), the other computer pairs back by itself, so each can reach the other.
+Paired computers are listed under **Devices** as cards, one click away; each session opens in
+its own window. The same is available from the command line:
 
 ```sh
 velora pair 192.168.0.10:7420 VL1-...      # first time: pairs, saves the host and connects
@@ -194,7 +200,7 @@ the host's state in `C:\ProgramData\Velora` (readable only by SYSTEM and adminis
 paired devices and password are carried over), and starts the host as SYSTEM in the console
 session. The host then follows the lock screen, UAC prompts and the logon screen, and runs
 from boot. Installing also adds a Windows Firewall rule, "Velora (service)", that lets the host
-receive UDP on port 7420 on private and domain networks: a service never gets Windows' "allow
+receive UDP on port 7420 on any network, Public ones included: a service never gets Windows' "allow
 access" prompt. `velora-host service uninstall` removes the service and the rule. Under the
 service, only administrators can pair or remove devices and change the password.
 
@@ -208,10 +214,17 @@ Both computers need this version or later.
 - **In a session**, drop files or folders on the window: they go to the remote computer's
   Downloads folder. On the remote computer, **Send to → Velora** in Explorer sends the
   selection back to your Downloads folder. The window title shows the progress.
-- **Devices → Files** opens a file manager: this computer and the remote one side by side.
-  Select and use **Send** or **Download**, drag rows from one side to the other, or drop files
-  from Explorer on the window. It connects for files only, without video, so it also works
-  while a session is open, and leaves that session alone.
+- **Devices**: drop files from Explorer on a computer's card to send them to its Downloads.
+- **Devices → Files** opens a file manager with a computer on each side, this one or any paired
+  one (pick it with the name at the top of the side). Select and use **Send to**, drag rows
+  from one side to the other, or drop files from Explorer on the side that receives. Between
+  two remote computers, files pass through this one (a temporary folder, removed afterwards).
+  It connects for files only, without video, so it also works while a session is open, and
+  leaves that session alone.
+
+The computer receiving files asks first: "*X is asking to send files to this PC*", with the size
+and where they go, **Accept** or **Decline**, and **Always accept from X** to skip the question
+for that device from then on. Unanswered requests are declined after two minutes.
 
 Nothing is ever overwritten: a name that is taken gets a number (`photo (1).jpg`). Files are
 written under a temporary name and appear only once complete; a cancelled or interrupted

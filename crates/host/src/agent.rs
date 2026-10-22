@@ -143,9 +143,12 @@ impl Agent {
 
     /// Connects the agent to a file stream until both directions end, then waits for it to
     /// exit (so it can clean up an interrupted transfer) or kills it.
-    pub async fn bridge(self, mut send: quinn::SendStream, mut recv: quinn::RecvStream) -> Result<()> {
+    /// Connects the stream to the agent. `prefix`: what the host already read from it, passed
+    /// on first.
+    pub async fn bridge(self, prefix: &[u8], mut send: quinn::SendStream, mut recv: quinn::RecvStream) -> Result<()> {
         let Self { process, mut stdin, mut stdout } = self;
         let up = async {
+            stdin.write_all(prefix).await?;
             let copied = tokio::io::copy(&mut recv, &mut stdin).await;
             let _ = stdin.flush().await;
             // Closes the pipe: the agent sees the end of its input.
