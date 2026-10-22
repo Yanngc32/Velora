@@ -165,6 +165,9 @@ jobs:
   android:
     needs: version
     if: needs.version.outputs.publish == 'true' || github.event_name != 'push'
+    # The signing key lives in the "release" environment, which only main and v* tags may use:
+    # dry runs, including pull requests from branches of this repository, never see it.
+    environment: ${{ needs.version.outputs.publish == 'true' && 'release' || '' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -182,8 +185,8 @@ jobs:
       - name: Install cargo-ndk
         run: cargo install cargo-ndk --locked
 
-      # Signed with the release key from the repository secrets. A dry run without them builds
-      # an unsigned APK; a release refuses to.
+      # Signed with the release key from the environment's secrets. A dry run builds an unsigned
+      # APK; a release without the key refuses to.
       - name: Release APK
         env:
           KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
