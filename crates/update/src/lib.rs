@@ -22,7 +22,7 @@ use std::{
 use anyhow::{bail, ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 
-pub const DEFAULT_BASE_URL: &str = "https://github.com/yanngc32/screen_mirroring/releases";
+pub const DEFAULT_BASE_URL: &str = "https://github.com/Yanngc32/Velora/releases";
 pub const MANIFEST: &str = "manifest.json";
 
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;

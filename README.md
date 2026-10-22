@@ -64,7 +64,7 @@ project yet (no GPU in CI).
 ## Installing
 
 Download `velora-<version>-<target>.zip` for Windows or Linux (x86-64) from the
-[releases page](https://github.com/yanngc32/screen_mirroring/releases). Extract it to a
+[releases page](https://github.com/Yanngc32/Velora/releases). Extract it to a
 directory **your user can write to**, so updates can be installed, for example
 `%LOCALAPPDATA%\Velora` or `~/.local/share/velora`. The archive contains
 both `velora-host` and `velora` and the FFmpeg libraries for hardware encoding.

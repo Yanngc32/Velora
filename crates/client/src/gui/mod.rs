@@ -37,7 +37,7 @@ use widgets::*;
 use crate::settings::Settings;
 
 const ICON_PNG: &[u8] = include_bytes!("../../assets/velora-icon.png");
-const REPO_URL: &str = "https://github.com/yanngc32/screen_mirroring";
+const REPO_URL: &str = "https://github.com/Yanngc32/Velora";
 
 /// Opens the launcher; `minimized` when started at sign-in.
 pub fn run(state: StateDir, config_dir: Option<PathBuf>, no_update: bool, minimized: bool) -> Result<()> {
@@ -671,7 +671,7 @@ impl Launcher {
             });
             divider(ui);
             row(ui, s.source_code, &mut |ui| {
-                ui.hyperlink_to(RichText::new("github.com/yanngc32/screen_mirroring").font(mono(13.0)), REPO_URL);
+                ui.hyperlink_to(RichText::new("github.com/Yanngc32/Velora").font(mono(13.0)), REPO_URL);
             });
         });
     }
