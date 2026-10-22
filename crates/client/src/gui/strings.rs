@@ -130,6 +130,8 @@ pub struct Strings {
     pub files_unsupported: &'static str,
     pub files_send_started: &'static str,
     pub files_send_failed: &'static str,
+    /// Explorer's Send To entry, which only Windows has.
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub files_send_to_description: &'static str,
 }
 
