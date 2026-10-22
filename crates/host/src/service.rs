@@ -14,14 +14,15 @@
 use std::{
     ffi::OsString,
     fs,
-    os::windows::fs::MetadataExt,
+    os::windows::{fs::MetadataExt, process::CommandExt},
     path::{Path, PathBuf},
+    process::Command,
     sync::mpsc,
     time::{Duration, Instant, SystemTime},
 };
 
 use anyhow::{bail, Context, Result};
-use velora_protocol::{control, identity::StateDir};
+use velora_protocol::{control, identity::StateDir, wire::DEFAULT_PORT};
 use windows::{
     core::{GUID, HSTRING, PWSTR},
     Win32::{
@@ -40,7 +41,9 @@ use windows::{
                 CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION, STARTUPINFOW,
             },
         },
-        UI::Shell::{FOLDERID_ProgramData, FOLDERID_ProgramFiles, SHGetKnownFolderPath, KF_FLAG_DEFAULT},
+        UI::Shell::{
+            FOLDERID_ProgramData, FOLDERID_ProgramFiles, FOLDERID_System, SHGetKnownFolderPath, KF_FLAG_DEFAULT,
+        },
     },
 };
 use windows_service::{
@@ -60,6 +63,9 @@ use crate::win::{self, Handle};
 pub const SERVICE_NAME: &str = "Velora";
 const DISPLAY_NAME: &str = "Velora Host";
 const DESCRIPTION: &str = "Lets paired devices view and control this computer, including on the lock screen.";
+/// Inbound firewall rule for the installed host. A SYSTEM process never gets Windows' "allow
+/// access" prompt, so without this rule the firewall silently drops every client.
+const FIREWALL_RULE: &str = "Velora (service)";
 /// Waits between restarts of a host that keeps failing: 1 s, doubling up to this.
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// A host that ran this long was healthy; the next failure starts the backoff over.
@@ -125,6 +131,10 @@ pub fn install(user_config: Option<PathBuf>) -> Result<()> {
     migrate_state(user_config, &state)?;
 
     let exe = target.join("velora-host.exe");
+    // Not fatal: a third-party firewall may stand in for Windows'.
+    if let Err(e) = allow_through_firewall(&exe) {
+        eprintln!("Could not add the firewall rule, allow UDP port {DEFAULT_PORT} for {}: {e:#}", exe.display());
+    }
     let info = ServiceInfo {
         name: SERVICE_NAME.into(),
         display_name: DISPLAY_NAME.into(),
@@ -170,7 +180,47 @@ pub fn uninstall() -> Result<()> {
         .context("the service is not installed (or this is not an administrator)")?;
     stop_and_wait(&service)?;
     service.delete()?;
+    let _ = remove_firewall_rule();
     println!("Removed the service. Files remain in {} and {}.", install_dir().display(), config_dir().display());
+    Ok(())
+}
+
+/// Replaces the service's firewall rule with one allowing `exe` on the host's UDP port.
+fn allow_through_firewall(exe: &Path) -> Result<()> {
+    let _ = remove_firewall_rule();
+    netsh(&[
+        "add",
+        "rule",
+        &format!("name=\"{FIREWALL_RULE}\""),
+        "dir=in",
+        "action=allow",
+        &format!("program=\"{}\"", exe.display()),
+        "protocol=UDP",
+        &format!("localport={DEFAULT_PORT}"),
+        "profile=private,domain",
+        "enable=yes",
+    ])
+}
+
+fn remove_firewall_rule() -> Result<()> {
+    netsh(&["delete", "rule", &format!("name=\"{FIREWALL_RULE}\"")])
+}
+
+/// Runs `netsh advfirewall firewall <args>`. By full path: a search would also look next to
+/// this executable, which may be in a folder the user can write to, and this runs elevated.
+/// Arguments are passed raw, since netsh wants `name="..."` rather than the whole argument
+/// quoted.
+fn netsh(args: &[&str]) -> Result<()> {
+    let exe = known_folder(&FOLDERID_System).context("locating System32")?.join("netsh.exe");
+    let mut command = Command::new(&exe);
+    command.args(["advfirewall", "firewall"]);
+    for arg in args {
+        command.raw_arg(arg);
+    }
+    let output = command.output().with_context(|| format!("running {}", exe.display()))?;
+    if !output.status.success() {
+        bail!("netsh failed: {}", String::from_utf8_lossy(&output.stdout).trim());
+    }
     Ok(())
 }
 
