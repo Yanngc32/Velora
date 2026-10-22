@@ -20,10 +20,13 @@ use anyhow::{bail, ensure, Context, Result};
 use tokio::sync::{mpsc, oneshot};
 use velora_protocol::{
     control::{self, Reply, Request},
+    files as wire_files,
     identity::{AuthorizedClient, StateDir},
-    pairing::{pairing_uri, parse_pairing_uri, PairingCode},
+    pairing::{pairing_uri_with, parse_pairing_uri, PairingCode},
     tls::{self, Fingerprint},
-    wire::{self, ClientMsg, Codec, FrameHeader, HostMsg, MouseMove, FEATURE_FILES, PROTOCOL_VERSION},
+    wire::{
+        self, ClientMsg, Codec, FrameHeader, HostMsg, MouseMove, FEATURE_CLIPBOARD, FEATURE_FILES, PROTOCOL_VERSION,
+    },
 };
 
 use crate::{
@@ -31,6 +34,7 @@ use crate::{
     encode::{self, EncoderChoice, EncoderSettings},
     input::{InputCmd, InputHandle},
     password::Check,
+    rate::{self, RateControl},
     transfer::Peer,
 };
 
@@ -53,6 +57,8 @@ pub struct HostOptions {
     pub encoder: EncoderChoice,
     /// Running as the system service, which the launcher shows.
     pub service: bool,
+    /// Lower the bitrate when the network falls behind (see `rate`); `bitrate_kbps` is the most.
+    pub adaptive_bitrate: bool,
 }
 
 #[derive(Clone)]
@@ -60,6 +66,8 @@ pub struct PendingPairing {
     pub code: PairingCode,
     /// Address advertised in the pairing link.
     pub address: String,
+    /// Addresses on a VPN mesh, in the link too.
+    pub also: Vec<String>,
     expires: Instant,
 }
 
@@ -128,7 +136,7 @@ pub async fn run(options: HostOptions, state: StateDir, pair: bool, auto_update:
     });
     if pair {
         let pairing = shared.start_pairing()?;
-        crate::print_pairing(&pairing.code, &pairing.address);
+        crate::print_pairing(&pairing.code, &pairing.address, &pairing.also);
     }
     // The launcher's view of this host. Without it the host still works from the command line.
     {
@@ -262,11 +270,15 @@ async fn handle_connection(incoming: quinn::Incoming, shared: Arc<Shared>) -> Re
         let _ = send.stopped().await;
         bail!("refused client '{name}' ({fingerprint}): {why}");
     }
-    // Only clients that know about extensions understand the features field.
-    let features = ext.map(|_| FEATURE_FILES);
+    // Where else this host answers, for clients that ask: tried along with this address later.
+    let addresses =
+        if ext.is_some_and(|e| e.addresses) { reachable_addresses(shared.options.bind) } else { Vec::new() };
+    // Only clients that know about extensions understand the features field. Sessions share
+    // the clipboard; a connection for files alone does not.
+    let features = ext.map(|e| FEATURE_FILES | if e.files_only { 0 } else { FEATURE_CLIPBOARD });
     if ext.is_some_and(|e| e.files_only) {
         tracing::info!("client '{name}' ({fingerprint}) connected for files from {}", conn.remote_address());
-        return serve_files_only(conn, send, fingerprint, &name, &shared, features).await;
+        return serve_files_only(conn, send, fingerprint, &name, &shared, features, addresses).await;
     }
     tracing::info!("client '{name}' ({fingerprint}) connected from {}", conn.remote_address());
 
@@ -276,8 +288,9 @@ async fn handle_connection(incoming: quinn::Incoming, shared: Arc<Shared>) -> Re
         old.conn.close(1u32.into(), b"another device took over");
     }
 
-    let peer = Peer { shared: shared.clone(), name: name.clone(), fingerprint };
-    let result = run_session(&conn, send, recv, &shared, features, peer).await;
+    let clipboard = ext.is_some_and(|e| e.clipboard).then(|| share_clipboard(&conn)).flatten();
+    let peer = Peer { shared: shared.clone(), name: name.clone(), fingerprint, clipboard };
+    let result = run_session(&conn, send, recv, &shared, features, addresses, peer).await;
 
     shared.input.send(InputCmd::ReleaseAll);
     let mut active = shared.active.lock().unwrap();
@@ -285,6 +298,29 @@ async fn handle_connection(incoming: quinn::Incoming, shared: Arc<Shared>) -> Re
         *active = None;
     }
     result
+}
+
+/// Shares this computer's clipboard with the device on `conn` for the session: what is copied
+/// here goes to it on a stream of its own; what it sends goes through the returned sender.
+fn share_clipboard(conn: &quinn::Connection) -> Option<std::sync::mpsc::Sender<velora_clipboard::Clip>> {
+    let (conn, runtime) = (conn.clone(), tokio::runtime::Handle::current());
+    velora_clipboard::spawn(move |clip| {
+        let encoded = match clip.encode() {
+            Ok(encoded) => encoded,
+            Err(e) => return tracing::warn!("cannot share the clipboard: {e:#}"),
+        };
+        let conn = conn.clone();
+        runtime.spawn(async move {
+            let sent = async {
+                let (mut send, _recv) = conn.open_bi().await?;
+                wire_files::send_clipboard(&mut send, encoded.0, &encoded.1).await
+            };
+            match sent.await {
+                Ok(()) => tracing::debug!("clipboard sent to the device ({} bytes)", encoded.1.len()),
+                Err(e) => tracing::debug!("clipboard not sent: {e:#}"),
+            }
+        });
+    })
 }
 
 /// A connection for file transfers only: nothing is captured, and the current session stays.
@@ -295,6 +331,7 @@ async fn serve_files_only(
     name: &str,
     shared: &Arc<Shared>,
     features: Option<u32>,
+    addresses: Vec<String>,
 ) -> Result<()> {
     let welcome = HostMsg::Welcome {
         version: PROTOCOL_VERSION,
@@ -303,11 +340,12 @@ async fn serve_files_only(
         width: 0,
         height: 0,
         features,
+        addresses,
     };
     send.write_all(&welcome.encode()).await?;
     shared.files.lock().unwrap().push(FilesConn { conn: conn.clone(), fingerprint });
     let result = tokio::select! {
-        r = crate::transfer::accept(conn.clone(), Peer { shared: shared.clone(), name: name.into(), fingerprint }) => r,
+        r = crate::transfer::accept(conn.clone(), Peer { shared: shared.clone(), name: name.into(), fingerprint, clipboard: None }) => r,
         e = conn.closed() => Err(e.into()),
     };
     shared.files.lock().unwrap().retain(|c| c.conn.stable_id() != conn.stable_id());
@@ -324,6 +362,7 @@ impl Shared {
         let pairing = PendingPairing {
             code: PairingCode::generate(self.fingerprint)?,
             address: advertised_address(self.options.bind),
+            also: vpn_addresses(self.options.bind.port()),
             expires: Instant::now() + PAIRING_TTL,
         };
         *self.pairing.lock().unwrap() = Some(pairing.clone());
@@ -425,7 +464,7 @@ impl Shared {
         let pairing = self.pairing.lock().unwrap().as_ref().and_then(|p| {
             let left = p.expires.checked_duration_since(Instant::now())?;
             Some(control::Pairing {
-                uri: pairing_uri(&p.address, &p.code),
+                uri: pairing_uri_with(&p.address, &p.also, &p.code),
                 code: p.code.encode(),
                 address: p.address.clone(),
                 expires_in_secs: left.as_secs(),
@@ -437,6 +476,7 @@ impl Shared {
             version: velora_update::Version::current().to_string(),
             fingerprint: self.fingerprint.short(),
             address: (!address.starts_with('<')).then_some(address),
+            also: vpn_addresses(self.options.bind.port()),
             service: self.options.service,
             password_set: crate::password::is_set(&self.state)?,
             devices,
@@ -581,6 +621,41 @@ pub fn advertised_address(bind: SocketAddr) -> String {
     }
 }
 
+/// `ip:port` addresses on a VPN mesh: Tailscale and Netbird both hand out addresses from the
+/// shared address space 100.64.0.0/10, and Tailscale IPv6 ones from fd7a:115c:a1e0::/48. Other
+/// devices of the mesh reach this computer there from anywhere.
+pub fn vpn_addresses(port: u16) -> Vec<String> {
+    let Ok(interfaces) = if_addrs::get_if_addrs() else { return Vec::new() };
+    let mut out: Vec<String> = interfaces
+        .into_iter()
+        .map(|i| i.ip())
+        .filter(is_vpn_mesh)
+        .map(|ip| SocketAddr::new(ip, port).to_string())
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Whether `ip` is in the ranges Tailscale and Netbird assign (see [`vpn_addresses`]).
+fn is_vpn_mesh(ip: &std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let [a, b, ..] = v4.octets();
+            a == 100 && (64..128).contains(&b)
+        }
+        std::net::IpAddr::V6(v6) => v6.segments()[..3] == [0xfd7a, 0x115c, 0xa1e0],
+    }
+}
+
+/// Every address to announce to a client: the LAN one, then those on a VPN mesh.
+fn reachable_addresses(bind: SocketAddr) -> Vec<String> {
+    let lan = advertised_address(bind);
+    let mut out: Vec<String> = (!lan.starts_with('<')).then_some(lan).into_iter().collect();
+    out.extend(vpn_addresses(bind.port()));
+    out
+}
+
 /// Primary LAN address, found by asking the OS which interface would route to a public IP
 /// (no packet is sent).
 fn local_ip() -> Option<std::net::IpAddr> {
@@ -661,10 +736,22 @@ fn authorize(
 struct Session {
     running: AtomicBool,
     keyframe_requested: AtomicBool,
+    /// Bitrate the encoder should use, set by the rate control.
+    bitrate_kbps: AtomicU32,
+    /// What the rate control looks at, since its last decision.
+    window: Mutex<RateWindow>,
     in_flight: AtomicU32,
     max_in_flight: AtomicU32,
     last_ack: Mutex<Instant>,
     stats: Mutex<Stats>,
+}
+
+/// Deliveries and waits of the current rate control period.
+#[derive(Default)]
+struct RateWindow {
+    delivery: Duration,
+    delivered: u32,
+    held_back: Duration,
 }
 
 struct OutFrame {
@@ -695,6 +782,7 @@ async fn run_session(
     mut control_recv: quinn::RecvStream,
     shared: &Arc<Shared>,
     features: Option<u32>,
+    addresses: Vec<String>,
     peer: Peer,
 ) -> Result<()> {
     let client_name = peer.name.clone();
@@ -702,6 +790,8 @@ async fn run_session(
     let session = Arc::new(Session {
         running: AtomicBool::new(true),
         keyframe_requested: AtomicBool::new(true),
+        bitrate_kbps: AtomicU32::new(opts.bitrate_kbps),
+        window: Mutex::new(RateWindow::default()),
         in_flight: AtomicU32::new(0),
         max_in_flight: AtomicU32::new(MIN_IN_FLIGHT + 1),
         last_ack: Mutex::new(Instant::now()),
@@ -743,6 +833,7 @@ async fn run_session(
                 width: (rect.width & !1) as u16,
                 height: (rect.height & !1) as u16,
                 features,
+                addresses,
             }
             .encode(),
         )
@@ -774,7 +865,11 @@ async fn run_session(
                 ClientMsg::FrameAck { frame_id } => {
                     session.ack_frame();
                     *session.last_ack.lock().unwrap() = Instant::now();
-                    session.stats.lock().unwrap().acked(frame_id);
+                    if let Some(delivery) = session.stats.lock().unwrap().acked(frame_id) {
+                        let mut window = session.window.lock().unwrap();
+                        window.delivery += delivery;
+                        window.delivered += 1;
+                    }
                 }
                 ClientMsg::Text { text } => shared.input.send(InputCmd::Text(text)),
                 ClientMsg::OfferPairing { link } => shared.offer(&client_name, link),
@@ -803,15 +898,33 @@ async fn run_session(
         let frame_interval = Duration::from_secs_f64(1.0 / opts.fps as f64);
         let mut tick = tokio::time::interval(Duration::from_millis(250));
         let mut last_log = Instant::now();
+        let mut rate = RateControl::new(opts.bitrate_kbps, Instant::now());
+        let mut last_rate = Instant::now();
         while session.running.load(Ordering::Relaxed) {
             tick.tick().await;
+            if opts.adaptive_bitrate && last_rate.elapsed() >= rate::PERIOD {
+                last_rate = Instant::now();
+                let window = std::mem::take(&mut *session.window.lock().unwrap());
+                let sample = rate::Sample {
+                    delivery: (window.delivered > 0).then(|| window.delivery / window.delivered),
+                    held_back: window.held_back,
+                };
+                if let Some(kbps) = rate.update(sample, Instant::now()) {
+                    tracing::info!(
+                        "bitrate {kbps} kbit/s (delivery {:.0} ms, held back {:.0} ms)",
+                        sample.delivery.unwrap_or_default().as_secs_f64() * 1000.0,
+                        sample.held_back.as_secs_f64() * 1000.0
+                    );
+                    session.bitrate_kbps.store(kbps, Ordering::Relaxed);
+                }
+            }
             let rtt = conn.rtt();
             let budget = (rtt.as_secs_f64() / frame_interval.as_secs_f64()).ceil() as u32 + MIN_IN_FLIGHT;
             session.max_in_flight.store(budget.clamp(MIN_IN_FLIGHT, MAX_IN_FLIGHT), Ordering::Relaxed);
             if last_log.elapsed() >= STATS_INTERVAL {
                 let elapsed = last_log.elapsed();
                 last_log = Instant::now();
-                session.stats.lock().unwrap().log(elapsed, rtt);
+                session.stats.lock().unwrap().log(elapsed, rtt, session.bitrate_kbps.load(Ordering::Relaxed));
             }
         }
         anyhow::Ok(())
@@ -856,6 +969,7 @@ fn capture_loop(
     let _ = ready.send(Ok(rect));
 
     let interval = Duration::from_secs_f64(1.0 / settings.fps.max(1) as f64);
+    let mut bitrate = settings.bitrate_kbps;
     let mut have_picture = false;
     let mut next_id = 0u32;
     let mut last_capture = Instant::now() - interval;
@@ -875,7 +989,9 @@ fn capture_loop(
                 *session.last_ack.lock().unwrap() = Instant::now();
             } else {
                 session.stats.lock().unwrap().throttled += 1;
+                let waited = Instant::now();
                 std::thread::sleep(Duration::from_millis(1));
+                session.window.lock().unwrap().held_back += waited.elapsed();
                 continue;
             }
         }
@@ -893,6 +1009,18 @@ fn capture_loop(
         }
         have_picture = true;
 
+        // The rate control asked for another bitrate: in place, or by opening the encoder again
+        // (which then starts with a keyframe).
+        let target = session.bitrate_kbps.load(Ordering::Relaxed);
+        if target != bitrate {
+            bitrate = target;
+            if !encoder.set_bitrate(target) {
+                let settings = EncoderSettings { bitrate_kbps: target, ..settings };
+                encoder = encode::open(choice, settings, rect.width, rect.height)?;
+                session.keyframe_requested.store(true, Ordering::Relaxed);
+            }
+        }
+        let keyframe = keyframe || session.keyframe_requested.load(Ordering::Relaxed);
         session.keyframe_requested.store(false, Ordering::Relaxed);
         let encode_start = Instant::now();
         let encoded = encoder.encode(frame.as_ref(), keyframe)?;
@@ -949,7 +1077,8 @@ impl Stats {
         }
     }
 
-    fn acked(&mut self, id: u32) {
+    /// Notes a frame's acknowledgement; returns its capture-to-acknowledgement time.
+    fn acked(&mut self, id: u32) -> Option<Duration> {
         while let Some(&(pending, captured)) = self.pending.front() {
             self.pending.pop_front();
             if pending == id {
@@ -957,18 +1086,20 @@ impl Stats {
                 self.latency_sum += latency;
                 self.latency_max = self.latency_max.max(latency);
                 self.acked += 1;
-                break;
+                return Some(latency);
             }
         }
+        None
     }
 
-    fn log(&mut self, elapsed: Duration, rtt: Duration) {
+    fn log(&mut self, elapsed: Duration, rtt: Duration, bitrate_kbps: u32) {
         let secs = elapsed.as_secs_f64();
         let per_frame = |d: Duration, n: u32| if n == 0 { 0.0 } else { d.as_secs_f64() * 1000.0 / n as f64 };
         tracing::info!(
-            "video: {:.1} fps, {:.2} Mbit/s, convert {:.1} ms, encode {:.1} ms, capture->client {:.1} ms (max {:.1}), rtt {:.1} ms, throttled {}",
+            "video: {:.1} fps, {:.2} Mbit/s (target {:.1}), convert {:.1} ms, encode {:.1} ms, capture->client {:.1} ms (max {:.1}), rtt {:.1} ms, throttled {}",
             self.frames as f64 / secs,
             self.bytes as f64 * 8.0 / secs / 1e6,
+            bitrate_kbps as f64 / 1000.0,
             per_frame(self.convert_time, self.frames),
             per_frame(self.encode_time, self.frames),
             per_frame(self.latency_sum, self.acked),
@@ -978,5 +1109,21 @@ impl Stats {
         );
         let pending = std::mem::take(&mut self.pending);
         *self = Self { pending, ..Self::default() };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_vpn_mesh;
+
+    #[test]
+    fn recognizes_vpn_mesh_addresses() {
+        let vpn = |s: &str| is_vpn_mesh(&s.parse().unwrap());
+        assert!(vpn("100.101.102.103"), "Tailscale / Netbird");
+        assert!(vpn("100.64.0.1") && vpn("100.127.255.254"));
+        assert!(!vpn("100.63.0.1") && !vpn("100.128.0.1"), "outside 100.64.0.0/10");
+        assert!(!vpn("192.168.1.9") && !vpn("10.0.0.2"));
+        assert!(vpn("fd7a:115c:a1e0::1234"));
+        assert!(!vpn("fe80::1"));
     }
 }

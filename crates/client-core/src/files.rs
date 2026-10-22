@@ -9,7 +9,7 @@ use std::{
     },
 };
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use velora_protocol::files::{self, Entry, FileMsg, Tree};
 
 pub use velora_protocol::files::{Entry as RemoteEntry, EntryKind};
@@ -70,25 +70,37 @@ pub enum OfferEvent {
     },
 }
 
-/// Accepts the host's file streams until the connection closes, saving offered files into
-/// `dest`.
+/// Accepts the host's streams until the connection closes: offered files are saved into
+/// `dest`, clipboard content goes to `on_clip`.
 pub(crate) async fn receive_offers(
     conn: quinn::Connection,
     dest: PathBuf,
     on_event: Arc<dyn Fn(OfferEvent) + Send + Sync>,
+    on_clip: Arc<dyn Fn(u8, Vec<u8>) + Send + Sync>,
 ) {
     let ids = Arc::new(AtomicU64::new(0));
-    while let Ok((send, recv)) = conn.accept_bi().await {
+    while let Ok((send, mut recv)) = conn.accept_bi().await {
         let id = ids.fetch_add(1, Ordering::Relaxed);
-        let (dest, on_event) = (dest.clone(), on_event.clone());
+        let (dest, on_event, on_clip) = (dest.clone(), on_event.clone(), on_clip.clone());
         tokio::spawn(async move {
-            if let Err(e) = receive_offer(send, recv, &dest, id, &on_event).await {
-                on_event(OfferEvent::Failed { id, error: format!("{e:#}") });
+            match files::read(&mut recv).await {
+                Ok(Some(FileMsg::Offer)) => {
+                    if let Err(e) = receive_offer(send, recv, &dest, id, &on_event).await {
+                        on_event(OfferEvent::Failed { id, error: format!("{e:#}") });
+                    }
+                }
+                Ok(Some(FileMsg::Clipboard { kind, size })) => match files::read_clipboard(&mut recv, size).await {
+                    Ok(data) => on_clip(kind, data),
+                    Err(e) => tracing::debug!("clipboard not received: {e:#}"),
+                },
+                Ok(_) => on_event(OfferEvent::Failed { id, error: "the host sent an unknown file request".into() }),
+                Err(e) => tracing::debug!("file stream from the host failed: {e:#}"),
             }
         });
     }
 }
 
+/// Saves the tree that follows an [`FileMsg::Offer`].
 async fn receive_offer(
     mut send: quinn::SendStream,
     mut recv: quinn::RecvStream,
@@ -96,9 +108,6 @@ async fn receive_offer(
     id: u64,
     on_event: &Arc<dyn Fn(OfferEvent) + Send + Sync>,
 ) -> Result<()> {
-    if files::read(&mut recv).await? != Some(FileMsg::Offer) {
-        bail!("the host sent an unknown file request");
-    }
     let mut progress = |done, total| on_event(OfferEvent::Progress { id, done, total });
     match files::receive_tree(&mut recv, dest, &mut progress).await {
         Ok(names) => {

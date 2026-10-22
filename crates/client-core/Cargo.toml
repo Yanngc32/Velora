@@ -13,7 +13,17 @@ tracing.workspace = true
 tokio.workspace = true
 quinn.workspace = true
 openh264 = { workspace = true, optional = true }
+ffmpeg-sys-next = { version = "9", default-features = false, features = ["avcodec"], optional = true }
 bytes = "1"
+
+[target.'cfg(windows)'.dependencies]
+# Zero-copy output of the D3D11VA decoder (see src/d3d11.rs).
+windows = { version = "0.62", optional = true, features = [
+  "Win32_Graphics_Direct3D",
+  "Win32_Graphics_Direct3D11",
+  "Win32_Graphics_Dxgi",
+  "Win32_Graphics_Dxgi_Common",
+] }
 
 [dev-dependencies]
 tokio = { workspace = true }
@@ -22,3 +32,5 @@ tokio = { workspace = true }
 default = ["decode"]
 # Software H.264 decoding to RGB (desktop). Mobile apps decode in hardware and leave it off.
 decode = ["dep:openh264"]
+# Hardware decoding (D3D11VA, VA-API) through the system FFmpeg libraries, OpenH264 as fallback.
+ffmpeg = ["decode", "dep:ffmpeg-sys-next", "dep:windows"]

@@ -35,6 +35,10 @@ pub trait VideoEncoder {
     /// Encodes `frame`, or re-encodes the previous picture when `None` (keyframe requested
     /// while the screen is unchanged).
     fn encode(&mut self, frame: Option<&Frame>, keyframe: bool) -> Result<Encoded>;
+
+    /// Changes the target bitrate from the next frame on, without a keyframe. False when the
+    /// encoder cannot: then it has to be opened again.
+    fn set_bitrate(&mut self, kbps: u32) -> bool;
 }
 
 #[derive(Debug, Clone, Copy)]

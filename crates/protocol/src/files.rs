@@ -68,6 +68,12 @@ pub enum FileMsg {
     },
     /// Host to client: files for the client's Downloads folder.
     Offer,
+    /// New clipboard content of the sender, `size` bytes of `kind` (see `velora-clipboard`)
+    /// following. Nothing is answered. Sent only to a side that announced it takes them.
+    Clipboard {
+        kind: u8,
+        size: u64,
+    },
     Entry(Entry),
     /// Total size of the files in the tree that follows.
     Total {
@@ -104,6 +110,12 @@ impl FileMsg {
             Self::Download { path: p } => path(3, p),
             Self::Upload { dir } => path(4, dir),
             Self::Offer => Writer::new(5).finish(),
+            Self::Clipboard { kind, size } => {
+                let mut w = Writer::new(6);
+                w.u8(*kind);
+                w.u64(*size);
+                w.finish()
+            }
             Self::Entry(e) => {
                 let mut w = Writer::new(16);
                 w.str_max(&e.name, MAX_PATH_LEN);
@@ -153,6 +165,7 @@ impl FileMsg {
             3 => Self::Download { path: r.str()? },
             4 => Self::Upload { dir: r.str()? },
             5 => Self::Offer,
+            6 => Self::Clipboard { kind: r.u8()?, size: r.u64()? },
             16 => Self::Entry(Entry {
                 name: r.str()?,
                 path: r.str()?,
@@ -179,6 +192,26 @@ impl FileMsg {
         r.end()?;
         Ok(msg)
     }
+}
+
+/// Largest clipboard content accepted.
+pub const MAX_CLIPBOARD: u64 = 32 * 1024 * 1024;
+
+/// Sends clipboard content on a fresh stream and closes it.
+pub async fn send_clipboard<W: AsyncWrite + Unpin>(w: &mut W, kind: u8, data: &[u8]) -> Result<()> {
+    ensure!(data.len() as u64 <= MAX_CLIPBOARD, "clipboard content too large");
+    write(w, &FileMsg::Clipboard { kind, size: data.len() as u64 }).await?;
+    w.write_all(data).await?;
+    w.shutdown().await?;
+    Ok(())
+}
+
+/// Reads the `size` bytes after a [`FileMsg::Clipboard`].
+pub async fn read_clipboard<R: AsyncRead + Unpin>(r: &mut R, size: u64) -> Result<Vec<u8>> {
+    ensure!(size <= MAX_CLIPBOARD, "clipboard content too large");
+    let mut data = vec![0; size as usize];
+    r.read_exact(&mut data).await?;
+    Ok(data)
 }
 
 /// Reads one message. `Ok(None)` when the stream ends before one starts.
@@ -702,6 +735,7 @@ mod tests {
         roundtrip(FileMsg::Download { path: "/home/ana/vídeo.mp4".into() });
         roundtrip(FileMsg::Upload { dir: String::new() });
         roundtrip(FileMsg::Offer);
+        roundtrip(FileMsg::Clipboard { kind: 2, size: 1 << 20 });
         roundtrip(FileMsg::Entry(Entry {
             name: "relatório.pdf".into(),
             path: r"C:\relatório.pdf".into(),

@@ -26,7 +26,7 @@ jobs:
       - run: cargo test --all-targets
 
   ffmpeg:
-    # Hardware encoder backend, built against the distro's FFmpeg.
+    # Hardware encoder and decoder backends, built against the distro's FFmpeg.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -35,8 +35,8 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy -p velora-host --all-targets --features ffmpeg -- -D warnings
-      - run: cargo test -p velora-host --features ffmpeg
+      - run: cargo clippy -p velora-host -p velora --all-targets --features velora-host/ffmpeg,velora/ffmpeg -- -D warnings
+      - run: cargo test -p velora-host -p velora-client-core --features velora-host/ffmpeg,velora-client-core/ffmpeg
 
   msrv:
     runs-on: ubuntu-latest

@@ -2,8 +2,12 @@
 //! delivery. UIs only draw frames and feed input: the desktop gets decoded RGB pictures,
 //! mobile apps get the H.264 stream in order and decode it in hardware.
 
+#[cfg(all(windows, feature = "ffmpeg"))]
+mod d3d11;
 pub mod files;
 pub mod hosts;
+#[cfg(feature = "ffmpeg")]
+mod hwdecode;
 mod reorder;
 #[cfg(feature = "decode")]
 mod video;
@@ -17,21 +21,21 @@ use std::{
     },
 };
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use tokio::sync::mpsc;
 use velora_protocol::{
     identity::Identity,
     tls::{self, Fingerprint},
     wire::{
-        self, ClientMsg, FrameHeader, HelloExt, HostMsg, KeyState, MouseButton, MouseMove, FEATURE_FILES,
-        PROTOCOL_VERSION,
+        self, ClientMsg, FrameHeader, HelloExt, HostMsg, KeyState, MouseButton, MouseMove, FEATURE_CLIPBOARD,
+        FEATURE_FILES, PROTOCOL_VERSION,
     },
 };
 
 pub use files::{OfferEvent, RemoteFiles};
 
 #[cfg(feature = "decode")]
-pub use video::{FrameSlot, VideoFrame};
+pub use video::{Chroma, FrameSlot, GpuPicture, VideoFrame};
 
 /// An encoded frame, delivered in order. Acknowledge it with [`InputSender::frame_done`] once
 /// it has been displayed: that is what paces the host.
@@ -55,6 +59,9 @@ pub enum VideoOutput {
 
 pub struct ConnectParams {
     pub addr: SocketAddr,
+    /// Other addresses of the host (LAN, VPN mesh): tried at once, a little after `addr`, and
+    /// the first to answer is used.
+    pub also: Vec<SocketAddr>,
     pub host_fingerprint: Fingerprint,
     pub identity: Identity,
     pub device_name: String,
@@ -104,17 +111,52 @@ struct Handshake {
     width: u16,
     height: u16,
     features: u32,
+    addresses: Vec<String>,
+}
+
+/// How long each further address waits before it is tried: the first usually answers.
+const ADDRESS_STAGGER: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Sets up the secure connection to the host, racing its addresses when it has several. Only
+/// the TLS handshake races: the host opens nothing before the hello, which goes on the winner
+/// alone, so the others never become a session that would take over.
+async fn establish(params: &ConnectParams) -> Result<(quinn::Endpoint, quinn::Connection)> {
+    let config = tls::client_config(&params.identity, params.host_fingerprint)?;
+    let mut addrs = vec![params.addr];
+    addrs.extend(params.also.iter().filter(|a| **a != params.addr));
+    let mut attempts = tokio::task::JoinSet::new();
+    for (i, addr) in addrs.into_iter().enumerate() {
+        let config = config.clone();
+        attempts.spawn(async move {
+            tokio::time::sleep(ADDRESS_STAGGER * i as u32).await;
+            let reached = async {
+                let bind: SocketAddr = if addr.is_ipv6() { "[::]:0".parse()? } else { "0.0.0.0:0".parse()? };
+                let mut endpoint = quinn::Endpoint::client(bind)?;
+                endpoint.set_default_client_config(config);
+                let conn = endpoint.connect(addr, tls::SERVER_NAME)?.await?;
+                anyhow::Ok((endpoint, conn))
+            };
+            reached.await.map_err(|e| (i, e))
+        });
+    }
+    let mut failure: Option<(usize, anyhow::Error)> = None;
+    while let Some(attempt) = attempts.join_next().await {
+        match attempt {
+            Ok(Ok(found)) => {
+                attempts.abort_all();
+                return Ok(found);
+            }
+            // The main address's failure says most; keep it over the others.
+            Ok(Err((i, e))) if failure.as_ref().is_none_or(|(j, _)| i < *j) => failure = Some((i, e)),
+            _ => {}
+        }
+    }
+    let error = failure.map_or_else(|| anyhow::anyhow!("no address to try"), |(_, e)| e);
+    Err(error.context("could not establish a secure connection (wrong address or host fingerprint changed?)"))
 }
 
 async fn handshake(params: &ConnectParams, ext: Option<HelloExt>) -> Result<Handshake> {
-    let bind: SocketAddr = if params.addr.is_ipv6() { "[::]:0".parse()? } else { "0.0.0.0:0".parse()? };
-    let mut endpoint = quinn::Endpoint::client(bind)?;
-    endpoint.set_default_client_config(tls::client_config(&params.identity, params.host_fingerprint)?);
-
-    let conn = endpoint
-        .connect(params.addr, tls::SERVER_NAME)?
-        .await
-        .context("could not establish a secure connection (wrong address or host fingerprint changed?)")?;
+    let (endpoint, conn) = establish(params).await?;
 
     let (mut send, mut recv) = conn.open_bi().await?;
     send.write_all(
@@ -139,7 +181,7 @@ async fn handshake(params: &ConnectParams, ext: Option<HelloExt>) -> Result<Hand
         };
         match HostMsg::decode(&body)? {
             HostMsg::Paired => newly_paired = true,
-            HostMsg::Welcome { version, host_name, width, height, features, .. } => {
+            HostMsg::Welcome { version, host_name, width, height, features, addresses, .. } => {
                 if version != PROTOCOL_VERSION {
                     bail!("host uses protocol version {version}, expected {PROTOCOL_VERSION}");
                 }
@@ -153,6 +195,7 @@ async fn handshake(params: &ConnectParams, ext: Option<HelloExt>) -> Result<Hand
                     width,
                     height,
                     features: features.unwrap_or(0),
+                    addresses,
                 });
             }
             HostMsg::Rejected { reason } => bail!("host rejected the connection: {reason}"),
@@ -163,6 +206,8 @@ async fn handshake(params: &ConnectParams, ext: Option<HelloExt>) -> Result<Hand
 
 pub struct Session {
     pub host_name: String,
+    /// Where else the host answers (see `HostMsg::Welcome`).
+    pub addresses: Vec<String>,
     /// The host accepted the pairing secret and stored this device.
     pub newly_paired: bool,
     pub width: u16,
@@ -198,8 +243,33 @@ impl Session {
 
     /// Saves files the host sends (Send To on the host) into `dest`, reporting each transfer.
     /// Hosts without file transfers never send any.
-    pub fn receive_files(&self, dest: PathBuf, on_event: Arc<dyn Fn(OfferEvent) + Send + Sync>) {
-        self.runtime.spawn(files::receive_offers(self.conn.clone(), dest, on_event));
+    /// Accepts what the host sends: files into `dest`, reported to `on_event`, and its
+    /// clipboard content (kind and bytes, see `velora-clipboard`), passed to `on_clip`.
+    pub fn receive_files(
+        &self,
+        dest: PathBuf,
+        on_event: Arc<dyn Fn(OfferEvent) + Send + Sync>,
+        on_clip: Arc<dyn Fn(u8, Vec<u8>) + Send + Sync>,
+    ) {
+        self.runtime.spawn(files::receive_offers(self.conn.clone(), dest, on_event, on_clip));
+    }
+
+    /// Sends this computer's clipboard content to the host, when it shares its clipboard.
+    pub fn send_clipboard(&self, kind: u8, data: Vec<u8>) {
+        if self.features & FEATURE_CLIPBOARD == 0 {
+            return;
+        }
+        let conn = self.conn.clone();
+        self.runtime.spawn(async move {
+            let sent = async {
+                let (mut send, _recv) = conn.open_bi().await?;
+                velora_protocol::files::send_clipboard(&mut send, kind, &data).await
+            };
+            match sent.await {
+                Ok(()) => tracing::debug!("clipboard sent to the host ({} bytes)", data.len()),
+                Err(e) => tracing::debug!("clipboard not sent: {e:#}"),
+            }
+        });
     }
 }
 
@@ -207,6 +277,8 @@ impl Session {
 /// if any, carries on.
 pub struct FilesSession {
     pub host_name: String,
+    /// Where else the host answers (see `HostMsg::Welcome`).
+    pub addresses: Vec<String>,
     pub files: RemoteFiles,
     conn: quinn::Connection,
     _endpoint: quinn::Endpoint,
@@ -227,7 +299,7 @@ impl Drop for FilesSession {
 /// Connects for file transfers only.
 pub async fn connect_files(params: ConnectParams) -> Result<FilesSession> {
     const TOO_OLD: &str = "this computer's Velora is too old for file transfers; update it";
-    let hs = match handshake(&params, Some(HelloExt { files_only: true })).await {
+    let hs = match handshake(&params, Some(HelloExt { files_only: true, clipboard: false, addresses: true })).await {
         Err(e) if e.is::<NoReply>() => bail!(TOO_OLD),
         hs => hs?,
     };
@@ -235,22 +307,23 @@ pub async fn connect_files(params: ConnectParams) -> Result<FilesSession> {
         bail!(TOO_OLD);
     }
     // Nothing more is said on the control stream; keep it open for the connection's lifetime.
-    let Handshake { endpoint, conn, send, recv, host_name, .. } = hs;
+    let Handshake { endpoint, conn, send, recv, host_name, addresses, .. } = hs;
     tokio::spawn(async move {
         let _keep = (send, recv);
         std::future::pending::<()>().await
     });
-    Ok(FilesSession { host_name, files: RemoteFiles { conn: conn.clone() }, conn, _endpoint: endpoint })
+    Ok(FilesSession { host_name, addresses, files: RemoteFiles { conn: conn.clone() }, conn, _endpoint: endpoint })
 }
 
 /// Connects, authenticates and starts delivering video to `output`.
 pub async fn connect(params: ConnectParams, output: VideoOutput) -> Result<Session> {
-    let hs = match handshake(&params, Some(HelloExt::default())).await {
+    let hs = match handshake(&params, Some(HelloExt { files_only: false, clipboard: true, addresses: true })).await {
         // Hosts that predate hello extensions drop the connection: ask again as they expect.
         Err(e) if e.is::<NoReply>() => handshake(&params, None).await?,
         hs => hs?,
     };
-    let Handshake { endpoint, conn, mut send, mut recv, host_name, newly_paired, width, height, features } = hs;
+    let Handshake { endpoint, conn, mut send, mut recv, host_name, newly_paired, width, height, features, addresses } =
+        hs;
 
     let (control_tx, mut control_rx) = mpsc::unbounded_channel::<ClientMsg>();
     tokio::spawn(async move {
@@ -287,6 +360,7 @@ pub async fn connect(params: ConnectParams, output: VideoOutput) -> Result<Sessi
 
     Ok(Session {
         host_name,
+        addresses,
         newly_paired,
         width,
         height,

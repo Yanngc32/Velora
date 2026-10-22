@@ -1,4 +1,10 @@
-//! Software video decoding thread and the frame hand-off to the UI.
+//! Video decoding thread and the frame hand-off to the UI.
+//!
+//! OpenH264 decodes on the CPU first. The GPU (see `hwdecode`, when built with FFmpeg) takes
+//! over when the window shows its pictures where they are (`FrameSlot::set_zero_copy`, see
+//! `d3d11`): measured at 1080p, 2.7 ms per frame against 6 to 8 on the CPU, with less CPU. When
+//! the picture has to be copied back to memory it is slower (about 11 ms), so then the GPU
+//! takes over only when the CPU cannot keep up. `VELORA_DECODER=gpu` or `software` forces one.
 //!
 //! Each frame is acknowledged only after it has been decoded, so the host's in-flight limit
 //! also throttles to the client's decode speed and no queue can build up anywhere between
@@ -10,20 +16,42 @@ use std::{
     time::{Duration, Instant},
 };
 
-use openh264::{decoder::Decoder, formats::YUVSource, OpenH264API};
+use openh264::{formats::YUVSource, OpenH264API};
 use tokio::sync::mpsc::UnboundedSender;
 use velora_protocol::wire::ClientMsg;
 
 use crate::reorder::{Packet, Reorder};
 
 const STATS_INTERVAL: Duration = Duration::from_secs(5);
+/// Frames the CPU decoder is timed over before deciding whether the GPU should take over.
+const CPU_TRIAL_FRAMES: u32 = 60;
+/// Average decode time above which the CPU is too slow: past it, 60 fps does not fit.
+const CPU_BUDGET: Duration = Duration::from_millis(12);
 
-/// A decoded picture, I420: full-size luma, then the two chroma planes at half width and height
-/// (rounded up), each packed without padding.
+/// How a frame's chroma is laid out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Chroma {
+    /// I420: `u` and `v` are separate planes (what OpenH264 gives).
+    Planar,
+    /// NV12: `u` holds both, interleaved (what GPU decoders give); `v` is empty.
+    Interleaved,
+}
+
+/// A picture that stayed on the GPU (see `d3d11`); never present in builds without it.
+#[cfg(all(windows, feature = "ffmpeg"))]
+pub use crate::d3d11::D3d11Picture as GpuPicture;
+#[cfg(not(all(windows, feature = "ffmpeg")))]
+pub enum GpuPicture {}
+
+/// A decoded picture: full-size luma, then chroma at half width and height (rounded up), each
+/// plane packed without padding. Or, when the window takes them, a picture still on the GPU
+/// (`gpu`), with empty planes.
 pub struct VideoFrame {
     pub frame_id: u32,
     pub width: u32,
     pub height: u32,
+    pub chroma: Chroma,
+    pub gpu: Option<GpuPicture>,
     pub y: Vec<u8>,
     pub u: Vec<u8>,
     pub v: Vec<u8>,
@@ -39,12 +67,99 @@ impl VideoFrame {
     pub fn to_xrgb(&self, out: &mut Vec<u32>) {
         let (w, h) = (self.width as usize, self.height as usize);
         let cw = self.chroma_size().0 as usize;
-        i420_to_xrgb((&self.y, &self.u, &self.v), (w, cw, cw), (w, h), out);
+        match self.chroma {
+            Chroma::Planar => i420_to_xrgb((&self.y, &self.u, &self.v), (w, cw, cw), (w, h), out),
+            Chroma::Interleaved => {
+                let (u, v): (Vec<u8>, Vec<u8>) = self.u.as_chunks::<2>().0.iter().map(|&[u, v]| (u, v)).unzip();
+                i420_to_xrgb((&self.y, &u, &v), (w, cw, cw), (w, h), out);
+            }
+        }
     }
 }
 
 /// Planes of a frame, kept for reuse.
-type Planes = (Vec<u8>, Vec<u8>, Vec<u8>);
+pub(crate) type Planes = (Vec<u8>, Vec<u8>, Vec<u8>);
+
+/// The decoder in use: the GPU's when it opens, OpenH264 otherwise or after the GPU fails.
+enum Decoder {
+    #[cfg(feature = "ffmpeg")]
+    Gpu(crate::hwdecode::HwDecoder),
+    Software(openh264::decoder::Decoder),
+}
+
+/// Which decoder `VELORA_DECODER` asks for, if any.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Choice {
+    Auto,
+    Gpu,
+    Software,
+}
+
+impl Choice {
+    fn from_env() -> Self {
+        match std::env::var("VELORA_DECODER").map(|v| v.to_ascii_lowercase()).as_deref() {
+            Ok("gpu") => Self::Gpu,
+            Ok("software") => Self::Software,
+            _ => Self::Auto,
+        }
+    }
+}
+
+impl Decoder {
+    /// The CPU, or the GPU when `VELORA_DECODER=gpu` asks for it and it opens.
+    fn open(choice: Choice) -> anyhow::Result<Self> {
+        if choice == Choice::Gpu {
+            if let Some(gpu) = Self::gpu() {
+                return Ok(gpu);
+            }
+        }
+        tracing::info!("decoding on the CPU");
+        Self::software()
+    }
+
+    /// The GPU decoder, if this build and this computer have one.
+    fn gpu() -> Option<Self> {
+        #[cfg(feature = "ffmpeg")]
+        match crate::hwdecode::HwDecoder::open() {
+            Ok(gpu) => {
+                tracing::info!("decoding on the GPU ({})", crate::hwdecode::HwDecoder::NAME);
+                return Some(Self::Gpu(gpu));
+            }
+            Err(e) => tracing::info!("no GPU decoding: {e:#}"),
+        }
+        None
+    }
+
+    fn software() -> anyhow::Result<Self> {
+        Ok(Self::Software(openh264::decoder::Decoder::with_api_config(OpenH264API::from_source(), Default::default())?))
+    }
+
+    /// Decodes one access unit into `planes`. `None` while there is no picture yet.
+    /// `zero_copy`: the window shows pictures left on the GPU.
+    fn decode(&mut self, data: &[u8], planes: Planes, zero_copy: bool) -> anyhow::Result<Option<VideoFrame>> {
+        let _ = zero_copy;
+        match self {
+            #[cfg(feature = "ffmpeg")]
+            Self::Gpu(gpu) => gpu.decode(data, planes, zero_copy),
+            Self::Software(decoder) => {
+                let Some(yuv) = decoder.decode(data)? else { return Ok(None) };
+                let (w, h) = yuv.dimensions();
+                let (mut y, mut u, mut v) = planes;
+                let (sy, su, sv) = yuv.strides();
+                let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+                pack(yuv.y(), sy, w, h, &mut y);
+                pack(yuv.u(), su, cw, ch, &mut u);
+                pack(yuv.v(), sv, cw, ch, &mut v);
+                let (width, height) = (w as u32, h as u32);
+                Ok(Some(VideoFrame { frame_id: 0, width, height, chroma: Chroma::Planar, gpu: None, y, u, v }))
+            }
+        }
+    }
+
+    fn on_gpu(&self) -> bool {
+        !matches!(self, Self::Software(_))
+    }
+}
 
 /// Single-slot mailbox: the UI always gets the most recent picture; older undisplayed ones are
 /// dropped instead of queued.
@@ -52,9 +167,21 @@ type Planes = (Vec<u8>, Vec<u8>, Vec<u8>);
 pub struct FrameSlot {
     latest: Mutex<Option<VideoFrame>>,
     spare: Mutex<Vec<Planes>>,
+    /// The window shows pictures left on the GPU (`VideoFrame::gpu`).
+    zero_copy: std::sync::atomic::AtomicBool,
 }
 
 impl FrameSlot {
+    /// Says whether the window shows pictures left on the GPU. Turned off again when that
+    /// fails, the decoder goes back to copying pictures to memory.
+    pub fn set_zero_copy(&self, on: bool) {
+        self.zero_copy.store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn zero_copy(&self) -> bool {
+        self.zero_copy.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn take(&self) -> Option<VideoFrame> {
         self.latest.lock().unwrap().take()
     }
@@ -101,7 +228,10 @@ fn decode_loop(
     control: &UnboundedSender<ClientMsg>,
     on_frame: &(dyn Fn() + Send + Sync),
 ) -> anyhow::Result<()> {
-    let mut decoder = Decoder::with_api_config(OpenH264API::from_source(), Default::default())?;
+    let choice = Choice::from_env();
+    let mut decoder = Decoder::open(choice)?;
+    // Timing of the CPU decoder until it has been judged: frames and total time.
+    let mut trial = (choice == Choice::Auto).then_some((0u32, Duration::ZERO));
     let mut reorder = Reorder::default();
     let mut need_keyframe = false;
     let mut stats = Stats::new();
@@ -119,25 +249,47 @@ fn decode_loop(
             }
 
             let start = Instant::now();
-            match decoder.decode(&packet.data) {
-                Ok(Some(yuv)) => {
+            match decoder.decode(&packet.data, slot.buffers(), slot.zero_copy()) {
+                Ok(Some(mut frame)) => {
                     need_keyframe = false;
-                    let (w, h) = yuv.dimensions();
-                    let decoded = start.elapsed();
-                    let (mut y, mut u, mut v) = slot.buffers();
-                    let (sy, su, sv) = yuv.strides();
-                    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
-                    pack(yuv.y(), sy, w, h, &mut y);
-                    pack(yuv.u(), su, cw, ch, &mut u);
-                    pack(yuv.v(), sv, cw, ch, &mut v);
-                    stats.convert += start.elapsed() - decoded;
-                    slot.publish(VideoFrame { frame_id: id, width: w as u32, height: h as u32, y, u, v });
-                    stats.decoded(start.elapsed(), packet.data.len());
+                    frame.frame_id = id;
+                    slot.publish(frame);
+                    let took = start.elapsed();
+                    stats.decoded(took, packet.data.len());
                     on_frame();
+                    if let Some((frames, total)) = &mut trial {
+                        *frames += 1;
+                        *total += took;
+                        if *frames >= CPU_TRIAL_FRAMES {
+                            let average = *total / *frames;
+                            trial = None;
+                            // Left on the GPU, its pictures cost the CPU nothing: worth it whenever
+                            // the window takes them.
+                            if average > CPU_BUDGET || slot.zero_copy() {
+                                tracing::info!(
+                                    "the CPU takes {average:?} per frame; trying the GPU{}",
+                                    if slot.zero_copy() { ", whose pictures the window shows in place" } else { "" }
+                                );
+                                if let Some(gpu) = Decoder::gpu() {
+                                    // A new decoder starts from a keyframe.
+                                    decoder = gpu;
+                                    need_keyframe = true;
+                                    let _ = control.send(ClientMsg::RequestKeyframe);
+                                }
+                            }
+                        }
+                    }
                 }
                 Ok(None) => {}
+                // The GPU gave up: the CPU takes over from the next keyframe.
+                Err(e) if decoder.on_gpu() => {
+                    tracing::warn!("GPU decoding failed on frame {id}: {e:#}; decoding on the CPU");
+                    decoder = Decoder::software()?;
+                    need_keyframe = true;
+                    let _ = control.send(ClientMsg::RequestKeyframe);
+                }
                 Err(e) => {
-                    tracing::warn!("decode error on frame {id}: {e}; requesting keyframe");
+                    tracing::warn!("decode error on frame {id}: {e:#}; requesting keyframe");
                     need_keyframe = true;
                     let _ = control.send(ClientMsg::RequestKeyframe);
                 }
@@ -200,12 +352,11 @@ struct Stats {
     frames: u32,
     bytes: usize,
     decode: Duration,
-    convert: Duration,
 }
 
 impl Stats {
     fn new() -> Self {
-        Self { since: Instant::now(), frames: 0, bytes: 0, decode: Duration::ZERO, convert: Duration::ZERO }
+        Self { since: Instant::now(), frames: 0, bytes: 0, decode: Duration::ZERO }
     }
 
     fn decoded(&mut self, took: Duration, bytes: usize) {
@@ -222,11 +373,10 @@ impl Stats {
         let secs = elapsed.as_secs_f64();
         let ms = |d: Duration| if self.frames == 0 { 0.0 } else { d.as_secs_f64() * 1000.0 / self.frames as f64 };
         tracing::info!(
-            "decoded {:.1} fps, {:.2} Mbit/s, decode {:.1} ms, copy {:.1} ms",
+            "decoded {:.1} fps, {:.2} Mbit/s, {:.1} ms per frame",
             self.frames as f64 / secs,
             self.bytes as f64 * 8.0 / secs / 1e6,
-            ms(self.decode - self.convert),
-            ms(self.convert)
+            ms(self.decode)
         );
         *self = Self::new();
     }
@@ -241,9 +391,30 @@ mod tests {
         for ((y, u, v), rgb) in
             [((16u8, 128u8, 128u8), 0x000000u32), ((235, 128, 128), 0xFFFFFF), ((82, 90, 240), 0xFF0000)]
         {
-            let frame = VideoFrame { frame_id: 0, width: 2, height: 2, y: vec![y; 4], u: vec![u], v: vec![v] };
-            let mut out = Vec::new();
-            frame.to_xrgb(&mut out);
+            let planar = VideoFrame {
+                frame_id: 0,
+                width: 2,
+                height: 2,
+                chroma: Chroma::Planar,
+                gpu: None,
+                y: vec![y; 4],
+                u: vec![u],
+                v: vec![v],
+            };
+            let interleaved = VideoFrame {
+                frame_id: 0,
+                width: 2,
+                height: 2,
+                chroma: Chroma::Interleaved,
+                gpu: None,
+                y: vec![y; 4],
+                u: vec![u, v],
+                v: Vec::new(),
+            };
+            let (mut out, mut nv12) = (Vec::new(), Vec::new());
+            planar.to_xrgb(&mut out);
+            interleaved.to_xrgb(&mut nv12);
+            assert_eq!(out, nv12);
             for px in out {
                 for shift in [0, 8, 16] {
                     let (a, b) = ((px >> shift) & 0xFF, (rgb >> shift) & 0xFF);

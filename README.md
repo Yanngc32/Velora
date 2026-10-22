@@ -116,18 +116,18 @@ cargo build --release
 
 ### Hardware encoding (recommended)
 
-The default build encodes in software (OpenH264). For GPU encoding, build the host with the
-`ffmpeg` feature, which links the FFmpeg libraries (libavcodec, libavutil) dynamically:
+The default build encodes and decodes in software (OpenH264). For the GPU, build with the
+`ffmpeg` features, which link the FFmpeg libraries (libavcodec, libavutil) dynamically:
 
 ```sh
 # Linux (Debian/Ubuntu): FFmpeg development packages and clang (for bindgen)
 sudo apt install libavcodec-dev libavutil-dev pkg-config clang
-cargo build --release --features velora-host/ffmpeg
+cargo build --release --features velora-host/ffmpeg,velora/ffmpeg
 
 # Windows: an LGPL *shared* FFmpeg build (e.g. BtbN's win64-lgpl-shared) and LLVM
 set FFMPEG_DIR=C:\path\to\ffmpeg     # contains include\ and lib\
-cargo build --release --features velora-host/ffmpeg
-# then copy the avcodec-*.dll and avutil-*.dll from FFMPEG_DIR\bin next to velora-host.exe
+cargo build --release --features velora-host/ffmpeg,velora/ffmpeg
+# then copy the avcodec-*.dll, avutil-*.dll and swresample-*.dll from FFMPEG_DIR\bin next to the .exe files
 ```
 
 `velora-host run --encoder auto` (the default) picks the first encoder that opens:
@@ -135,6 +135,19 @@ NVENC, then AMF, then Quick Sync on Windows, and NVENC, then VA-API, then Quick 
 If none opens, it falls back to software. To force one, pass `--encoder nvenc|amf|qsv|vaapi|software`,
 or `--encoder ffmpeg:<name>` for any FFmpeg encoder. All hardware encoders are configured for
 low latency: no B-frames, CBR, no lookahead, and keyframes only on demand.
+
+The bitrate adapts to the network: `--bitrate` (12000 kbit/s by default) is the most. When
+frames take well longer than usual to be acknowledged, or the host has to hold frames back,
+it drops to 70% (down to a tenth of the most); once the path keeps up, it climbs back step by
+step. The change applies in place, with no keyframe. `--fixed-bitrate` turns this off.
+
+On the viewing side, `velora` draws on the GPU (OpenGL 3.3 / ES 3.0, software fallback). A
+build with `ffmpeg` also decodes on the GPU: on Windows, D3D11VA decodes and the D3D11 video
+processor converts the picture, which the window shows in place through `WGL_NV_DX_interop2`
+(measured at 1080p: 2.7 ms per frame against 6–8 ms for OpenH264, and less CPU). Without the
+interop, and with VA-API on Linux, the picture is copied back to memory, which is slower than
+OpenH264 up to 1080p: then the GPU takes over only when the CPU falls behind (more than 12 ms
+per frame, say at 4K). `VELORA_DECODER=gpu` or `software` forces one.
 
 On Linux, VA-API needs the driver for your GPU (`intel-media-driver` or `mesa-va-drivers`)
 and access to `/dev/dri/renderD128` (the `render` group).
@@ -207,6 +220,12 @@ service, only administrators can pair or remove devices and change the password.
 When a second paired device connects, it takes over the session. Switching from the phone to
 the laptop just works.
 
+### Shared clipboard
+
+During a session, text and images copied on one computer can be pasted on the other, both
+ways. Images travel as PNG (up to 32 MB). Turn it off under **Settings → Share the
+clipboard**. Both computers need this version; with an older one, the clipboard stays apart.
+
 ### Files between computers
 
 Both computers need this version or later.
@@ -272,13 +291,16 @@ the Rust core and generates its Kotlin bindings.
 
 ### Access over the internet
 
-Built-in NAT traversal is not implemented yet. Until then, either:
+With a mesh VPN such as **Tailscale** or **Netbird** on both computers, nothing else is
+needed. The host finds its addresses on the mesh (100.64.0.0/10, and Tailscale's
+fd7a:115c:a1e0::/48), shows them under **This PC**, puts them in the pairing link, and tells
+every client that connects. The client keeps them with the computer and, on the next
+connection, tries them along with the usual address (that one first, each other one 250 ms
+later): at home the LAN answers, away the VPN does, with no address to change. Only the
+secure handshake races; the session opens on the address that answered first.
 
-- use a mesh VPN such as Tailscale or WireGuard and connect to the host's VPN address
-  (recommended), or
-- forward **UDP** port 7420 on the host's router.
-
-Every connection is authenticated and encrypted either way.
+Without a mesh VPN, forward **UDP** port 7420 on the host's router. Every connection is
+authenticated and encrypted either way. Built-in NAT traversal is not implemented.
 
 ## Security model
 
@@ -308,14 +330,13 @@ Windows limitations: without the service, input can't reach elevated windows unl
 1. **Zero-copy GPU pipeline.** Hardware encoders work today, but frames still go through CPU
    color conversion and an upload. Next: convert on the GPU (D3D11 video processor, VA-API VPP)
    and hand the DXGI texture straight to the encoder.
-2. **Hardware decoding on the client.** The session window already draws on the GPU (YUV
-   textures, shader conversion and bilinear scaling, software fallback); decoding is still
-   OpenH264 on the CPU. Next: D3D11VA / VA-API through FFmpeg.
+2. **Zero-copy decoding on Linux.** Windows decodes and shows pictures without leaving the
+   GPU; VA-API still copies them back. Next: import the VA-API surface into EGL (dma-buf).
 3. **Mobile:** an iOS app (Swift + VideoToolbox) on the same `velora-mobile` core. On Android:
    pinch to zoom, a direct-touch mode, and Play Store publishing.
 4. **NAT traversal.** A self-hostable rendezvous server, UDP hole punching, and a relay fallback.
 5. Wayland capture (xdg-desktop-portal + PipeWire), multi-monitor selection, cursor shape sync,
-   clipboard, audio, relative mouse mode for games, adaptive bitrate.
+   audio, relative mouse mode for games.
 6. A systemd user service; installers.
 
 ## Releasing (maintainers)

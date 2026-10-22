@@ -278,7 +278,7 @@ impl Launcher {
                 continue;
             }
             self.offers_taken.push(offer.uri.clone());
-            let Some((address, code)) = velora_protocol::pairing::parse_pairing_uri(&offer.uri) else { continue };
+            let Some(link) = velora_protocol::pairing::parse_pairing_link(&offer.uri) else { continue };
             let (name, done, uri) = (self.settings.device_name.clone(), self.offers_done.clone(), offer.uri.clone());
             let (from, s, config_dir) = (offer.name.clone(), self.s, self.config_dir.clone());
             std::thread::spawn(move || {
@@ -288,8 +288,9 @@ impl Launcher {
                     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
                     runtime.block_on(velora_client_core::hosts::pair_quietly(
                         &state,
-                        &address,
-                        &code.encode(),
+                        &link.address,
+                        &link.also,
+                        &link.code.encode(),
                         &name,
                         None,
                     ))
@@ -410,6 +411,10 @@ impl Launcher {
                 let mut line = format!("{} · {}", s.share_on, st.name);
                 if let Some(address) = &st.address {
                     line.push_str(&format!(" · {address}"));
+                }
+                // Reachable from anywhere on the VPN mesh too.
+                if let Some(vpn) = st.also.first() {
+                    line.push_str(&format!(" · VPN {vpn}"));
                 }
                 line
             }

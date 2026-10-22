@@ -20,6 +20,9 @@ pub struct Peer {
     pub shared: Arc<Shared>,
     pub name: String,
     pub fingerprint: Fingerprint,
+    /// Puts what the device copied on this computer's clipboard, during a session with a
+    /// device that shares it.
+    pub clipboard: Option<std::sync::mpsc::Sender<velora_clipboard::Clip>>,
 }
 
 /// Serves the file streams a device opens, until the connection closes.
@@ -38,6 +41,14 @@ pub async fn accept(conn: quinn::Connection, peer: Peer) -> Result<()> {
 async fn serve(mut send: quinn::SendStream, mut recv: quinn::RecvStream, peer: Peer) -> Result<()> {
     let service = peer.shared.is_service();
     let Some(request) = files::read(&mut recv).await? else { return Ok(()) };
+    if let FileMsg::Clipboard { kind, size } = request {
+        let data = files::read_clipboard(&mut recv, size).await?;
+        if let Some(clipboard) = &peer.clipboard {
+            tracing::debug!("clipboard received from '{}' ({} bytes)", peer.name, data.len());
+            let _ = clipboard.send(velora_clipboard::Clip::decode(kind, &data)?);
+        }
+        return Ok(());
+    }
     // Read here, then handed on with the rest of the stream.
     let mut prefix = request.encode();
     let folder = match &request {

@@ -4,6 +4,8 @@
 mod autostart;
 mod gpu;
 mod gui;
+#[cfg(all(windows, feature = "ffmpeg"))]
+mod interop;
 mod keymap;
 mod port_owner;
 mod render;
@@ -80,6 +82,10 @@ enum Command {
         /// Pairing link to this computer's own host, offered so the host's computer pairs back.
         #[arg(long)]
         offer: Option<String>,
+        /// Another address of the host (say, on Tailscale or Netbird), tried along with
+        /// `address`. May be given several times.
+        #[arg(long)]
+        also: Vec<String>,
     },
     /// Connect to a paired host by name or address.
     Connect { host: String },
@@ -157,6 +163,7 @@ fn run() -> Result<()> {
         });
     }
 
+    let share_clipboard = settings.share_clipboard;
     let device_name = settings.device_name;
     let password = if cli.password_stdin { Some(read_password()?).filter(|p| !p.is_empty()) } else { None };
     let password = password.as_deref();
@@ -179,24 +186,24 @@ fn run() -> Result<()> {
             }
             Ok(())
         }
-        Command::Pair { address, code, name, offer } => {
+        Command::Pair { address, code, name, offer, also } => {
             let (proxy, event_loop) = new_event_loop()?;
             let slot = Arc::new(FrameSlot::default());
             let output = VideoOutput::Decoded { slot: slot.clone(), on_frame: redraw_callback(proxy) };
             let name = name.unwrap_or(device_name);
-            let session = runtime.block_on(hosts::pair(&state, &address, &code, &name, password, output))?;
+            let session = runtime.block_on(hosts::pair(&state, &address, &also, &code, &name, password, output))?;
             println!("Paired with '{}'. Next time: velora connect {}", session.host_name, session.host_name);
             if let Some(link) = offer {
                 session.input.offer_pairing(&link);
             }
-            run_window(&runtime, event_loop, session, slot)
+            run_window(&runtime, event_loop, session, slot, share_clipboard)
         }
         Command::Connect { host } => {
             let (proxy, event_loop) = new_event_loop()?;
             let slot = Arc::new(FrameSlot::default());
             let output = VideoOutput::Decoded { slot: slot.clone(), on_frame: redraw_callback(proxy) };
             let session = runtime.block_on(hosts::connect(&state, &host, &device_name, password, output))?;
-            run_window(&runtime, event_loop, session, slot)
+            run_window(&runtime, event_loop, session, slot, share_clipboard)
         }
         Command::Bench { host, seconds } => runtime.block_on(async {
             let frames = Arc::new(AtomicU32::new(0));
@@ -254,10 +261,30 @@ fn run_window(
     event_loop: EventLoop<()>,
     session: Session,
     frames: Arc<FrameSlot>,
+    share_clipboard: bool,
 ) -> Result<()> {
     let session = Arc::new(session);
     let transfers = Arc::new(Mutex::new(Transfers::default()));
     let proxy = event_loop.create_proxy();
+    // The clipboard goes both ways: copied here, it goes to the host; copied there, it lands
+    // here (see `velora-clipboard`).
+    let clipboard = share_clipboard.then(|| {
+        let session = session.clone();
+        velora_clipboard::spawn(move |clip| match clip.encode() {
+            Ok((kind, data)) => session.send_clipboard(kind, data),
+            Err(e) => tracing::warn!("cannot share the clipboard: {e:#}"),
+        })
+    });
+    let paste = Arc::new(move |kind: u8, data: Vec<u8>| {
+        let Some(Some(clipboard)) = &clipboard else { return };
+        tracing::debug!("clipboard received from the host ({} bytes)", data.len());
+        match velora_clipboard::Clip::decode(kind, &data) {
+            Ok(clip) => {
+                let _ = clipboard.send(clip);
+            }
+            Err(e) => tracing::warn!("clipboard from the host: {e:#}"),
+        }
+    });
     // What the host sends (Send To there) lands in this user's Downloads folder.
     match velora_protocol::files::downloads_dir() {
         Ok(dest) => {
@@ -268,6 +295,7 @@ fn run_window(
                     transfers.lock().unwrap().offer(event);
                     let _ = proxy.send_event(());
                 }),
+                paste,
             );
         }
         Err(e) => tracing::warn!("cannot receive files: {e:#}"),
@@ -458,7 +486,10 @@ impl App {
             Renderer::Gpu(gpu) => {
                 // The textures hold the picture now: its buffers can go back to the decoder.
                 if let Some(frame) = fresh {
-                    gpu.upload(&frame);
+                    if let Err(e) = gpu.upload(&frame) {
+                        tracing::warn!("showing pictures from the GPU decoder failed: {e:#}; copying them instead");
+                        self.frames.set_zero_copy(false);
+                    }
                     self.frames.recycle(frame);
                 }
                 self.viewport = gpu.draw(w.get(), h.get())?;
@@ -531,7 +562,13 @@ impl ApplicationHandler for App {
             }
         };
         match Renderer::new(&window) {
-            Ok(renderer) => self.renderer = Some(renderer),
+            Ok(renderer) => {
+                // The decoder may leave pictures on the GPU when the window can show them there.
+                if let Renderer::Gpu(gpu) = &renderer {
+                    self.frames.set_zero_copy(gpu.zero_copy());
+                }
+                self.renderer = Some(renderer);
+            }
             Err(e) => {
                 eprintln!("cannot create drawing surface: {e:#}");
                 event_loop.exit();

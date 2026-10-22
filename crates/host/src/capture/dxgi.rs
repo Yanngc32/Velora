@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use windows::{
     core::Interface,
     Win32::{
-        Foundation::HMODULE,
+        Foundation::{E_INVALIDARG, HMODULE},
         Graphics::{
             Direct3D::D3D_DRIVER_TYPE_HARDWARE,
             Direct3D11::{
@@ -27,6 +27,9 @@ use windows::{
 };
 
 use super::{Capturer, DisplayRect, Frame};
+
+/// How long a new capture waits for the previous one in this process to release the output.
+const RELEASE_WAIT: Duration = Duration::from_secs(2);
 
 pub struct DxgiCapturer {
     device: ID3D11Device,
@@ -89,14 +92,23 @@ impl DxgiCapturer {
         // Duplication shows the calling thread's desktop: after a switch to the lock screen or
         // a UAC prompt (ACCESS_LOST), move to the new one first.
         crate::win::follow_input_desktop();
+        // A process may duplicate an output only once at a time (E_INVALIDARG otherwise). When a
+        // device takes over, the previous session's capture is still letting go: wait for it.
+        let deadline = std::time::Instant::now() + RELEASE_WAIT;
         // SAFETY: COM calls on valid interfaces.
-        let (dup, desc) = unsafe {
-            let dup = self
-                .output
-                .DuplicateOutput(&self.device)
-                .context("DuplicateOutput failed (another app duplicating, or secure desktop active)")?;
-            (dup, self.output.GetDesc()?)
+        let dup = loop {
+            match unsafe { self.output.DuplicateOutput(&self.device) } {
+                Err(e) if e.code() == E_INVALIDARG && std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                result => {
+                    break result
+                        .context("DuplicateOutput failed (another app duplicating, or secure desktop active)")?
+                }
+            }
         };
+        // SAFETY: as above.
+        let desc = unsafe { self.output.GetDesc()? };
         let r = desc.DesktopCoordinates;
         let rect =
             DisplayRect { x: r.left, y: r.top, width: (r.right - r.left) as u32, height: (r.bottom - r.top) as u32 };
