@@ -1,10 +1,10 @@
 //! Video decoding thread and the frame hand-off to the UI.
 //!
-//! OpenH264 decodes on the CPU first: with the picture copied back from the GPU, hardware
-//! decoding takes longer per frame (measured at 1080p: about 11 ms against 6), though it uses
-//! less CPU. So the GPU (see `hwdecode`, when built with FFmpeg) takes over only when the CPU
-//! cannot keep up, or when `VELORA_DECODER=gpu` asks for it; `VELORA_DECODER=software` keeps
-//! the CPU.
+//! OpenH264 decodes on the CPU first. The GPU (see `hwdecode`, when built with FFmpeg) takes
+//! over when the window shows its pictures where they are (`FrameSlot::set_zero_copy`, see
+//! `d3d11`): measured at 1080p, 2.7 ms per frame against 6 to 8 on the CPU, with less CPU. When
+//! the picture has to be copied back to memory it is slower (about 11 ms), so then the GPU
+//! takes over only when the CPU cannot keep up. `VELORA_DECODER=gpu` or `software` forces one.
 //!
 //! Each frame is acknowledged only after it has been decoded, so the host's in-flight limit
 //! also throttles to the client's decode speed and no queue can build up anywhere between
@@ -37,13 +37,21 @@ pub enum Chroma {
     Interleaved,
 }
 
+/// A picture that stayed on the GPU (see `d3d11`); never present in builds without it.
+#[cfg(all(windows, feature = "ffmpeg"))]
+pub use crate::d3d11::D3d11Picture as GpuPicture;
+#[cfg(not(all(windows, feature = "ffmpeg")))]
+pub enum GpuPicture {}
+
 /// A decoded picture: full-size luma, then chroma at half width and height (rounded up), each
-/// plane packed without padding.
+/// plane packed without padding. Or, when the window takes them, a picture still on the GPU
+/// (`gpu`), with empty planes.
 pub struct VideoFrame {
     pub frame_id: u32,
     pub width: u32,
     pub height: u32,
     pub chroma: Chroma,
+    pub gpu: Option<GpuPicture>,
     pub y: Vec<u8>,
     pub u: Vec<u8>,
     pub v: Vec<u8>,
@@ -127,10 +135,12 @@ impl Decoder {
     }
 
     /// Decodes one access unit into `planes`. `None` while there is no picture yet.
-    fn decode(&mut self, data: &[u8], planes: Planes) -> anyhow::Result<Option<VideoFrame>> {
+    /// `zero_copy`: the window shows pictures left on the GPU.
+    fn decode(&mut self, data: &[u8], planes: Planes, zero_copy: bool) -> anyhow::Result<Option<VideoFrame>> {
+        let _ = zero_copy;
         match self {
             #[cfg(feature = "ffmpeg")]
-            Self::Gpu(gpu) => gpu.decode(data, planes),
+            Self::Gpu(gpu) => gpu.decode(data, planes, zero_copy),
             Self::Software(decoder) => {
                 let Some(yuv) = decoder.decode(data)? else { return Ok(None) };
                 let (w, h) = yuv.dimensions();
@@ -141,7 +151,7 @@ impl Decoder {
                 pack(yuv.u(), su, cw, ch, &mut u);
                 pack(yuv.v(), sv, cw, ch, &mut v);
                 let (width, height) = (w as u32, h as u32);
-                Ok(Some(VideoFrame { frame_id: 0, width, height, chroma: Chroma::Planar, y, u, v }))
+                Ok(Some(VideoFrame { frame_id: 0, width, height, chroma: Chroma::Planar, gpu: None, y, u, v }))
             }
         }
     }
@@ -157,9 +167,21 @@ impl Decoder {
 pub struct FrameSlot {
     latest: Mutex<Option<VideoFrame>>,
     spare: Mutex<Vec<Planes>>,
+    /// The window shows pictures left on the GPU (`VideoFrame::gpu`).
+    zero_copy: std::sync::atomic::AtomicBool,
 }
 
 impl FrameSlot {
+    /// Says whether the window shows pictures left on the GPU. Turned off again when that
+    /// fails, the decoder goes back to copying pictures to memory.
+    pub fn set_zero_copy(&self, on: bool) {
+        self.zero_copy.store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn zero_copy(&self) -> bool {
+        self.zero_copy.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn take(&self) -> Option<VideoFrame> {
         self.latest.lock().unwrap().take()
     }
@@ -227,7 +249,7 @@ fn decode_loop(
             }
 
             let start = Instant::now();
-            match decoder.decode(&packet.data, slot.buffers()) {
+            match decoder.decode(&packet.data, slot.buffers(), slot.zero_copy()) {
                 Ok(Some(mut frame)) => {
                     need_keyframe = false;
                     frame.frame_id = id;
@@ -241,8 +263,13 @@ fn decode_loop(
                         if *frames >= CPU_TRIAL_FRAMES {
                             let average = *total / *frames;
                             trial = None;
-                            if average > CPU_BUDGET {
-                                tracing::info!("the CPU takes {average:?} per frame, trying the GPU");
+                            // Left on the GPU, its pictures cost the CPU nothing: worth it whenever
+                            // the window takes them.
+                            if average > CPU_BUDGET || slot.zero_copy() {
+                                tracing::info!(
+                                    "the CPU takes {average:?} per frame; trying the GPU{}",
+                                    if slot.zero_copy() { ", whose pictures the window shows in place" } else { "" }
+                                );
                                 if let Some(gpu) = Decoder::gpu() {
                                     // A new decoder starts from a keyframe.
                                     decoder = gpu;
@@ -369,6 +396,7 @@ mod tests {
                 width: 2,
                 height: 2,
                 chroma: Chroma::Planar,
+                gpu: None,
                 y: vec![y; 4],
                 u: vec![u],
                 v: vec![v],
@@ -378,6 +406,7 @@ mod tests {
                 width: 2,
                 height: 2,
                 chroma: Chroma::Interleaved,
+                gpu: None,
                 y: vec![y; 4],
                 u: vec![u, v],
                 v: Vec::new(),

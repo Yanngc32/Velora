@@ -2,7 +2,8 @@
 //! from a GPU decoder: luma plus a two-channel chroma one), and a shader
 //! converts them (BT.601 limited range, like the host) while scaling with bilinear filtering
 //! into the letterboxed viewport. Frees the CPU of the color conversion and the per-pixel
-//! scaling of the software path, and scales smoothly instead of pixel by pixel.
+//! scaling of the software path, and scales smoothly instead of pixel by pixel. Pictures the
+//! decoder left on the GPU (RGBA, see `interop`) are sampled where they are, with no upload.
 
 use std::num::NonZeroU32;
 
@@ -34,13 +35,18 @@ const FRAGMENT: &str = r#"
 uniform sampler2D luma;
 uniform sampler2D cb;
 uniform sampler2D cr;
-uniform bool interleaved;
+// 0: I420 planes, 1: NV12 (chroma interleaved), 2: RGB already.
+uniform int mode;
 in vec2 uv;
 out vec4 color;
 void main() {
+    if (mode == 2) {
+        color = vec4(texture(luma, uv).rgb, 1.0);
+        return;
+    }
     float y = 1.164383 * (texture(luma, uv).r - 0.062745);
     float u = texture(cb, uv).r - 0.5;
-    float v = (interleaved ? texture(cb, uv).g : texture(cr, uv).r) - 0.5;
+    float v = (mode == 1 ? texture(cb, uv).g : texture(cr, uv).r) - 0.5;
     color = vec4(y + 1.596027 * v, y - 0.391762 * u - 0.812968 * v, y + 2.017232 * u, 1.0);
 }
 "#;
@@ -55,7 +61,12 @@ pub struct Gpu {
     /// Size and chroma layout of the picture in the textures.
     picture: (u32, u32),
     chroma: Chroma,
-    interleaved: Option<glow::UniformLocation>,
+    mode: Option<glow::UniformLocation>,
+    /// The decoder's texture, while the picture is one left on the GPU.
+    #[cfg(all(windows, feature = "ffmpeg"))]
+    shared: Option<crate::interop::Shared>,
+    #[cfg(all(windows, feature = "ffmpeg"))]
+    interop: Option<crate::interop::Interop>,
     surface: Surface<WindowSurface>,
     context: PossiblyCurrentContext,
     /// The drawable's size, to resize it with the window.
@@ -131,7 +142,9 @@ impl Gpu {
                 gl.get_parameter_string(glow::RENDERER),
                 gl.get_parameter_string(glow::VERSION)
             );
-            let interleaved = gl.get_uniform_location(program, "interleaved");
+            let mode = gl.get_uniform_location(program, "mode");
+            #[cfg(all(windows, feature = "ffmpeg"))]
+            let interop = crate::interop::Interop::load(&display);
             Ok(Self {
                 gl,
                 program,
@@ -139,7 +152,11 @@ impl Gpu {
                 textures: textures.try_into().expect("three textures"),
                 picture: (0, 0),
                 chroma: Chroma::Planar,
-                interleaved,
+                mode,
+                #[cfg(all(windows, feature = "ffmpeg"))]
+                shared: None,
+                #[cfg(all(windows, feature = "ffmpeg"))]
+                interop,
                 surface,
                 context,
                 drawable: (w, h),
@@ -147,8 +164,45 @@ impl Gpu {
         }
     }
 
-    /// Puts a new picture in the textures.
-    pub fn upload(&mut self, frame: &VideoFrame) {
+    /// Whether pictures left on the GPU can be shown (the driver shares D3D11 textures).
+    pub fn zero_copy(&self) -> bool {
+        #[cfg(all(windows, feature = "ffmpeg"))]
+        return self.interop.is_some();
+        #[cfg(not(all(windows, feature = "ffmpeg")))]
+        false
+    }
+
+    /// Puts a new picture in the textures, or for one left on the GPU, takes its texture.
+    /// Fails when such a picture cannot be shown: send pictures in memory from then on.
+    pub fn upload(&mut self, frame: &VideoFrame) -> Result<()> {
+        if let Some(picture) = &frame.gpu {
+            #[cfg(all(windows, feature = "ffmpeg"))]
+            {
+                let interop = self.interop.as_mut().context("no D3D11 interop")?;
+                let shared = interop.texture(&self.gl, picture.shared_handle());
+                let shared = match shared {
+                    Ok(shared) => shared,
+                    Err(e) => {
+                        self.interop = None;
+                        return Err(e);
+                    }
+                };
+                self.shared = Some(shared);
+                self.picture = (frame.width, frame.height);
+                // SAFETY: GL calls on the current context.
+                unsafe {
+                    self.gl.use_program(Some(self.program));
+                    self.gl.uniform_1_i32(self.mode.as_ref(), 2);
+                }
+                return Ok(());
+            }
+            #[cfg(not(all(windows, feature = "ffmpeg")))]
+            match *picture {}
+        }
+        #[cfg(all(windows, feature = "ffmpeg"))]
+        {
+            self.shared = None;
+        }
         let (w, h) = (frame.width, frame.height);
         let (cw, ch) = frame.chroma_size();
         // Plane, texture size, bytes per texel.
@@ -162,7 +216,7 @@ impl Gpu {
             for (unit, (texture, (data, pw, ph, texel))) in self.textures.iter().zip(planes).enumerate() {
                 let len = (pw * ph * texel) as usize;
                 if data.len() < len {
-                    return;
+                    return Ok(());
                 }
                 let pixels = glow::PixelUnpackData::Slice(Some(&data[..len]));
                 let (internal, format) = if texel == 2 { (glow::RG8, glow::RG) } else { (glow::R8, glow::RED) };
@@ -177,11 +231,12 @@ impl Gpu {
                 }
             }
             self.gl.use_program(Some(self.program));
-            let interleaved = frame.chroma == Chroma::Interleaved;
-            self.gl.uniform_1_i32(self.interleaved.as_ref(), interleaved as i32);
+            let mode = if frame.chroma == Chroma::Interleaved { 1 } else { 0 };
+            self.gl.uniform_1_i32(self.mode.as_ref(), mode);
         }
         self.picture = (w, h);
         self.chroma = frame.chroma;
+        Ok(())
     }
 
     /// Draws the picture letterboxed into a `width` × `height` window and shows it. Returns
@@ -210,6 +265,25 @@ impl Gpu {
                     gl.active_texture(glow::TEXTURE0 + unit as u32);
                     gl.bind_texture(glow::TEXTURE_2D, Some(*texture));
                 }
+                #[cfg(all(windows, feature = "ffmpeg"))]
+                if let (Some(shared), Some(interop)) = (self.shared, &self.interop) {
+                    // The decoder's texture in place of the luma one, for this draw only.
+                    interop.with(shared, || {
+                        gl.active_texture(glow::TEXTURE0);
+                        gl.bind_texture(glow::TEXTURE_2D, Some(shared.texture));
+                        for (param, value) in [
+                            (glow::TEXTURE_MIN_FILTER, glow::LINEAR),
+                            (glow::TEXTURE_MAG_FILTER, glow::LINEAR),
+                            (glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE),
+                            (glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE),
+                        ] {
+                            gl.tex_parameter_i32(glow::TEXTURE_2D, param, value as i32);
+                        }
+                        gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+                    })?;
+                    self.surface.swap_buffers(&self.context)?;
+                    return Ok(vp);
+                }
                 gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
             }
         }
@@ -220,6 +294,10 @@ impl Gpu {
 
 impl Drop for Gpu {
     fn drop(&mut self) {
+        #[cfg(all(windows, feature = "ffmpeg"))]
+        if let Some(interop) = &mut self.interop {
+            interop.release(&self.gl);
+        }
         // SAFETY: the context is still current; these objects were created on it.
         unsafe {
             for texture in self.textures {

@@ -4,6 +4,8 @@
 mod autostart;
 mod gpu;
 mod gui;
+#[cfg(all(windows, feature = "ffmpeg"))]
+mod interop;
 mod keymap;
 mod port_owner;
 mod render;
@@ -452,7 +454,10 @@ impl App {
             Renderer::Gpu(gpu) => {
                 // The textures hold the picture now: its buffers can go back to the decoder.
                 if let Some(frame) = fresh {
-                    gpu.upload(&frame);
+                    if let Err(e) = gpu.upload(&frame) {
+                        tracing::warn!("showing pictures from the GPU decoder failed: {e:#}; copying them instead");
+                        self.frames.set_zero_copy(false);
+                    }
                     self.frames.recycle(frame);
                 }
                 self.viewport = gpu.draw(w.get(), h.get())?;
@@ -525,7 +530,13 @@ impl ApplicationHandler for App {
             }
         };
         match Renderer::new(&window) {
-            Ok(renderer) => self.renderer = Some(renderer),
+            Ok(renderer) => {
+                // The decoder may leave pictures on the GPU when the window can show them there.
+                if let Renderer::Gpu(gpu) = &renderer {
+                    self.frames.set_zero_copy(gpu.zero_copy());
+                }
+                self.renderer = Some(renderer);
+            }
             Err(e) => {
                 eprintln!("cannot create drawing surface: {e:#}");
                 event_loop.exit();

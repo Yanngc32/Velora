@@ -133,10 +133,13 @@ If none opens, it falls back to software. To force one, pass `--encoder nvenc|am
 or `--encoder ffmpeg:<name>` for any FFmpeg encoder. All hardware encoders are configured for
 low latency: no B-frames, CBR, no lookahead, and keyframes only on demand.
 
-On the viewing side, `velora` draws on the GPU (OpenGL 3.3 / ES 3.0, software fallback) and
-decodes with OpenH264 on the CPU, which has the lowest latency up to 1080p. When the CPU
-cannot keep up (more than 12 ms per frame, say at 4K), a build with `ffmpeg` switches to the
-GPU: D3D11VA on Windows, VA-API on Linux. `VELORA_DECODER=gpu` or `software` forces one.
+On the viewing side, `velora` draws on the GPU (OpenGL 3.3 / ES 3.0, software fallback). A
+build with `ffmpeg` also decodes on the GPU: on Windows, D3D11VA decodes and the D3D11 video
+processor converts the picture, which the window shows in place through `WGL_NV_DX_interop2`
+(measured at 1080p: 2.7 ms per frame against 6–8 ms for OpenH264, and less CPU). Without the
+interop, and with VA-API on Linux, the picture is copied back to memory, which is slower than
+OpenH264 up to 1080p: then the GPU takes over only when the CPU falls behind (more than 12 ms
+per frame, say at 4K). `VELORA_DECODER=gpu` or `software` forces one.
 
 On Linux, VA-API needs the driver for your GPU (`intel-media-driver` or `mesa-va-drivers`)
 and access to `/dev/dri/renderD128` (the `render` group).
@@ -300,10 +303,8 @@ Windows limitations: without the service, input can't reach elevated windows unl
 1. **Zero-copy GPU pipeline.** Hardware encoders work today, but frames still go through CPU
    color conversion and an upload. Next: convert on the GPU (D3D11 video processor, VA-API VPP)
    and hand the DXGI texture straight to the encoder.
-2. **Zero-copy hardware decoding on the client.** D3D11VA / VA-API decoding works, but the
-   picture is copied back to memory for OpenGL, which makes it slower per frame than OpenH264
-   at 1080p; so it only takes over when the CPU falls behind. Next: share the decoded texture
-   with OpenGL (WGL_NV_DX_interop2, EGL dma-buf) and skip the copy.
+2. **Zero-copy decoding on Linux.** Windows decodes and shows pictures without leaving the
+   GPU; VA-API still copies them back. Next: import the VA-API surface into EGL (dma-buf).
 3. **Mobile:** an iOS app (Swift + VideoToolbox) on the same `velora-mobile` core. On Android:
    pinch to zoom, a direct-touch mode, and Play Store publishing.
 4. **NAT traversal.** A self-hostable rendezvous server, UDP hole punching, and a relay fallback.

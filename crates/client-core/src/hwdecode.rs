@@ -8,7 +8,7 @@ use std::{
     sync::Once,
 };
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use ffmpeg_sys_next as ff;
 
 use crate::video::{Chroma, Planes, VideoFrame};
@@ -63,6 +63,9 @@ unsafe extern "C" fn pick_format(
 }
 
 pub struct HwDecoder {
+    /// Turns pictures into textures the window shows directly, while it takes them.
+    #[cfg(windows)]
+    converter: Option<crate::d3d11::Converter>,
     ctx: *mut ff::AVCodecContext,
     device: *mut ff::AVBufferRef,
     packet: *mut ff::AVPacket,
@@ -80,6 +83,8 @@ impl HwDecoder {
     pub fn open() -> Result<Self> {
         init_logging();
         let mut this = Self {
+            #[cfg(windows)]
+            converter: None,
             ctx: ptr::null_mut(),
             device: ptr::null_mut(),
             packet: ptr::null_mut(),
@@ -115,8 +120,9 @@ impl HwDecoder {
         Ok(this)
     }
 
-    /// Decodes one access unit into `planes`. `None` while the decoder has no picture yet.
-    pub fn decode(&mut self, data: &[u8], planes: Planes) -> Result<Option<VideoFrame>> {
+    /// Decodes one access unit into `planes`, or with `zero_copy`, into a texture left on the
+    /// GPU when it can (then the planes stay empty). `None` while there is no picture yet.
+    pub fn decode(&mut self, data: &[u8], planes: Planes, zero_copy: bool) -> Result<Option<VideoFrame>> {
         // SAFETY: owned FFmpeg objects; the packet gets its own copy of `data`.
         unsafe {
             check(ff::av_new_packet(self.packet, data.len() as c_int), "allocating a packet")?;
@@ -136,6 +142,22 @@ impl HwDecoder {
                     ff::av_frame_unref(self.frame);
                     bail!("the GPU did not decode this stream");
                 }
+                #[cfg(windows)]
+                if zero_copy {
+                    match self.on_gpu() {
+                        Ok(picture) => {
+                            ff::av_frame_unref(self.frame);
+                            out = Some(picture);
+                            continue;
+                        }
+                        // Copied back below, from now on.
+                        Err(e) => {
+                            tracing::warn!("cannot keep pictures on the GPU: {e:#}");
+                            self.converter = None;
+                        }
+                    }
+                }
+                let _ = zero_copy;
                 ff::av_frame_unref(self.download);
                 let copied = ff::av_hwframe_transfer_data(self.download, self.frame, 0);
                 ff::av_frame_unref(self.frame);
@@ -145,6 +167,34 @@ impl HwDecoder {
                 out = Some(self.nv12(buffers.unwrap_or_default())?);
             }
             Ok(out)
+        }
+    }
+
+    /// The decoded picture converted into a texture of `d3d11::Converter`, left on the GPU.
+    #[cfg(windows)]
+    unsafe fn on_gpu(&mut self) -> Result<VideoFrame> {
+        use windows::{core::Interface, Win32::Graphics::Direct3D11::ID3D11Texture2D};
+        // SAFETY: a D3D11VA frame holds its texture in data[0] and the array slice in data[1].
+        unsafe {
+            let f = &*self.frame;
+            let raw = f.data[0] as *mut std::ffi::c_void;
+            let texture = ID3D11Texture2D::from_raw_borrowed(&raw).context("no texture in the picture")?;
+            let (w, h) = (f.width as u32, f.height as u32);
+            if !self.converter.as_ref().is_some_and(|c| c.fits(texture, w, h)) {
+                self.converter = Some(crate::d3d11::Converter::new(texture, w, h)?);
+            }
+            let converter = self.converter.as_mut().expect("just made");
+            let picture = converter.convert(texture, f.data[1] as usize as u32)?;
+            Ok(VideoFrame {
+                frame_id: 0,
+                width: w,
+                height: h,
+                chroma: Chroma::Planar,
+                gpu: Some(picture),
+                y: Vec::new(),
+                u: Vec::new(),
+                v: Vec::new(),
+            })
         }
     }
 
@@ -160,7 +210,16 @@ impl HwDecoder {
             let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
             copy_plane(f.data[0], f.linesize[0] as usize, w, h, &mut y);
             copy_plane(f.data[1], f.linesize[1] as usize, cw * 2, ch, &mut uv);
-            Ok(VideoFrame { frame_id: 0, width: w as u32, height: h as u32, chroma: Chroma::Interleaved, y, u: uv, v })
+            Ok(VideoFrame {
+                frame_id: 0,
+                width: w as u32,
+                height: h as u32,
+                chroma: Chroma::Interleaved,
+                gpu: None,
+                y,
+                u: uv,
+                v,
+            })
         }
     }
 }

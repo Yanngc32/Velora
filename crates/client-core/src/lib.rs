@@ -2,6 +2,8 @@
 //! delivery. UIs only draw frames and feed input: the desktop gets decoded RGB pictures,
 //! mobile apps get the H.264 stream in order and decode it in hardware.
 
+#[cfg(all(windows, feature = "ffmpeg"))]
+mod d3d11;
 pub mod files;
 pub mod hosts;
 #[cfg(feature = "ffmpeg")]
@@ -33,7 +35,7 @@ use velora_protocol::{
 pub use files::{OfferEvent, RemoteFiles};
 
 #[cfg(feature = "decode")]
-pub use video::{Chroma, FrameSlot, VideoFrame};
+pub use video::{Chroma, FrameSlot, GpuPicture, VideoFrame};
 
 /// An encoded frame, delivered in order. Acknowledge it with [`InputSender::frame_done`] once
 /// it has been displayed: that is what paces the host.
