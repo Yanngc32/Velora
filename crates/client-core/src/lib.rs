@@ -4,6 +4,8 @@
 
 pub mod files;
 pub mod hosts;
+#[cfg(feature = "ffmpeg")]
+mod hwdecode;
 mod reorder;
 #[cfg(feature = "decode")]
 mod video;
@@ -31,7 +33,7 @@ use velora_protocol::{
 pub use files::{OfferEvent, RemoteFiles};
 
 #[cfg(feature = "decode")]
-pub use video::{FrameSlot, VideoFrame};
+pub use video::{Chroma, FrameSlot, VideoFrame};
 
 /// An encoded frame, delivered in order. Acknowledge it with [`InputSender::frame_done`] once
 /// it has been displayed: that is what paces the host.

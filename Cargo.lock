@@ -4717,6 +4717,7 @@ version = "0.3.1"
 dependencies = [
  "anyhow",
  "bytes",
+ "ffmpeg-sys-next",
  "openh264",
  "quinn",
  "tokio",

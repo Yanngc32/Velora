@@ -28,6 +28,10 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 sys-locale = "0.3"
 qrcode = { version = "0.14", default-features = false }
 
+[features]
+# Hardware video decoding through the system FFmpeg libraries.
+ffmpeg = ["velora-client-core/ffmpeg"]
+
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [
   "Win32_Foundation",

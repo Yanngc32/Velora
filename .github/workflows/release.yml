@@ -112,7 +112,7 @@ jobs:
           # Linux: find the bundled FFmpeg in ./lib next to the binaries. DT_RPATH (not RUNPATH)
           # also applies to the libraries' own dependencies (libavcodec -> libswresample).
           RUSTFLAGS: ${{ runner.os == 'Linux' && '-C link-arg=-Wl,--disable-new-dtags,-rpath,$ORIGIN/lib' || '' }}
-        run: cargo build --release --locked -p velora-host -p velora --features velora-host/ffmpeg
+        run: cargo build --release --locked -p velora-host -p velora --features velora-host/ffmpeg,velora/ffmpeg
 
       - name: Stage install directory
         run: |

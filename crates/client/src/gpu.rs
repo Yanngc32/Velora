@@ -1,4 +1,5 @@
-//! GPU presentation: the decoded I420 planes go up as three one-channel textures, and a shader
+//! GPU presentation: the decoded planes go up as textures (I420: three one-channel ones; NV12
+//! from a GPU decoder: luma plus a two-channel chroma one), and a shader
 //! converts them (BT.601 limited range, like the host) while scaling with bilinear filtering
 //! into the letterboxed viewport. Frees the CPU of the color conversion and the per-pixel
 //! scaling of the software path, and scales smoothly instead of pixel by pixel.
@@ -14,7 +15,7 @@ use glutin::{
     surface::{GlSurface, Surface, SurfaceAttributesBuilder, SwapInterval, WindowSurface},
 };
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
-use velora_client_core::VideoFrame;
+use velora_client_core::{Chroma, VideoFrame};
 use winit::window::Window;
 
 use crate::render::Viewport;
@@ -33,12 +34,13 @@ const FRAGMENT: &str = r#"
 uniform sampler2D luma;
 uniform sampler2D cb;
 uniform sampler2D cr;
+uniform bool interleaved;
 in vec2 uv;
 out vec4 color;
 void main() {
     float y = 1.164383 * (texture(luma, uv).r - 0.062745);
     float u = texture(cb, uv).r - 0.5;
-    float v = texture(cr, uv).r - 0.5;
+    float v = (interleaved ? texture(cb, uv).g : texture(cr, uv).r) - 0.5;
     color = vec4(y + 1.596027 * v, y - 0.391762 * u - 0.812968 * v, y + 2.017232 * u, 1.0);
 }
 "#;
@@ -50,8 +52,10 @@ pub struct Gpu {
     vao: glow::VertexArray,
     /// Luma, then the two chroma planes.
     textures: [glow::Texture; 3],
-    /// Size of the picture in the textures.
+    /// Size and chroma layout of the picture in the textures.
     picture: (u32, u32),
+    chroma: Chroma,
+    interleaved: Option<glow::UniformLocation>,
     surface: Surface<WindowSurface>,
     context: PossiblyCurrentContext,
     /// The drawable's size, to resize it with the window.
@@ -127,12 +131,15 @@ impl Gpu {
                 gl.get_parameter_string(glow::RENDERER),
                 gl.get_parameter_string(glow::VERSION)
             );
+            let interleaved = gl.get_uniform_location(program, "interleaved");
             Ok(Self {
                 gl,
                 program,
                 vao,
                 textures: textures.try_into().expect("three textures"),
                 picture: (0, 0),
+                chroma: Chroma::Planar,
+                interleaved,
                 surface,
                 context,
                 drawable: (w, h),
@@ -144,38 +151,37 @@ impl Gpu {
     pub fn upload(&mut self, frame: &VideoFrame) {
         let (w, h) = (frame.width, frame.height);
         let (cw, ch) = frame.chroma_size();
-        let planes = [(&frame.y, w, h), (&frame.u, cw, ch), (&frame.v, cw, ch)];
-        let resize = self.picture != (w, h);
-        // SAFETY: GL calls on the current context; each plane holds width × height bytes.
+        // Plane, texture size, bytes per texel.
+        let planes: Vec<(&[u8], u32, u32, u32)> = match frame.chroma {
+            Chroma::Planar => vec![(&frame.y, w, h, 1), (&frame.u, cw, ch, 1), (&frame.v, cw, ch, 1)],
+            Chroma::Interleaved => vec![(&frame.y, w, h, 1), (&frame.u, cw, ch, 2)],
+        };
+        let resize = self.picture != (w, h) || self.chroma != frame.chroma;
+        // SAFETY: GL calls on the current context; each plane holds width × height texels.
         unsafe {
-            for (unit, (texture, (data, pw, ph))) in self.textures.iter().zip(planes).enumerate() {
-                if data.len() < (pw * ph) as usize {
+            for (unit, (texture, (data, pw, ph, texel))) in self.textures.iter().zip(planes).enumerate() {
+                let len = (pw * ph * texel) as usize;
+                if data.len() < len {
                     return;
                 }
-                let pixels = glow::PixelUnpackData::Slice(Some(&data[..(pw * ph) as usize]));
+                let pixels = glow::PixelUnpackData::Slice(Some(&data[..len]));
+                let (internal, format) = if texel == 2 { (glow::RG8, glow::RG) } else { (glow::R8, glow::RED) };
                 self.gl.active_texture(glow::TEXTURE0 + unit as u32);
                 self.gl.bind_texture(glow::TEXTURE_2D, Some(*texture));
+                let (pw, ph) = (pw as i32, ph as i32);
                 if resize {
-                    let (pw, ph) = (pw as i32, ph as i32);
-                    let format = glow::R8 as i32;
-                    self.gl.tex_image_2d(
-                        glow::TEXTURE_2D,
-                        0,
-                        format,
-                        pw,
-                        ph,
-                        0,
-                        glow::RED,
-                        glow::UNSIGNED_BYTE,
-                        pixels,
-                    );
+                    let internal = internal as i32;
+                    self.gl.tex_image_2d(glow::TEXTURE_2D, 0, internal, pw, ph, 0, format, glow::UNSIGNED_BYTE, pixels);
                 } else {
-                    let (pw, ph) = (pw as i32, ph as i32);
-                    self.gl.tex_sub_image_2d(glow::TEXTURE_2D, 0, 0, 0, pw, ph, glow::RED, glow::UNSIGNED_BYTE, pixels);
+                    self.gl.tex_sub_image_2d(glow::TEXTURE_2D, 0, 0, 0, pw, ph, format, glow::UNSIGNED_BYTE, pixels);
                 }
             }
+            self.gl.use_program(Some(self.program));
+            let interleaved = frame.chroma == Chroma::Interleaved;
+            self.gl.uniform_1_i32(self.interleaved.as_ref(), interleaved as i32);
         }
         self.picture = (w, h);
+        self.chroma = frame.chroma;
     }
 
     /// Draws the picture letterboxed into a `width` × `height` window and shows it. Returns
