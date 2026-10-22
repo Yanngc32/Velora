@@ -317,7 +317,8 @@ tag by hand does the same):
 5. publishes the GitHub release and creates the tag.
 
 The Android release key lives in the `ANDROID_KEYSTORE_BASE64` (a base64 PKCS#12 keystore,
-alias `velora`) and `ANDROID_KEYSTORE_PASSWORD` repository secrets. Keep a copy of it: installed
+alias `velora`) and `ANDROID_KEYSTORE_PASSWORD` secrets of the `release` environment, which only
+`main` and `v*` tags may use, so pull request builds never get it. Keep a copy of it: installed
 apps only accept updates signed with the same key, whose certificate fingerprint is pinned in
 the Release workflow.
 
