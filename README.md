@@ -3,6 +3,15 @@
 <h1 align="center">Velora</h1>
 <p align="center"><b>Your screen. Anywhere.</b></p>
 
+<p align="center">
+  <a href="docs/media/velora-tour.mp4"><img src="docs/media/velora-tour.gif" width="800"
+    alt="A file request arrives on the laptop, Accept is clicked, and two transfers finish"></a>
+  <br>
+  <sub><a href="docs/media/velora-tour.mp4">Watch the full tour (38 s, with sound)</a> ·
+  Music: “Happy Beats / Business Moves” by ende.app,
+  <a href="https://creativecommons.org/licenses/by/4.0/">CC BY 4.0</a></sub>
+</p>
+
 Open-source, low-latency remote control for your own computers: view and drive a Windows or
 Linux PC from another PC or from your Android phone. It is designed around input
 responsiveness and a picture that is always current, not around maximum image quality.
