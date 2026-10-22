@@ -8,6 +8,7 @@
 use std::{
     collections::VecDeque,
     net::SocketAddr,
+    path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicU32, Ordering},
         Arc, Mutex,
@@ -15,14 +16,14 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use tokio::sync::{mpsc, oneshot};
 use velora_protocol::{
     control::{self, Reply, Request},
     identity::{AuthorizedClient, StateDir},
     pairing::{pairing_uri, PairingCode},
     tls::{self, Fingerprint},
-    wire::{self, ClientMsg, Codec, FrameHeader, HostMsg, MouseMove, PROTOCOL_VERSION},
+    wire::{self, ClientMsg, Codec, FrameHeader, HostMsg, MouseMove, FEATURE_FILES, PROTOCOL_VERSION},
 };
 
 use crate::{
@@ -64,6 +65,14 @@ pub struct PendingPairing {
 struct Active {
     conn: quinn::Connection,
     fingerprint: Fingerprint,
+    /// The device takes files (Send To); older ones don't know about them.
+    files: bool,
+}
+
+/// A connection for file transfers only (the desktop's file manager).
+struct FilesConn {
+    conn: quinn::Connection,
+    fingerprint: Fingerprint,
 }
 
 pub struct Shared {
@@ -77,6 +86,7 @@ pub struct Shared {
     clients: Mutex<()>,
     password: crate::password::Gate,
     active: Mutex<Option<Active>>,
+    files: Mutex<Vec<FilesConn>>,
     shutdown: tokio::sync::Notify,
 }
 
@@ -104,6 +114,7 @@ pub async fn run(options: HostOptions, state: StateDir, pair: bool, auto_update:
         pairing: Mutex::new(None),
         clients: Mutex::new(()),
         active: Mutex::new(None),
+        files: Mutex::new(Vec::new()),
         shutdown: tokio::sync::Notify::new(),
     });
     if pair {
@@ -164,7 +175,7 @@ pub async fn run(options: HostOptions, state: StateDir, pair: bool, auto_update:
 }
 
 /// Periodically installs new releases; resolves once one is installed and nobody is using
-/// the host (no session, no open pairing window).
+/// the host (no session or file connection, no open pairing window).
 async fn update_loop(shared: &Shared) {
     let mut delay = UPDATE_FIRST_CHECK;
     loop {
@@ -182,7 +193,8 @@ async fn update_loop(shared: &Shared) {
     }
     loop {
         let pairing_open = shared.pairing.lock().unwrap().as_ref().is_some_and(|p| p.expires > Instant::now());
-        if shared.active.lock().unwrap().is_none() && !pairing_open {
+        let busy = shared.active.lock().unwrap().is_some() || !shared.files.lock().unwrap().is_empty();
+        if !busy && !pairing_open {
             return;
         }
         tokio::time::sleep(UPDATE_IDLE_POLL).await;
@@ -199,7 +211,7 @@ async fn handle_connection(incoming: quinn::Incoming, shared: Arc<Shared>) -> Re
         .await
         .context("no hello")??
         .context("closed before hello")?;
-    let ClientMsg::Hello { version, name, pairing_secret, password } = ClientMsg::decode(&body)? else {
+    let ClientMsg::Hello { version, name, pairing_secret, password, ext } = ClientMsg::decode(&body)? else {
         bail!("expected hello");
     };
     // Shown in logs and stored in the paired list: strip control characters.
@@ -241,20 +253,53 @@ async fn handle_connection(incoming: quinn::Incoming, shared: Arc<Shared>) -> Re
         let _ = send.stopped().await;
         bail!("refused client '{name}' ({fingerprint}): {why}");
     }
+    // Only clients that know about extensions understand the features field.
+    let features = ext.map(|_| FEATURE_FILES);
+    if ext.is_some_and(|e| e.files_only) {
+        tracing::info!("client '{name}' ({fingerprint}) connected for files from {}", conn.remote_address());
+        return serve_files_only(conn, send, fingerprint, &shared, features).await;
+    }
     tracing::info!("client '{name}' ({fingerprint}) connected from {}", conn.remote_address());
 
     // A newly connected device takes over: switching from the phone to a PC should just work.
-    if let Some(old) = shared.active.lock().unwrap().replace(Active { conn: conn.clone(), fingerprint }) {
+    let active = Active { conn: conn.clone(), fingerprint, files: ext.is_some() };
+    if let Some(old) = shared.active.lock().unwrap().replace(active) {
         old.conn.close(1u32.into(), b"another device took over");
     }
 
-    let result = run_session(&conn, send, recv, &shared).await;
+    let result = run_session(&conn, send, recv, &shared, features).await;
 
     shared.input.send(InputCmd::ReleaseAll);
     let mut active = shared.active.lock().unwrap();
     if active.as_ref().is_some_and(|a| a.conn.stable_id() == conn.stable_id()) {
         *active = None;
     }
+    result
+}
+
+/// A connection for file transfers only: nothing is captured, and the current session stays.
+async fn serve_files_only(
+    conn: quinn::Connection,
+    mut send: quinn::SendStream,
+    fingerprint: Fingerprint,
+    shared: &Arc<Shared>,
+    features: Option<u32>,
+) -> Result<()> {
+    let welcome = HostMsg::Welcome {
+        version: PROTOCOL_VERSION,
+        host_name: shared.options.name.clone(),
+        codec: Codec::H264,
+        width: 0,
+        height: 0,
+        features,
+    };
+    send.write_all(&welcome.encode()).await?;
+    shared.files.lock().unwrap().push(FilesConn { conn: conn.clone(), fingerprint });
+    let result = tokio::select! {
+        r = crate::transfer::accept(conn.clone(), shared.options.service) => r,
+        e = conn.closed() => Err(e.into()),
+    };
+    shared.files.lock().unwrap().retain(|c| c.conn.stable_id() != conn.stable_id());
     result
 }
 
@@ -281,7 +326,9 @@ impl Shared {
         if self.options.service && request == Request::Shutdown {
             return Err("this host runs as the Velora service; turn the service off instead".into());
         }
-        if self.options.service && !privileged && request != Request::Status {
+        // Sending files changes nothing about access, and reads them as the user at the console.
+        let harmless = matches!(request, Request::Status | Request::SendFiles { .. });
+        if self.options.service && !privileged && !harmless {
             return Err("only an administrator can change this computer's access".into());
         }
         let result = match request {
@@ -299,8 +346,31 @@ impl Shared {
                 self.shutdown.notify_one();
                 Ok(())
             }
+            Request::SendFiles { paths } => self.send_files(paths),
         };
         result.and_then(|()| self.status()).map_err(|e| format!("{e:#}"))
+    }
+
+    /// Starts sending `paths` to the connected device; the transfer goes on in the background.
+    /// Called from a blocking thread of the runtime.
+    fn send_files(&self, paths: Vec<PathBuf>) -> Result<()> {
+        ensure!(!paths.is_empty(), "nothing to send");
+        ensure!(paths.iter().all(|p| p.is_absolute()), "paths must be absolute");
+        let conn = {
+            let active = self.active.lock().unwrap();
+            let active = active.as_ref().context("no device is connected")?;
+            ensure!(active.files, "the connected device can't receive files; update Velora on it");
+            active.conn.clone()
+        };
+        let service = self.options.service;
+        tokio::runtime::Handle::current().spawn(async move {
+            let count = paths.len();
+            match crate::transfer::offer(conn, paths, service).await {
+                Ok(_) => tracing::info!("sent {count} item(s) to the connected device"),
+                Err(e) => tracing::warn!("sending files failed: {e:#}"),
+            }
+        });
+        Ok(())
     }
 
     fn revoke(&self, fingerprint: &str) -> Result<()> {
@@ -311,6 +381,9 @@ impl Shared {
         }
         if let Some(active) = self.active.lock().unwrap().as_ref().filter(|a| a.fingerprint == fingerprint) {
             active.conn.close(2u32.into(), b"device removed on the host");
+        }
+        for files in self.files.lock().unwrap().iter().filter(|c| c.fingerprint == fingerprint) {
+            files.conn.close(2u32.into(), b"device removed on the host");
         }
         Ok(())
     }
@@ -489,6 +562,7 @@ async fn run_session(
     mut control_send: quinn::SendStream,
     mut control_recv: quinn::RecvStream,
     shared: &Arc<Shared>,
+    features: Option<u32>,
 ) -> Result<()> {
     let opts = &shared.options;
     let session = Arc::new(Session {
@@ -534,6 +608,7 @@ async fn run_session(
                 codec: Codec::H264,
                 width: (rect.width & !1) as u16,
                 height: (rect.height & !1) as u16,
+                features,
             }
             .encode(),
         )
@@ -612,6 +687,7 @@ async fn run_session(
         r = control => r,
         r = pointer => r,
         r = monitor => r,
+        r = crate::transfer::accept(conn.clone(), opts.service) => r,
         e = conn.closed() => Err(e.into()),
     };
     session.running.store(false, Ordering::Relaxed);

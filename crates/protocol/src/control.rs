@@ -35,6 +35,11 @@ pub enum Request {
     SetPassword {
         password: Option<String>,
     },
+    /// Sends files and folders to the connected device, into its Downloads folder (Send To).
+    /// The reply comes once the transfer started; it continues in the background.
+    SendFiles {
+        paths: Vec<PathBuf>,
+    },
 }
 
 pub type Reply = std::result::Result<Status, String>;
@@ -162,6 +167,9 @@ mod tests {
         let json = serde_json::to_string(&revoke).unwrap();
         assert_eq!(json, r#"{"op":"revoke","fingerprint":"abc"}"#);
         assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), revoke);
+        let send = Request::SendFiles { paths: vec![PathBuf::from("foto.jpg")] };
+        let json = serde_json::to_string(&send).unwrap();
+        assert_eq!(json, r#"{"op":"send_files","paths":["foto.jpg"]}"#);
 
         let err: Reply = Err("nope".into());
         let json = serde_json::to_string(&err).unwrap();

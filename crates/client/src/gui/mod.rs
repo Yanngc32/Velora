@@ -4,9 +4,10 @@
 //! `main.rs`). That window needs raw physical keys, which egui does not expose, and a separate
 //! process keeps a misbehaving session from taking the launcher down.
 
+mod files;
 mod icons;
 mod motion;
-mod strings;
+pub(crate) mod strings;
 mod theme;
 mod this_pc;
 mod widgets;
@@ -79,6 +80,8 @@ enum Page {
     ThisPc,
     Settings,
     About,
+    /// The file manager, reached from a device; the sidebar shows it under Devices.
+    Files,
 }
 
 #[derive(Clone)]
@@ -153,6 +156,8 @@ struct Launcher {
     /// The access password being typed on "This PC".
     draft_password: String,
     password_prompt: Option<PasswordPrompt>,
+    /// The file manager of one paired computer, kept while you look elsewhere.
+    files: Option<files::FileManager>,
 }
 
 impl Launcher {
@@ -197,6 +202,7 @@ impl Launcher {
             service_job: Arc::default(),
             draft_password: String::new(),
             password_prompt: None,
+            files: None,
         };
         if !launcher.hosts.is_empty() {
             launcher.page = Page::Devices;
@@ -448,6 +454,7 @@ impl Launcher {
         });
         match action {
             Some((DeviceAction::Connect, name)) => self.spawn(name.clone(), &["connect", &name], None),
+            Some((DeviceAction::Files, name)) => self.open_files(name, ui.ctx()),
             Some((DeviceAction::Forget, name)) => {
                 if let Err(e) = hosts::forget(&self.state, &name) {
                     self.error = Some(format!("{e:#}"));
@@ -456,6 +463,25 @@ impl Launcher {
             }
             None => {}
         }
+    }
+
+    fn open_files(&mut self, host: String, ctx: &egui::Context) {
+        if self.files.as_ref().is_none_or(|f| f.host != host) {
+            let manager =
+                files::FileManager::open(host, self.config_dir.clone(), self.settings.device_name.clone(), ctx);
+            match manager {
+                Ok(manager) => self.files = Some(manager),
+                Err(e) => return self.error = Some(format!("{e:#}")),
+            }
+        }
+        self.go(Page::Files);
+    }
+
+    fn files_page(&mut self, ui: &mut egui::Ui) {
+        let s = self.s;
+        let Some(manager) = &mut self.files else { return self.go(Page::Devices) };
+        page_header(ui, s.files_label, &fill(s.files_title, &[&manager.host]), Some(s.files_hint));
+        manager.ui(ui, s);
     }
 
     fn empty_devices(&mut self, ui: &mut egui::Ui) {
@@ -699,8 +725,9 @@ impl Launcher {
                 let pulse = self.new_host.as_ref().map_or(0.0, |(_, since)| motion::pulse(self.now, *since, 0.8));
                 (self.hosts.len(), pulse)
             });
-            let response = nav_item(ui, &self.icons, icon, label, self.page == page, badge);
-            if self.page == page {
+            let current = if self.page == Page::Files { Page::Devices } else { self.page };
+            let response = nav_item(ui, &self.icons, icon, label, current == page, badge);
+            if current == page {
                 selected = Some(response.rect);
             }
             if response.clicked() {
@@ -830,9 +857,12 @@ impl eframe::App for Launcher {
                 if settling {
                     ui.ctx().request_repaint();
                 }
-                // The device list scrolls itself, below its header.
+                // The device list and the file manager scroll themselves, below their header.
                 if self.page == Page::Devices {
                     return self.devices(ui);
+                }
+                if self.page == Page::Files {
+                    return self.files_page(ui);
                 }
                 // One scroll position per page: a long page must not leave the next one scrolled.
                 let scroll = egui::ScrollArea::vertical().id_salt(self.page as u8).auto_shrink([false, false]);
@@ -854,6 +884,7 @@ impl eframe::App for Launcher {
 
 enum DeviceAction {
     Connect,
+    Files,
     Forget,
 }
 
@@ -880,6 +911,9 @@ fn device_row(ui: &mut egui::Ui, s: &Strings, icons: &Icons, host: &KnownHost, r
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if primary_button(ui, s.connect, 110.0, true).clicked() {
                     action = Some(DeviceAction::Connect);
+                }
+                if secondary_button(ui, s.files).clicked() {
+                    action = Some(DeviceAction::Files);
                 }
                 if secondary_button(ui, s.forget).clicked() {
                     action = Some(DeviceAction::Forget);

@@ -8,6 +8,8 @@
 //!   older one, so retransmitting stale positions would only add latency.
 //! - **Video** (host -> client): one unidirectional stream per encoded frame, starting with a
 //!   [`FrameHeader`] followed by the H.264 Annex-B bitstream until end of stream.
+//! - **Files** (either side opens): one bidirectional stream per operation, see
+//!   [`crate::files`]. Only with hosts that announce [`FEATURE_FILES`].
 
 use anyhow::{bail, ensure, Context, Result};
 
@@ -27,6 +29,17 @@ pub const MAX_NAME_LEN: usize = 256;
 pub const MAX_TEXT_LEN: usize = 4096;
 /// Longest access password, in bytes.
 pub const MAX_PASSWORD_LEN: usize = 256;
+
+/// [`HostMsg::Welcome`] feature bit: the host serves file streams.
+pub const FEATURE_FILES: u32 = 1;
+
+/// What a client that knows about extensions adds to its hello. Hosts that predate them reject
+/// such a hello, and only hellos with it are answered with `features` in the welcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct HelloExt {
+    /// Only file transfers: no video or input, and the host's current session is left alone.
+    pub files_only: bool,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
@@ -100,6 +113,8 @@ pub enum ClientMsg {
         /// Sent inside TLS to the pinned host. Encoded only when present, so hosts that
         /// predate passwords still understand every hello without one.
         password: Option<String>,
+        /// Present from clients that know about extensions, encoded after the password field.
+        ext: Option<HelloExt>,
     },
     /// `code` is a Linux evdev key code (`KEY_*`), i.e. a physical, layout-independent key.
     Key {
@@ -145,6 +160,9 @@ pub enum HostMsg {
         codec: Codec,
         width: u16,
         height: u16,
+        /// `FEATURE_*` bits. Sent only in reply to a hello with [`HelloExt`]: clients that
+        /// predate it reject trailing bytes.
+        features: Option<u32>,
     },
     /// Sent before `Welcome` when the client was just authorized through a pairing secret.
     Paired,
@@ -224,14 +242,14 @@ impl FrameHeader {
     }
 }
 
-struct Writer(Vec<u8>);
+pub(crate) struct Writer(Vec<u8>);
 
 impl Writer {
-    fn new(tag: u8) -> Self {
+    pub(crate) fn new(tag: u8) -> Self {
         // Reserve the u32 length prefix, patched in `finish`.
         Self(vec![0, 0, 0, 0, tag])
     }
-    fn u8(&mut self, v: u8) {
+    pub(crate) fn u8(&mut self, v: u8) {
         self.0.push(v);
     }
     fn u16(&mut self, v: u16) {
@@ -243,18 +261,21 @@ impl Writer {
     fn u32(&mut self, v: u32) {
         self.0.extend_from_slice(&v.to_le_bytes());
     }
+    pub(crate) fn u64(&mut self, v: u64) {
+        self.0.extend_from_slice(&v.to_le_bytes());
+    }
     fn bytes(&mut self, v: &[u8]) {
         self.0.extend_from_slice(v);
     }
     fn str(&mut self, s: &str) {
         self.str_max(s, MAX_NAME_LEN);
     }
-    fn str_max(&mut self, s: &str, max: usize) {
+    pub(crate) fn str_max(&mut self, s: &str, max: usize) {
         let s = truncate_utf8(s, max);
         self.u16(s.len() as u16);
         self.bytes(s.as_bytes());
     }
-    fn finish(mut self) -> Vec<u8> {
+    pub(crate) fn finish(mut self) -> Vec<u8> {
         let len = (self.0.len() - 4) as u32;
         self.0[0..4].copy_from_slice(&len.to_le_bytes());
         self.0
@@ -284,7 +305,7 @@ fn truncate_utf8(s: &str, max: usize) -> &str {
     &s[..end]
 }
 
-struct Reader<'a>(&'a [u8]);
+pub(crate) struct Reader<'a>(pub(crate) &'a [u8]);
 
 impl<'a> Reader<'a> {
     fn take(&mut self, n: usize) -> Result<&'a [u8]> {
@@ -293,7 +314,7 @@ impl<'a> Reader<'a> {
         self.0 = tail;
         Ok(head)
     }
-    fn u8(&mut self) -> Result<u8> {
+    pub(crate) fn u8(&mut self) -> Result<u8> {
         Ok(self.take(1)?[0])
     }
     fn bool(&mut self) -> Result<bool> {
@@ -312,11 +333,14 @@ impl<'a> Reader<'a> {
     fn u32(&mut self) -> Result<u32> {
         Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
     }
-    fn str(&mut self) -> Result<String> {
+    pub(crate) fn u64(&mut self) -> Result<u64> {
+        Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+    }
+    pub(crate) fn str(&mut self) -> Result<String> {
         let len = self.u16()? as usize;
         String::from_utf8(self.take(len)?.to_vec()).context("invalid utf-8")
     }
-    fn end(&self) -> Result<()> {
+    pub(crate) fn end(&self) -> Result<()> {
         ensure!(self.0.is_empty(), "trailing bytes in message");
         Ok(())
     }
@@ -326,7 +350,7 @@ impl ClientMsg {
     /// Encodes the message including its u32 length prefix.
     pub fn encode(&self) -> Vec<u8> {
         match self {
-            Self::Hello { version, name, pairing_secret, password } => {
+            Self::Hello { version, name, pairing_secret, password, ext } => {
                 let mut w = Writer::new(1);
                 w.u16(*version);
                 w.str(name);
@@ -337,9 +361,16 @@ impl ClientMsg {
                     }
                     None => w.u8(0),
                 }
-                if let Some(password) = password {
-                    w.u8(1);
-                    w.str_max(password, MAX_PASSWORD_LEN);
+                match (password, ext) {
+                    (Some(password), _) => {
+                        w.u8(1);
+                        w.str_max(password, MAX_PASSWORD_LEN);
+                    }
+                    (None, Some(_)) => w.u8(0),
+                    (None, None) => {}
+                }
+                if let Some(ext) = ext {
+                    w.u8(ext.files_only as u8);
                 }
                 w.finish()
             }
@@ -390,7 +421,9 @@ impl ClientMsg {
                     if r.bool()? { Some(r.take(PAIRING_SECRET_LEN)?.try_into().unwrap()) } else { None };
                 // Absent in hellos without a password, and from clients that predate them.
                 let password = if !r.0.is_empty() && r.bool()? { Some(r.str()?) } else { None };
-                Self::Hello { version, name, pairing_secret, password }
+                // Unknown flag bits come from newer clients and are ignored.
+                let ext = if r.0.is_empty() { None } else { Some(HelloExt { files_only: r.u8()? & 1 != 0 }) };
+                Self::Hello { version, name, pairing_secret, password, ext }
             }
             2 => Self::Key { code: r.u16()?, state: KeyState::from_u8(r.u8()?)? },
             3 => {
@@ -412,13 +445,16 @@ impl ClientMsg {
 impl HostMsg {
     pub fn encode(&self) -> Vec<u8> {
         match self {
-            Self::Welcome { version, host_name, codec, width, height } => {
+            Self::Welcome { version, host_name, codec, width, height, features } => {
                 let mut w = Writer::new(1);
                 w.u16(*version);
                 w.str(host_name);
                 w.u8(*codec as u8);
                 w.u16(*width);
                 w.u16(*height);
+                if let Some(features) = features {
+                    w.u32(*features);
+                }
                 w.finish()
             }
             Self::Paired => Writer::new(2).finish(),
@@ -444,6 +480,7 @@ impl HostMsg {
                 codec: Codec::from_u8(r.u8()?)?,
                 width: r.u16()?,
                 height: r.u16()?,
+                features: if r.0.is_empty() { None } else { Some(r.u32()?) },
             },
             2 => Self::Paired,
             3 => Self::Rejected { reason: r.str()? },
@@ -489,19 +526,36 @@ mod tests {
 
     #[test]
     fn client_messages_roundtrip() {
-        roundtrip_client(ClientMsg::Hello { version: 1, name: "laptop".into(), pairing_secret: None, password: None });
+        roundtrip_client(ClientMsg::Hello {
+            version: 1,
+            name: "laptop".into(),
+            pairing_secret: None,
+            password: None,
+            ext: None,
+        });
         roundtrip_client(ClientMsg::Hello {
             version: 1,
             name: "telefone".into(),
             pairing_secret: Some([7; PAIRING_SECRET_LEN]),
             password: None,
+            ext: None,
         });
         roundtrip_client(ClientMsg::Hello {
             version: 1,
             name: "telefone".into(),
             pairing_secret: None,
             password: Some("senha secreta".into()),
+            ext: None,
         });
+        for password in [None, Some("senha".to_string())] {
+            roundtrip_client(ClientMsg::Hello {
+                version: 1,
+                name: "laptop".into(),
+                pairing_secret: None,
+                password,
+                ext: Some(HelloExt { files_only: true }),
+            });
+        }
         roundtrip_client(ClientMsg::Key { code: 30, state: KeyState::Repeat });
         roundtrip_client(ClientMsg::MouseButton { button: MouseButton::Back, down: true, x: 65535, y: 0 });
         roundtrip_client(ClientMsg::Scroll { dx: -120, dy: 360 });
@@ -509,6 +563,13 @@ mod tests {
         roundtrip_client(ClientMsg::RequestKeyframe);
         roundtrip_client(ClientMsg::ReleaseAll);
         roundtrip_client(ClientMsg::Text { text: "olá, ação ✓".into() });
+    }
+
+    #[test]
+    fn hellos_without_extensions_are_unchanged() {
+        // What hosts that predate extensions accept: nothing after the pairing secret flag.
+        let plain = ClientMsg::Hello { version: 1, name: "a".into(), pairing_secret: None, password: None, ext: None };
+        assert_eq!(plain.encode().len(), 4 + 1 + 2 + 2 + 1 + 1);
     }
 
     #[test]
@@ -533,6 +594,15 @@ mod tests {
             codec: Codec::H264,
             width: 2560,
             height: 1440,
+            features: None,
+        });
+        roundtrip_host(HostMsg::Welcome {
+            version: 1,
+            host_name: "desktop".into(),
+            codec: Codec::H264,
+            width: 0,
+            height: 0,
+            features: Some(FEATURE_FILES),
         });
         roundtrip_host(HostMsg::Paired);
         roundtrip_host(HostMsg::PasswordRequired { wrong: true });
@@ -568,7 +638,7 @@ mod tests {
     #[test]
     fn long_names_are_truncated_on_char_boundary() {
         let name = "é".repeat(1000);
-        let enc = ClientMsg::Hello { version: 1, name, pairing_secret: None, password: None }.encode();
+        let enc = ClientMsg::Hello { version: 1, name, pairing_secret: None, password: None, ext: None }.encode();
         let ClientMsg::Hello { name, .. } = ClientMsg::decode(&enc[4..]).unwrap() else { panic!() };
         assert_eq!(name.len(), MAX_NAME_LEN);
         assert!(name.chars().all(|c| c == 'é'));

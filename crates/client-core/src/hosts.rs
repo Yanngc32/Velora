@@ -10,7 +10,7 @@ use velora_protocol::{
     wire::DEFAULT_PORT,
 };
 
-use crate::{ConnectParams, Session, VideoOutput};
+use crate::{ConnectParams, FilesSession, Session, VideoOutput};
 
 pub fn list(state: &StateDir) -> Result<Vec<KnownHost>> {
     state.load(StateDir::KNOWN_HOSTS)
@@ -64,20 +64,39 @@ pub async fn connect(
     password: Option<&str>,
     output: VideoOutput,
 ) -> Result<Session> {
+    crate::connect(known_params(state, host, device_name, password).await?, output).await
+}
+
+/// Connects to a paired host for file transfers only. Fails with [`crate::PasswordRequired`]
+/// like [`pair`].
+pub async fn connect_files(
+    state: &StateDir,
+    host: &str,
+    device_name: &str,
+    password: Option<&str>,
+) -> Result<FilesSession> {
+    crate::connect_files(known_params(state, host, device_name, password).await?).await
+}
+
+async fn known_params(
+    state: &StateDir,
+    host: &str,
+    device_name: &str,
+    password: Option<&str>,
+) -> Result<ConnectParams> {
     let hosts = list(state)?;
     let known = hosts
         .iter()
         .find(|h| h.name == host || h.address == host)
         .with_context(|| format!("'{host}' is not paired yet"))?;
-    let params = ConnectParams {
+    Ok(ConnectParams {
         addr: resolve(&known.address).await?,
         host_fingerprint: Fingerprint::from_base64(&known.fingerprint)?,
         identity: state.load_or_create_identity()?,
         device_name: device_name.to_string(),
         pairing_secret: None,
         password: password.map(str::to_string),
-    };
-    crate::connect(params, output).await
+    })
 }
 
 /// Resolves `ip[:port]` or `hostname[:port]`, defaulting to the standard port.
