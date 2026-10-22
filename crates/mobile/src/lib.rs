@@ -20,11 +20,20 @@ uniffi::setup_scaffolding!();
 pub enum MobileError {
     #[error("{0}")]
     Failed(String),
+    /// The host has an access password: ask for it and call again with it.
+    #[error("this computer asks for a password")]
+    PasswordRequired,
+    #[error("wrong password")]
+    WrongPassword,
 }
 
 impl From<anyhow::Error> for MobileError {
     fn from(e: anyhow::Error) -> Self {
-        Self::Failed(format!("{e:#}"))
+        match e.downcast_ref::<velora_client_core::PasswordRequired>() {
+            Some(p) if p.wrong => Self::WrongPassword,
+            Some(_) => Self::PasswordRequired,
+            None => Self::Failed(format!("{e:#}")),
+        }
     }
 }
 
@@ -107,20 +116,30 @@ impl Client {
         Ok(hosts::forget(&self.state, &name)?)
     }
 
-    /// Pairs with the code printed by `velora-host run --pair`. Blocking.
-    pub fn pair(&self, address: String, code: String) -> Result<Arc<Session>> {
+    /// Pairs with the code printed by `velora-host run --pair`. Blocking. Fails with
+    /// `PasswordRequired` / `WrongPassword` when the host has an access password; the code
+    /// stays valid, so call again with the password.
+    pub fn pair(&self, address: String, code: String, password: Option<String>) -> Result<Arc<Session>> {
         let gate = Arc::new(Gate::default());
         let output = gate.output();
-        let session =
-            runtime().block_on(hosts::pair(&self.state, address.trim(), code.trim(), &self.device_name, output))?;
+        let session = runtime().block_on(hosts::pair(
+            &self.state,
+            address.trim(),
+            code.trim(),
+            &self.device_name,
+            password.as_deref(),
+            output,
+        ))?;
         Ok(Arc::new(Session { inner: Arc::new(session), gate }))
     }
 
-    /// Connects to a paired host by name. Blocking.
-    pub fn connect(&self, host: String) -> Result<Arc<Session>> {
+    /// Connects to a paired host by name. Blocking. Fails like [`Client::pair`] when a
+    /// password is needed.
+    pub fn connect(&self, host: String, password: Option<String>) -> Result<Arc<Session>> {
         let gate = Arc::new(Gate::default());
         let output = gate.output();
-        let session = runtime().block_on(hosts::connect(&self.state, &host, &self.device_name, output))?;
+        let session =
+            runtime().block_on(hosts::connect(&self.state, &host, &self.device_name, password.as_deref(), output))?;
         Ok(Arc::new(Session { inner: Arc::new(session), gate }))
     }
 }

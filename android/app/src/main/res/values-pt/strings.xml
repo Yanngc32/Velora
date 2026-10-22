@@ -1,12 +1,20 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="no_hosts">Nenhum computador pareado ainda. No computador, rode `velora-host run --pair` e escaneie o QR code que aparecer.</string>
+    <string name="no_hosts_title">Nenhum computador pareado</string>
+    <string name="no_hosts">No computador, abra o Velora → Este PC → Mostrar QR code e escaneie aqui.</string>
+    <string name="devices_label">Seus computadores</string>
+    <string name="devices_title">Dispositivos</string>
+    <plurals name="devices_count">
+        <item quantity="one">%1$d computador pareado</item>
+        <item quantity="other">%1$d computadores pareados</item>
+    </plurals>
+    <string name="forget_text">Ele sai desta lista. Pareie de novo para usar depois.</string>
     <string name="scan_qr">Escanear QR code</string>
     <string name="enter_code">Digitar código</string>
     <string name="pair_title">Parear um computador</string>
-    <string name="pair_hint">Endereço e código exibidos por `velora-host run --pair`.</string>
-    <string name="address">Endereço (IP:porta)</string>
-    <string name="code">Código de pareamento (VL1-…)</string>
+    <string name="pair_hint">Aparecem no computador em Este PC → Mostrar QR code.</string>
+    <string name="address">Endereço</string>
+    <string name="code">Código de pareamento</string>
     <string name="pair">Parear</string>
     <string name="cancel">Cancelar</string>
     <string name="forget">Esquecer</string>
@@ -15,4 +23,9 @@
     <string name="disconnected">Desconectado: %1$s</string>
     <string name="not_a_pairing_code">Esse QR code não é um código de pareamento do Velora.</string>
     <string name="scanner_unavailable">O leitor de QR não está disponível neste aparelho; digite o código.</string>
+    <string name="password">Senha</string>
+    <string name="password_title">Senha de %1$s</string>
+    <string name="password_needed">Este computador pede uma senha de acesso.</string>
+    <string name="password_wrong">Senha incorreta. Tente de novo.</string>
+    <string name="connect">Conectar</string>
 </resources>

@@ -86,6 +86,9 @@ impl DxgiCapturer {
     /// (Re)creates the duplication and refreshes the output position, which changes after a
     /// resolution or layout change.
     fn duplicate(&mut self) -> Result<()> {
+        // Duplication shows the calling thread's desktop: after a switch to the lock screen or
+        // a UAC prompt (ACCESS_LOST), move to the new one first.
+        crate::win::follow_input_desktop();
         // SAFETY: COM calls on valid interfaces.
         let (dup, desc) = unsafe {
             let dup = self

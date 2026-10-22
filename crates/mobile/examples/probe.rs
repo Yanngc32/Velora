@@ -1,6 +1,8 @@
 //! Exercises the exported API like an app would, against a running host:
 //! `probe <config-dir> pair <address> <code> [seconds]` or `probe <config-dir> connect <host> [seconds]`.
-//! Frames are decoded in software to check they arrive valid and in order.
+//! Frames are decoded in software to check they arrive valid and in order. `PROBE_PASSWORD`
+//! gives the host's access password; `PROBE_NO_INPUT=1` skips the input exercise, which
+//! types on the host.
 
 use std::{
     sync::{Arc, Mutex, OnceLock},
@@ -37,9 +39,10 @@ impl SessionListener for Probe {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let client = Client::new(args[1].clone(), "probe".into()).unwrap();
+    let password = std::env::var("PROBE_PASSWORD").ok();
     let (session, seconds) = match args[2].as_str() {
-        "pair" => (client.pair(args[3].clone(), args[4].clone()).unwrap(), args.get(5)),
-        _ => (client.connect(args[3].clone()).unwrap(), args.get(4)),
+        "pair" => (client.pair(args[3].clone(), args[4].clone(), password).unwrap(), args.get(5)),
+        _ => (client.connect(args[3].clone(), password).unwrap(), args.get(4)),
     };
     let seconds: u64 = seconds.and_then(|s| s.parse().ok()).unwrap_or(5);
     println!("connected to {} ({}x{})", session.host_name(), session.width(), session.height());
@@ -53,8 +56,10 @@ fn main() {
     session.start(probe.clone());
 
     // Exercise input and text paths.
-    session.mouse_move(32768, 32768);
-    session.text("ação".into());
+    if std::env::var_os("PROBE_NO_INPUT").is_none() {
+        session.mouse_move(32768, 32768);
+        session.text("ação".into());
+    }
     std::thread::sleep(Duration::from_secs(seconds));
     let (frames, pictures, errors) = *probe.stats.lock().unwrap();
     println!(

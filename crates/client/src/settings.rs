@@ -11,11 +11,15 @@ pub struct Settings {
     pub device_name: String,
     /// Install updates in the background (release builds only).
     pub auto_update: bool,
+    /// Open the launcher, minimized, when the user signs in.
+    pub open_at_login: bool,
+    /// Start this computer's host when the user signs in.
+    pub share_at_login: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { device_name: default_device_name(), auto_update: true }
+        Self { device_name: default_device_name(), auto_update: true, open_at_login: false, share_at_login: false }
     }
 }
 

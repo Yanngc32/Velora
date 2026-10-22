@@ -1,12 +1,11 @@
 package io.github.yanngc32.velora
 
-import android.app.Activity
 import android.content.Context
 import android.content.Intent
-import android.graphics.Color
 import android.os.Build
 import android.os.Bundle
 import android.util.Log
+import android.util.TypedValue
 import android.view.Gravity
 import android.view.InputDevice
 import android.view.KeyEvent
@@ -23,8 +22,33 @@ import android.widget.Button
 import android.widget.FrameLayout
 import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
-import android.widget.TextView
 import android.widget.Toast
+import androidx.activity.ComponentActivity
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.size
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.toArgb
+import androidx.compose.ui.platform.ComposeView
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.unit.dp
+import androidx.core.content.res.ResourcesCompat
+import uniffi.velora_mobile.MobileException
 import uniffi.velora_mobile.Session
 import uniffi.velora_mobile.SessionListener
 import uniffi.velora_mobile.VideoFrame
@@ -33,12 +57,16 @@ import kotlin.math.min
 import uniffi.velora_mobile.Button as RemoteButton
 
 /** Full-screen remote session: video, trackpad, keyboard. */
-class SessionActivity : Activity(), SessionListener, SurfaceHolder.Callback, VideoDecoder.Callbacks {
+class SessionActivity : ComponentActivity(), SessionListener, SurfaceHolder.Callback, VideoDecoder.Callbacks {
     private lateinit var videoArea: FrameLayout
     private lateinit var surfaceView: SurfaceView
     private lateinit var cursorView: CursorView
     private lateinit var keyboard: KeyboardInput
-    private lateinit var status: TextView
+
+    /** "Connecting…" over the video area until the session starts. */
+    private var connecting by mutableStateOf(true)
+    /** Asking for the computer's password (`true`: the last one was wrong). */
+    private var passwordPrompt by mutableStateOf<Boolean?>(null)
 
     @Volatile private var session: Session? = null
     @Volatile private var decoder: VideoDecoder? = null
@@ -95,7 +123,7 @@ class SessionActivity : Activity(), SessionListener, SurfaceHolder.Callback, Vid
     }
 
     private fun buildLayout() {
-        val root = FrameLayout(this).apply { setBackgroundColor(getColor(R.color.velora_ink)) }
+        val root = FrameLayout(this).apply { setBackgroundColor(Velora.Bg.toArgb()) }
         videoArea = FrameLayout(this)
         surfaceView = SurfaceView(this).also { it.holder.addCallback(this) }
         cursorView = CursorView(this)
@@ -108,10 +136,9 @@ class SessionActivity : Activity(), SessionListener, SurfaceHolder.Callback, Vid
             override fun text(text: String) = typeText(text)
             override fun key(code: Int) = tapKey(code)
         })
-        status = TextView(this).apply {
-            setTextColor(Color.WHITE)
-            textSize = 18f
-            text = getString(R.string.connecting)
+        // Status and password prompt, drawn like the rest of the app.
+        val overlay = ComposeView(this).apply {
+            setContent { VeloraTheme { Overlay() } }
         }
 
         val content = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
@@ -119,19 +146,62 @@ class SessionActivity : Activity(), SessionListener, SurfaceHolder.Callback, Vid
         content.addView(toolbar(), LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
         root.addView(content, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
         root.addView(keyboard, FrameLayout.LayoutParams(1, 1))
-        root.addView(status, FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT, Gravity.CENTER))
+        root.addView(overlay, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
         setContentView(root)
+    }
+
+    @Composable
+    private fun Overlay() {
+        if (connecting && passwordPrompt == null) {
+            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    CircularProgressIndicator(Modifier.size(18.dp), color = Velora.AccentText, strokeWidth = 2.dp)
+                    Text(stringResource(R.string.connecting), style = MaterialTheme.typography.bodyLarge, color = Velora.Weak)
+                }
+            }
+        }
+        passwordPrompt?.let { wrong -> PasswordDialog(wrong) }
+    }
+
+    /** The computer has an access password: ask for it and connect again. Never stored. */
+    @Composable
+    private fun PasswordDialog(wrong: Boolean) {
+        var password by remember { mutableStateOf("") }
+        val name = intent.getStringExtra(EXTRA_HOST) ?: intent.getStringExtra(EXTRA_ADDRESS) ?: ""
+        val submit = {
+            passwordPrompt = null
+            connect(password)
+        }
+        VeloraDialog(onDismiss = { finish() }) {
+            Text(stringResource(R.string.password_title, name), style = MaterialTheme.typography.titleMedium)
+            Spacer(Modifier.height(4.dp))
+            Text(
+                stringResource(if (wrong) R.string.password_wrong else R.string.password_needed),
+                style = MaterialTheme.typography.bodyMedium,
+                color = if (wrong) Velora.Error else Velora.Weak,
+            )
+            Spacer(Modifier.height(16.dp))
+            Field(stringResource(R.string.password), password, { password = it }, password = true)
+            Spacer(Modifier.height(20.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                SecondaryButton(stringResource(R.string.cancel), { finish() }, Modifier.weight(1f))
+                PrimaryButton(stringResource(R.string.connect), submit, Modifier.weight(1f), enabled = password.isNotEmpty())
+            }
+        }
     }
 
     private fun toolbar(): View {
         val bar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            setBackgroundColor(TOOLBAR_COLOR)
+            setBackgroundColor(Velora.Card.toArgb())
         }
+        val font = ResourcesCompat.getFont(this, R.font.inter_medium)
         fun add(label: String, onClick: (Button) -> Unit) {
             val b = Button(this, null, android.R.attr.borderlessButtonStyle).apply {
                 text = label
-                setTextColor(Color.WHITE)
+                typeface = font
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+                setTextColor(Velora.Text.toArgb())
                 isAllCaps = false
                 minWidth = 0
                 minimumWidth = 0
@@ -142,7 +212,7 @@ class SessionActivity : Activity(), SessionListener, SurfaceHolder.Callback, Vid
         fun modifier(label: String, code: Int) {
             add(label) { b ->
                 if (!latched.remove(code)) latched.add(code)
-                b.setTextColor(if (code in latched) LATCHED_COLOR else Color.WHITE)
+                b.setTextColor(if (code in latched) Velora.AccentText.toArgb() else Velora.Text.toArgb())
             }
             modifierButtons += bar.getChildAt(bar.childCount - 1) as Button
         }
@@ -159,16 +229,28 @@ class SessionActivity : Activity(), SessionListener, SurfaceHolder.Callback, Vid
         add("→") { tapKey(Keys.RIGHT) }
         add("Del") { tapKey(Keys.DELETE) }
         add("✕") { finish() }
-        return HorizontalScrollView(this).apply { addView(bar) }
+        // A 1 px line on top, like the cards' borders.
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(View(this@SessionActivity).apply { setBackgroundColor(Velora.Border.toArgb()) }, LinearLayout.LayoutParams(MATCH_PARENT, 1))
+            addView(
+                HorizontalScrollView(this@SessionActivity).apply {
+                    setBackgroundColor(Velora.Card.toArgb())
+                    addView(bar)
+                },
+                LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT),
+            )
+        }
     }
 
-    private fun connect() {
+    /** Connects (or pairs). Called again with the password when the computer asks for one. */
+    private fun connect(password: String? = null) {
         val host = intent.getStringExtra(EXTRA_HOST)
         val address = intent.getStringExtra(EXTRA_ADDRESS)
         val code = intent.getStringExtra(EXTRA_CODE)
         thread(name = "connect") {
             try {
-                val s = if (host != null) client.connect(host) else client.pair(address!!, code!!)
+                val s = if (host != null) client.connect(host, password) else client.pair(address!!, code!!, password)
                 runOnUiThread {
                     if (finished) {
                         s.disconnect()
@@ -176,16 +258,21 @@ class SessionActivity : Activity(), SessionListener, SurfaceHolder.Callback, Vid
                         return@runOnUiThread
                     }
                     session = s
-                    status.visibility = View.GONE
+                    connecting = false
                     setVideoSize(s.width().toInt(), s.height().toInt())
                     s.start(this)
                 }
+            } catch (e: MobileException.PasswordRequired) {
+                runOnUiThread { if (!finished) passwordPrompt = false }
+            } catch (e: MobileException.WrongPassword) {
+                runOnUiThread { if (!finished) passwordPrompt = true }
             } catch (e: Exception) {
                 Log.w(TAG, "connection failed", e)
                 runOnUiThread { fail(e.message ?: e.toString()) }
             }
         }
     }
+
 
     private fun fail(message: String) {
         Toast.makeText(this, message, Toast.LENGTH_LONG).show()
@@ -309,7 +396,7 @@ class SessionActivity : Activity(), SessionListener, SurfaceHolder.Callback, Vid
         val s = session ?: return
         for (m in latched.reversed()) s.key(m.toUShort(), false)
         latched.clear()
-        modifierButtons.forEach { it.setTextColor(Color.WHITE) }
+        modifierButtons.forEach { it.setTextColor(Velora.Text.toArgb()) }
     }
 
     /** Physical keyboards (USB/Bluetooth): Android reports Linux key codes as scan codes. */
@@ -329,8 +416,9 @@ class SessionActivity : Activity(), SessionListener, SurfaceHolder.Callback, Vid
     override fun onPause() {
         super.onPause()
         session?.releaseAll()
-        // Sessions don't run in the background: leaving the screen disconnects.
-        if (!isChangingConfigurations) finish()
+        // Sessions don't run in the background: leaving the screen disconnects. Not while
+        // asking for the password, though: a password manager's autofill pauses us.
+        if (!isChangingConfigurations && passwordPrompt == null) finish()
     }
 
     override fun finish() {
@@ -351,8 +439,6 @@ class SessionActivity : Activity(), SessionListener, SurfaceHolder.Callback, Vid
 
     companion object {
         private const val TAG = "SessionActivity"
-        private const val TOOLBAR_COLOR = 0xFF16141F.toInt()
-        private const val LATCHED_COLOR = 0xFF4EE1C3.toInt() // Velora teal
         private const val EXTRA_HOST = "host"
         private const val EXTRA_ADDRESS = "address"
         private const val EXTRA_CODE = "code"

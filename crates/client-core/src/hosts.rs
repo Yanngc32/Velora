@@ -31,12 +31,14 @@ fn remember(state: &StateDir, name: &str, address: &str, fingerprint: Fingerprin
 }
 
 /// Pairs with the host at `address` using the code it printed, saves it and returns the
-/// established session.
+/// established session. Fails with [`crate::PasswordRequired`] when the host has an access
+/// password and `password` is missing or wrong; the code stays valid for another try.
 pub async fn pair(
     state: &StateDir,
     address: &str,
     code: &str,
     device_name: &str,
+    password: Option<&str>,
     output: VideoOutput,
 ) -> Result<Session> {
     let code = PairingCode::parse(code)?;
@@ -46,14 +48,22 @@ pub async fn pair(
         identity: state.load_or_create_identity()?,
         device_name: device_name.to_string(),
         pairing_secret: Some(code.secret),
+        password: password.map(str::to_string),
     };
     let session = crate::connect(params, output).await?;
     remember(state, &session.host_name, address, code.host)?;
     Ok(session)
 }
 
-/// Connects to a paired host by name or address.
-pub async fn connect(state: &StateDir, host: &str, device_name: &str, output: VideoOutput) -> Result<Session> {
+/// Connects to a paired host by name or address. Fails with [`crate::PasswordRequired`] like
+/// [`pair`].
+pub async fn connect(
+    state: &StateDir,
+    host: &str,
+    device_name: &str,
+    password: Option<&str>,
+    output: VideoOutput,
+) -> Result<Session> {
     let hosts = list(state)?;
     let known = hosts
         .iter()
@@ -65,6 +75,7 @@ pub async fn connect(state: &StateDir, host: &str, device_name: &str, output: Vi
         identity: state.load_or_create_identity()?,
         device_name: device_name.to_string(),
         pairing_secret: None,
+        password: password.map(str::to_string),
     };
     crate::connect(params, output).await
 }

@@ -5,18 +5,9 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use ring::signature::{Ed25519KeyPair, KeyPair};
-
 use super::*;
 
 const TARGET: &str = "x86_64-unknown-linux-gnu";
-
-fn keypair() -> (Ed25519KeyPair, String) {
-    let doc = Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new()).unwrap();
-    let pair = Ed25519KeyPair::from_pkcs8(doc.as_ref()).unwrap();
-    let public = B64.encode(pair.public_key().as_ref());
-    (pair, public)
-}
 
 fn entry(path: &str, data: &[u8]) -> FileEntry {
     FileEntry {
@@ -26,12 +17,6 @@ fn entry(path: &str, data: &[u8]) -> FileEntry {
         size: data.len() as u64,
         executable: !path.contains('/'),
     }
-}
-
-fn signed(manifest: &Manifest, key: &Ed25519KeyPair) -> (Vec<u8>, String) {
-    let bytes = serde_json::to_vec(manifest).unwrap();
-    let sig = B64.encode(key.sign(&bytes).as_ref());
-    (bytes, sig)
 }
 
 fn temp_dir(name: &str) -> PathBuf {
@@ -53,33 +38,26 @@ fn versions() {
 }
 
 #[test]
-fn manifest_signatures() {
-    let (key, public) = keypair();
+fn parses_manifests() {
     let manifest = Manifest {
         version: "0.2.0".into(),
         targets: BTreeMap::from([(TARGET.into(), vec![entry("velora-host", b"x")])]),
     };
-    let (bytes, sig) = signed(&manifest, &key);
-    assert_eq!(verify_manifest(&bytes, &sig, &public).unwrap(), manifest);
-
-    let mut tampered = bytes.clone();
-    tampered[5] ^= 1;
-    assert!(verify_manifest(&tampered, &sig, &public).is_err());
-    let (_, other) = keypair();
-    assert!(verify_manifest(&bytes, &sig, &other).is_err());
-    assert!(verify_manifest(&bytes, &sig, "").is_err(), "unconfigured key disables updates");
+    let bytes = serde_json::to_vec(&manifest).unwrap();
+    assert_eq!(parse_manifest(&bytes).unwrap(), manifest);
+    assert!(parse_manifest(b"{").is_err());
+    let bad_version = Manifest { version: "latest".into(), ..manifest };
+    assert!(parse_manifest(&serde_json::to_vec(&bad_version).unwrap()).is_err());
 }
 
 #[test]
 fn rejects_paths_outside_the_install_dir() {
-    let (key, public) = keypair();
     for path in ["../evil", "/etc/passwd", "lib/../../x", ""] {
         let manifest = Manifest {
             version: "0.2.0".into(),
             targets: BTreeMap::from([(TARGET.into(), vec![entry("ok", b"")]), ("t".into(), vec![entry(path, b"")])]),
         };
-        let (bytes, sig) = signed(&manifest, &key);
-        assert!(verify_manifest(&bytes, &sig, &public).is_err(), "{path:?} accepted");
+        assert!(parse_manifest(&serde_json::to_vec(&manifest).unwrap()).is_err(), "{path:?} accepted");
     }
 }
 
@@ -146,7 +124,6 @@ fn serve(files: HashMap<String, Vec<u8>>) -> (String, Arc<Mutex<Vec<String>>>) {
 
 #[test]
 fn updates_only_changed_files() {
-    let (key, public) = keypair();
     let dir = temp_dir("install");
     fs::create_dir_all(dir.join("lib")).unwrap();
     fs::write(dir.join("velora-host"), "host v1").unwrap();
@@ -155,17 +132,14 @@ fn updates_only_changed_files() {
     let files = [("velora-host", &b"host v2"[..]), ("velora", b"client v2"), ("lib/libav.so.1", b"same lib")];
     let entries: Vec<FileEntry> = files.iter().map(|(p, d)| entry(p, d)).collect();
     let manifest = Manifest { version: "0.9.0".into(), targets: BTreeMap::from([(TARGET.into(), entries.clone())]) };
-    let (bytes, sig) = signed(&manifest, &key);
-    let mut served = HashMap::from([
-        (format!("/releases/latest/download/{MANIFEST}"), bytes),
-        (format!("/releases/latest/download/{SIGNATURE}"), sig.into_bytes()),
-    ]);
+    let mut served =
+        HashMap::from([(format!("/releases/latest/download/{MANIFEST}"), serde_json::to_vec(&manifest).unwrap())]);
     for (e, (_, data)) in entries.iter().zip(&files) {
         served.insert(format!("/releases/download/v0.9.0/{}", e.asset), data.to_vec());
     }
     let (base, log) = serve(served);
 
-    let updater = Updater::new(base.clone(), public.clone(), TARGET.into(), dir.clone(), Version(0, 1, 0));
+    let updater = Updater::new(base.clone(), TARGET.into(), dir.clone(), Version(0, 1, 0));
     let update = updater.check().unwrap().expect("newer version available");
     assert_eq!(update.version, Version(0, 9, 0));
     let paths: Vec<_> = update.files.iter().map(|f| f.path.as_str()).collect();
@@ -185,26 +159,23 @@ fn updates_only_changed_files() {
     assert!(!dir.join("velora-host.old").exists());
 
     // Same version is not offered again; a newer local build ignores older releases.
-    let current = Updater::new(base.clone(), public.clone(), TARGET.into(), dir.clone(), Version(0, 9, 0));
+    let current = Updater::new(base.clone(), TARGET.into(), dir.clone(), Version(0, 9, 0));
     assert!(current.check().unwrap().is_none());
-    let newer = Updater::new(base, public, TARGET.into(), dir, Version(1, 0, 0));
+    let newer = Updater::new(base, TARGET.into(), dir, Version(1, 0, 0));
     assert!(newer.check().unwrap().is_none());
 }
 
 #[test]
 fn corrupted_download_changes_nothing() {
-    let (key, public) = keypair();
     let dir = temp_dir("corrupt");
     fs::write(dir.join("velora-host"), "host v1").unwrap();
     let e = entry("velora-host", b"host v2");
     let manifest = Manifest { version: "0.9.0".into(), targets: BTreeMap::from([(TARGET.into(), vec![e.clone()])]) };
-    let (bytes, sig) = signed(&manifest, &key);
     let (base, _) = serve(HashMap::from([
-        (format!("/releases/latest/download/{MANIFEST}"), bytes),
-        (format!("/releases/latest/download/{SIGNATURE}"), sig.into_bytes()),
+        (format!("/releases/latest/download/{MANIFEST}"), serde_json::to_vec(&manifest).unwrap()),
         (format!("/releases/download/v0.9.0/{}", e.asset), b"host vX".to_vec()),
     ]));
-    let updater = Updater::new(base, public, TARGET.into(), dir.clone(), Version(0, 1, 0));
+    let updater = Updater::new(base, TARGET.into(), dir.clone(), Version(0, 1, 0));
     let update = updater.check().unwrap().unwrap();
     let err = updater.install(&update).unwrap_err();
     assert!(format!("{err:#}").contains("does not match"), "{err:#}");
