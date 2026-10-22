@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/protocol", "crates/host", "crates/client-core", "crates/client", "crates/update", "crates/release", "crates/mobile", "crates/uniffi-bindgen"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/Yanngc32/Velora"
