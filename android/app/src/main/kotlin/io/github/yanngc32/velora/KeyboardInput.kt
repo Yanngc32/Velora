@@ -8,6 +8,8 @@ import android.view.inputmethod.BaseInputConnection
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputConnection
 import android.view.inputmethod.InputMethodManager
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
 
 /** Receives what the soft keyboard produces. */
 interface KeyboardSink {
@@ -37,13 +39,20 @@ class KeyboardInput(context: Context, private val sink: KeyboardSink) : View(con
         return Connection()
     }
 
+    /**
+     * Shows or hides the keyboard, by whether it is on screen. The input method's own state
+     * can't tell: once this view has focus it stays connected and accepting text while hidden.
+     * The show request is explicit (flags 0), since keyboards may ignore an implicit one, and
+     * posted, so the input method has connected to this view once it has focus.
+     */
     fun toggle() {
         val imm = context.getSystemService(InputMethodManager::class.java) ?: return
-        requestFocus()
-        if (!imm.isActive(this) || !imm.isAcceptingText) {
-            imm.showSoftInput(this, InputMethodManager.SHOW_IMPLICIT)
-        } else {
+        val visible = ViewCompat.getRootWindowInsets(this)?.isVisible(WindowInsetsCompat.Type.ime()) ?: false
+        if (visible) {
             imm.hideSoftInputFromWindow(windowToken, 0)
+        } else {
+            requestFocus()
+            post { imm.showSoftInput(this, 0) }
         }
     }
 
