@@ -3,9 +3,9 @@
 Branch `claude/reach-f1-client-plumbing-fff4e6` (from 35081ec). Files: `crates/client-core/src/{lib,hosts}.rs`, `src/reach/{mod,dht,relay,punch}.rs`,
 `crates/client-core/Cargo.toml` and, as its consequence, three lines of `Cargo.lock`. `dht.rs`, `relay.rs` and `punch.rs` are stubs:
 `reach/mod.rs` can only declare them if the files exist, so F1 creates them and F2, F3, F4 own them from the merge on. No exported
-function changed its signature. 46 tests (5 before, 41 new), fmt, clippy `-D warnings` and `cargo test -p velora-client-core` green on
-Windows; `cargo check -p velora-mobile` compiles. Linux and Android were not compiled here. I also broke the code on purpose 13 ways
-(stagger, relay delay, dedupe, the hello bit, `Reached` never sent, `remember` dropping reach data, `store_reach` erasing the key, ...)
+function changed its signature. 47 tests (5 before, 42 new), fmt, clippy `-D warnings` and `cargo test -p velora-client-core` green on
+Windows; `cargo check -p velora-mobile` compiles. Linux and Android were not compiled here. I also broke the code on purpose 14 ways
+(stagger, relay delay, dedupe, the hello bit, `Reached` never sent, `remember` dropping reach data, `store_reach` erasing the key, two addresses of one relay dialed together, ...)
 and each made at least one test fail.
 
 ## Public surface (what the other tickets and the UIs can use)
@@ -60,6 +60,10 @@ First batch: `addr`, `also`, then the rest of the host's last `Reach` list (`Dir
 - Direct candidates start `ADDRESS_STAGGER` (250 ms) apart, counted from when they arrive, so a late one never jumps the queue.
 - Relays and punches start `RELAY_DELAY` / `PUNCH_DELAY` (2 s each) after the first direct one, 250 ms apart among themselves; with no direct candidate
   they start at once; one that arrives with a direct candidate in the same batch counts from it.
+- Two addresses of the same relay for the same host start `RELAY_ADDRESS_STAGGER` (2 s) apart (other relays are not held up): D2 serves one client per
+  host and a second `RelayTo` from the same device takes the first over, so a relay reachable at both its IPv4 and IPv6 address gets one dial, not two
+  that cancel each other. There is one candidate per relay address, so a dial that is still running when the next address starts can be taken over
+  (`CLOSE_TAKEN_OVER`): it should fail at once.
 - `resolve_record` is asked `LOOKUP_DELAY` (500 ms) after the start, or at once when nothing is running or waiting: a LAN address that answers in
   milliseconds never touches the DHT.
 - A way of reaching the host runs once (same address, or same relay and target), however often it is proposed; at most `MAX_CANDIDATES` (32) run.
@@ -97,8 +101,10 @@ First batch: `addr`, `also`, then the rest of the host's last `Reach` list (`Dir
    rebuilds one from `dir()` (parent + file name, which is how `StateDir::open` made it). `#[derive(Clone)]` on `StateDir` (T0's `identity.rs`) would
    remove it.
 7. **Listeners add up** (`on_reach`), unlike `on_displays`, which has one: the file-saving listener must not be replaced by a UI's.
-8. **`MAX_CANDIDATES` = 32.** A hostile or buggy host could list 8 relays of 16 addresses; each candidate is a socket and a handshake.
-9. **Not consumed:** the pairing link's `key=` / `secret=` (T0 added them to `PairingLink`). `hosts::pair` takes address and code, so using them would
+8. **`RELAY_ADDRESS_STAGGER` = 2 s** (added after reading D2's note): the alternative, one candidate per relay with all its addresses, would have changed the
+   ticket's `Relay { relay_addr, .. }` and made `Route.address` ambiguous.
+9. **`MAX_CANDIDATES` = 32.** A hostile or buggy host could list 8 relays of 16 addresses; each candidate is a socket and a handshake.
+10. **Not consumed:** the pairing link's `key=` / `secret=` (T0 added them to `PairingLink`). `hosts::pair` takes address and code, so using them would
    need a new function; the `Reach` that follows the first welcome gives the same values, so nothing is lost but the DHT before the first connection.
 
 ## Gotchas
@@ -109,6 +115,8 @@ First batch: `addr`, `also`, then the rest of the host's last `Reach` list (`Dir
 - Do not use tokio's paused clock with real QUIC sockets: the virtual clock jumps whenever the runtime waits on I/O. The race tests use fake dials for that.
 - Several lanes that build `velora-client-core` into one `CARGO_TARGET_DIR` collide on the artifact hash (see the B2 note): `touch crates/client-core/src/*.rs`
   before each cargo command and check the test names.
+- D2 serves one client per host and device: a files window (`connect_files`) and a session through the same relay, or two `velora` processes, take each
+  other over. Nothing in F1 prevents it (they are separate connections, usually separate processes); F3 and G2 should know.
 - `ReachInfo` hands over `relays_for_others`, but `KnownHost` has no field for it (T0): F3 cannot tell from the stored entry whether a listed relay still
   accepts `RelayTo`. A relay in `KnownHost.relays` is one the *host* is registered with, so it did at that time.
 

@@ -25,6 +25,7 @@
 //! spawn on a multi-threaded runtime. All of them must be `Send`, and a test in `lib.rs` fails to compile otherwise.
 
 use std::{
+    collections::HashMap,
     fmt,
     future::Future,
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -59,6 +60,11 @@ pub const ADDRESS_STAGGER: Duration = Duration::from_millis(250);
 /// Relays start this long after the first direct address: a relay costs the relaying PC bandwidth and the session a hop,
 /// so it is the way in when nothing direct answers, not a competitor of the direct addresses.
 pub const RELAY_DELAY: Duration = Duration::from_secs(2);
+/// Two addresses of the same relay, for the same host, start this far apart. A relay lets one client reach a host at a
+/// time and a second `RelayTo` from the same device takes the first over (D2's decision 2), so the second address waits
+/// until the first has had time to finish: a relay reachable at both its IPv4 and IPv6 address still gets one dial, not two
+/// that cancel each other.
+pub const RELAY_ADDRESS_STAGGER: Duration = Duration::from_secs(2);
 /// Hole punching starts as late as the relays: the relay is the sure path and the punch is the one that saves its hop,
 /// so the two run side by side and whichever completes first wins. Field tests (I4) tune this, here and in one place.
 pub const PUNCH_DELAY: Duration = Duration::from_secs(2);
@@ -314,7 +320,8 @@ fn relay_candidates(host: &KnownHost, target: Fingerprint) -> Vec<Candidate> {
 // ---- the race ----
 
 /// When each candidate may start. Direct addresses go one stagger apart; relays and punches wait for their delay after
-/// the first direct one (at once when there is none) and go one stagger apart among themselves.
+/// the first direct one (at once when there is none) and go one stagger apart among themselves, except that addresses of
+/// the same relay keep [`RELAY_ADDRESS_STAGGER`] between them.
 #[derive(Default)]
 struct Slots {
     /// When the first direct candidate starts: the others count their delay from it.
@@ -323,6 +330,8 @@ struct Slots {
     next_direct: Option<Instant>,
     /// Earliest start of the next relay or punch.
     next_slow: Option<Instant>,
+    /// Earliest start of the next candidate through each relay, for each host (the relay's fingerprint, the host's).
+    same_relay: HashMap<(Fingerprint, Fingerprint), Instant>,
 }
 
 impl Slots {
@@ -336,10 +345,19 @@ impl Slots {
                 at
             }
             Candidate::Relay { .. } | Candidate::Punch { .. } => {
-                let delay = if matches!(candidate, Candidate::Relay { .. }) { RELAY_DELAY } else { PUNCH_DELAY };
+                let (delay, relay) = match candidate {
+                    Candidate::Relay { relay_fingerprint, target, .. } => {
+                        (RELAY_DELAY, Some((*relay_fingerprint, *target)))
+                    }
+                    _ => (PUNCH_DELAY, None),
+                };
                 let after_direct = self.first_direct.map_or(now, |first| first + delay);
-                let at = after_direct.max(now).max(self.next_slow.unwrap_or(now));
-                self.next_slow = Some(at + ADDRESS_STAGGER);
+                // The slot in the lane of relays and punches; waiting for the same relay does not hold up the others.
+                let lane = after_direct.max(now).max(self.next_slow.unwrap_or(now));
+                self.next_slow = Some(lane + ADDRESS_STAGGER);
+                let Some(relay) = relay else { return lane };
+                let at = lane.max(self.same_relay.get(&relay).copied().unwrap_or(now));
+                self.same_relay.insert(relay, at + RELAY_ADDRESS_STAGGER);
                 at
             }
         }
@@ -413,7 +431,8 @@ type Asked = std::result::Result<Result<Vec<Candidate>>, Elapsed>;
 /// of their own, so they must be `Send`, and a panic in one costs that candidate (or the lookup) and nothing else.
 ///
 /// Rules: direct candidates start [`ADDRESS_STAGGER`] apart; relays and punches wait [`RELAY_DELAY`] and
-/// [`PUNCH_DELAY`] after the first direct one (when none exists they start at once); a way of reaching the host runs
+/// [`PUNCH_DELAY`] after the first direct one (when none exists they start at once), and addresses of the same relay
+/// [`RELAY_ADDRESS_STAGGER`] apart; a way of reaching the host runs
 /// once, however often it is proposed; at most [`MAX_CANDIDATES`] run. The error, when none connects, is the failure of
 /// the earliest candidate accepted (the main address, normally): the one that says most.
 pub(crate) async fn race<T, D, F, L>(first: Vec<Candidate>, lookup: Option<L>, dial: D) -> Result<(Candidate, T)>
@@ -851,6 +870,20 @@ mod tests {
             vec![(direct(1), 0), (punch(8), 2000), (relay(7), 2250), (relay(6), 2500)],
             "in the order they were listed, since both wait the same"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn two_addresses_of_one_relay_are_not_dialed_together_but_another_relay_is_not_held_up() {
+        let at_address = |relay: u8, address: u8| Candidate::Relay {
+            relay_addr: addr(address),
+            relay_fingerprint: Fingerprint([relay; 32]),
+            target: HOST,
+        };
+        let (first, second, other) = (at_address(7, 10), at_address(7, 11), at_address(8, 12));
+        let run =
+            run(vec![direct(1), first.clone(), second.clone(), other.clone()], None, |_| Answer::Fails(ms(9000))).await;
+        // The relay lane is 250 ms a candidate, and the second address of relay 7 waits 2 s after the first.
+        assert_eq!(run.starts, vec![(direct(1), 0), (first, 2000), (other, 2500), (second, 4000)]);
     }
 
     #[tokio::test(start_paused = true)]

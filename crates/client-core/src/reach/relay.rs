@@ -23,10 +23,15 @@ use crate::ConnectParams;
 /// ordinary Velora hello on it. The endpoint owns whatever carries the tunnel (the outer connection to the relay, tasks),
 /// so keeping it alive keeps the path up and dropping it ends everything; the caller keeps it for the session's lifetime.
 ///
-/// **Timing.** The race starts it [`RELAY_DELAY`](super::RELAY_DELAY) after the first direct address, and drops it when
-/// another candidate wins: the future must be cancel-safe and `Send` (it is spawned). It fails with an error the race logs
-/// at debug level; the dial has no timeout of its own in the race, so it must give up by itself (a relay that does not
-/// answer, a `RelayStatus` that is not ok).
+/// **Timing.** The race starts it [`RELAY_DELAY`](super::RELAY_DELAY) after the first direct address and drops it when
+/// another candidate wins, so the future must be cancel-safe and `Send` (it is spawned). It must give up by itself, with an
+/// error the race logs at debug level (the race has no timeout for it): a relay that does not answer, a `RelayStatus` that is
+/// not ok.
+///
+/// **One dial per relay and host.** A candidate is one address of a relay. A relay serves one client per host, and a second
+/// `RelayTo` from this device takes the first over (`CLOSE_TAKEN_OVER`), so the race keeps the addresses of one relay
+/// [`RELAY_ADDRESS_STAGGER`](super::RELAY_ADDRESS_STAGGER) apart. A dial that is still going when the next address starts may
+/// be taken over: it should fail at once, not try again.
 pub async fn dial_relay(
     _params: &ConnectParams,
     _relay_addr: SocketAddr,
