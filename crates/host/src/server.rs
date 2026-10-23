@@ -1020,6 +1020,27 @@ async fn run_session(
     result
 }
 
+/// Opens the encoder for `capturer`'s frames: on its GPU when `gpu` allows and the encoder can
+/// take them there, else from memory. The capture follows the encoder's choice.
+fn open_encoder(
+    choice: &EncoderChoice,
+    settings: EncoderSettings,
+    rect: DisplayRect,
+    capturer: &mut dyn capture::Capturer,
+    gpu: bool,
+) -> Result<Box<dyn encode::VideoEncoder>> {
+    #[cfg(windows)]
+    let device = if gpu { capturer.device() } else { None };
+    #[cfg(not(windows))]
+    let device: Option<encode::GpuDevice> = {
+        let _ = gpu;
+        None
+    };
+    let encoder = encode::open(choice, settings, rect.width, rect.height, device.as_ref())?;
+    capturer.set_gpu_frames(encoder.on_gpu());
+    Ok(encoder)
+}
+
 fn capture_loop(
     session: &Session,
     choice: &EncoderChoice,
@@ -1029,10 +1050,12 @@ fn capture_loop(
     input: &InputHandle,
 ) -> Result<()> {
     let mut shown = session.display.load(Ordering::Relaxed);
+    // Frames stay on the GPU for encoders that take them there, until that fails once.
+    let mut gpu = encode::zero_copy();
     let setup = || -> Result<_> {
-        let capturer = capture::open(shown)?;
+        let mut capturer = capture::open(shown)?;
         let rect = capturer.rect();
-        let encoder = encode::open(choice, settings, rect.width, rect.height)?;
+        let encoder = open_encoder(choice, settings, rect, capturer.as_mut(), gpu)?;
         tracing::info!("encoder: {}", encoder.name());
         Ok((capturer, encoder))
     };
@@ -1063,7 +1086,7 @@ fn capture_loop(
                     rect = capturer.rect();
                     input.send(InputCmd::SetDisplay(rect));
                     let settings = EncoderSettings { bitrate_kbps: bitrate, ..settings };
-                    encoder = encode::open(choice, settings, rect.width, rect.height)?;
+                    encoder = open_encoder(choice, settings, rect, capturer.as_mut(), gpu)?;
                     session.keyframe_requested.store(true, Ordering::Relaxed);
                     have_picture = false;
                     shown = wanted;
@@ -1119,14 +1142,34 @@ fn capture_loop(
             bitrate = target;
             if !encoder.set_bitrate(target) {
                 let settings = EncoderSettings { bitrate_kbps: target, ..settings };
-                encoder = encode::open(choice, settings, rect.width, rect.height)?;
+                encoder = open_encoder(choice, settings, rect, capturer.as_mut(), gpu)?;
                 session.keyframe_requested.store(true, Ordering::Relaxed);
+                continue;
             }
+        }
+        // Captured before the encoder switched between the GPU and memory: wait for the next.
+        #[cfg(windows)]
+        if frame.as_ref().is_some_and(|f| f.texture.is_some() != encoder.on_gpu()) {
+            session.keyframe_requested.store(true, Ordering::Relaxed);
+            continue;
         }
         let keyframe = keyframe || session.keyframe_requested.load(Ordering::Relaxed);
         session.keyframe_requested.store(false, Ordering::Relaxed);
         let encode_start = Instant::now();
-        let encoded = encoder.encode(frame.as_ref(), keyframe)?;
+        let encoded = match encoder.encode(frame.as_ref(), keyframe) {
+            Ok(encoded) => encoded,
+            // Encoding on the GPU is the newer path: if it fails, copy frames to memory instead.
+            Err(e) if encoder.on_gpu() => {
+                tracing::warn!("encoding frames on the GPU failed: {e:#}; copying them to memory instead");
+                gpu = false;
+                let settings = EncoderSettings { bitrate_kbps: bitrate, ..settings };
+                encoder = open_encoder(choice, settings, rect, capturer.as_mut(), gpu)?;
+                session.keyframe_requested.store(true, Ordering::Relaxed);
+                have_picture = false;
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
         {
             let mut stats = session.stats.lock().unwrap();
             stats.convert_time += encoded.convert_time;

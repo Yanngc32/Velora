@@ -53,8 +53,8 @@ image quality.
     </td>
     <td width="33%" valign="top">
       <b>🎮 GPU end to end</b><br>
-      NVENC, AMF, Quick Sync or VA-API encoding. On Windows, GPU decoding shown in place:
-      2.7 ms per frame at 1080p.
+      NVENC, AMF, Quick Sync or VA-API encoding. On Windows, frames stay on the GPU from
+      capture to encoder and from decoder to screen.
     </td>
     <td width="33%" valign="top">
       <b>📶 Adaptive bitrate</b><br>
@@ -421,6 +421,12 @@ If none opens, it falls back to software. To force one, pass `--encoder nvenc|am
 or `--encoder ffmpeg:<name>` for any FFmpeg encoder. All hardware encoders are configured for
 low latency: no B-frames, CBR, no lookahead, and keyframes only on demand.
 
+On Windows, NVENC, AMF and Quick Sync take frames without them leaving the GPU: the D3D11
+video processor converts the captured desktop to NV12 on the GPU that captured it, straight
+into the encoder's own textures, and the CPU does none of it (measured with Quick Sync on an
+Intel UHD 750: about 5 ms per 1080p frame). If that path fails, the host goes back to
+converting on the CPU; `VELORA_ZERO_COPY=0` keeps it there.
+
 The bitrate adapts to the network: `--bitrate` (12000 kbit/s by default) is the most. When
 frames take well longer than usual to be acknowledged, or the host has to hold frames back,
 it drops to 70% (down to a tenth of the most); once the path keeps up, it climbs back step by
@@ -486,9 +492,8 @@ the Rust core and generates its Kotlin bindings.
 
 ## Roadmap
 
-1. **Zero-copy GPU pipeline.** Hardware encoders work today, but frames still go through CPU
-   color conversion and an upload. Next: convert on the GPU (D3D11 video processor, VA-API VPP)
-   and hand the DXGI texture straight to the encoder.
+1. **Zero-copy capture on Linux.** On Windows, captured frames reach the encoder without
+   leaving the GPU; on Linux they are still converted on the CPU and uploaded. Next: VA-API VPP.
 2. **Zero-copy decoding on Linux.** Windows decodes and shows pictures without leaving the
    GPU; VA-API still copies them back. Next: import the VA-API surface into EGL (dma-buf).
 3. **Mobile:** an iOS app (Swift + VideoToolbox) on the same `velora-mobile` core. On Android:

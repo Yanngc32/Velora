@@ -88,7 +88,7 @@ mod tests {
             ([255, 0, 0], (41, 240, 110)), // blue
         ] {
             let data = solid(4, 2, bgr);
-            let (y, u, v) = convert_planar(&Frame { width: 4, height: 2, stride: 16, data: &data });
+            let (y, u, v) = convert_planar(&Frame::new(4, 2, 16, &data));
             let (y, u, v) = (y[0] as i32, u[0] as i32, v[0] as i32);
             assert!(
                 (y - yuv.0).abs() <= 1 && (u - yuv.1).abs() <= 1 && (v - yuv.2).abs() <= 1,
@@ -100,7 +100,7 @@ mod tests {
     #[test]
     fn crops_odd_dimensions_and_honors_stride() {
         let data = vec![128u8; 32 * 3];
-        let frame = Frame { width: 5, height: 3, stride: 32, data: &data };
+        let frame = Frame::new(5, 3, 32, &data);
         assert_eq!(even_dims(&frame), (4, 2));
         let (y, u, v) = convert_planar(&frame);
         assert_eq!((y.len(), u.len(), v.len()), (8, 2, 2));
@@ -109,7 +109,7 @@ mod tests {
     #[test]
     fn nv12_matches_planar() {
         let data: Vec<u8> = (0..8 * 4 * 4).map(|i| (i * 37 % 256) as u8).collect();
-        let frame = Frame { width: 8, height: 4, stride: 32, data: &data };
+        let frame = Frame::new(8, 4, 32, &data);
         let (y, u, v) = convert_planar(&frame);
         let (mut y2, mut uv) = (vec![0; 32], vec![0; 16]);
         bgrx_to_yuv420(&frame, &mut y2, 8, Chroma::Interleaved { uv: &mut uv, stride: 8 });
