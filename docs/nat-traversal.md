@@ -162,13 +162,13 @@ Spike first (1 day): confirm with `mainline` 8 on this network the observed addr
 What: the host publishes a signed, encrypted record in the Mainline DHT (BEP 44 mutable
 item). `mainline` 8.0.1 implements BEP 44 (`MutableItem::new(signing_key, value, seq, salt)`,
 `put_mutable`, `get_mutable_most_recent`) and BEP 42 (observed public address), and can save
-its routing table (`to_bootstrap()`) so the next start joins in well under a second without
-touching the bootstrap nodes.
+its routing table (`to_bootstrap()`) so the next start has its first nodes after about 0.1 s
+(the default bootstrap names stay in the list as a fallback; the spike measured it, §14).
 
 ```
 key    = Ed25519 public key of the device (new; stored next to the identity)
 salt   = "velora/1"
-seq    = unix time at publish (monotonic across restarts without a counter file)
+seq    = max(unix time at publish, last seq + 1)   (an equal seq is silently ignored)
 value  = { fingerprint, addresses: [kind:ip:port...], nat: open|cone|symmetric, relays: [...],
            mac } encrypted as below. BEP 44 allows 1000 bytes of bencoded value: 996 of ours.
            This is ~300 with 8 addresses.
@@ -187,8 +187,9 @@ about 245 characters and eight no longer fit in 300, so it carries what a first 
 needs and the rest arrives in `HostMsg::Reach`)
 or, for devices paired before this version, from `HostMsg::Reach` on their next connection.
 On connect, the client fetches the record (about a second warm, a few seconds cold) and
-adds its addresses to the race. The host republishes every 30 minutes (nodes keep items for
-about two hours) and whenever an address changes.
+adds its addresses to the race. The host republishes every 30 minutes (the spike found an item
+still there an hour after one publish; the longer rows are in `docs/dht-spike.md`) and
+whenever an address changes.
 
 Why a new key: BEP 44 signs with Ed25519 and the TLS identity is ECDSA P-256. Changing the
 certificate's key would change every fingerprint and break every pairing, so the Ed25519 key
@@ -212,8 +213,10 @@ Risks:
   the client has.
 - The session process (`velora connect`) starts a DHT client each time: with the saved
   routing table it is fast; without it (first run, long offline) a few seconds.
-- A DHT client sends a few hundred small UDP packets per minute while running. The host keeps
-  one running; the client only during connect.
+- An idle DHT client node sends about 50 datagrams a minute and costs 0.085% of a core; a
+  lookup is about 500 datagrams and a publish from a fresh node about 1,000 (the spike). The
+  host may open a node for each publish round instead of keeping one running; the client only
+  during connect.
 
 ### Phase 4: relay through a machine the user already has (before phase 3)
 
@@ -280,10 +283,13 @@ host the socket already belongs to quinn, so the host's endpoint uses a small
 Comparing the observed port across several nodes also tells the NAT type for free.
 
 Signaling: through R when the host is registered with one (sub-second, the normal case once
-phase 4 exists); otherwise the client publishes a punch request as its own DHT item
-("to H, from endpoint E, nonce") encrypted for H, and a sharing host without a relay polls
-the items of its paired clients every 10 s, and every 2 s for five minutes after a client was
-last connected. Either way the host then sends to E, which it can do without raw socket
+phase 4 exists); otherwise the client publishes a punch request as a DHT item ("to H, from
+endpoint E, nonce") sealed with its device secret and signed by a key derived from that same
+secret, so the host can compute the key of each paired device without any message to carry
+it, and a sharing host without a relay polls those items every 30-60 s, with a short burst
+after a client was last connected (polling is the dearest thing in the plan: about 10
+datagrams a second per client at 10 s, §14). Either way the host then sends to E, which it
+can do without raw socket
 access: `Endpoint::connect_with` toward E sends an Initial from the listening port, which is
 enough to open the mapping; the attempt is dropped when the client's own connection arrives.
 The client keeps dialing the host's observed endpoint; its Initial retransmissions ride the
@@ -473,3 +479,15 @@ hand-over notes are in `docs/reach-handover/`. What they changed:
    STUN server sees the PC at one public address with the source port unchanged. Phase 1
    cannot map a port there; the DHT record, hole punching (the NAT is endpoint-independent)
    and the relay are what is left, which is the case the later phases are for.
+7. **A DHT lookup is cheap to start and dear to repeat** (spike). The first value of a resolve
+   arrives after about 0.5 s from a saved table (1.2 s cold); a cold start sometimes asks only
+   the bootstrap addresses and finds nothing, so a resolve retries once on the same node; a
+   publish counts only when at least 8 nodes stored it. A repeated lookup from a running node
+   is about 70 datagrams, so the host's poll for punch requests is every 30-60 s with a short
+   burst after a disconnect, not every 10 s and every 2 s.
+8. **The punch item is signed with a key derived from the device secret.** Nothing in the
+   protocol tells a host a paired client's public key, and a secret is per (host, device), so
+   both ends can compute the same key and a constant salt is enough.
+9. **`mainline` may turn a node into a server.** After 15 minutes it switches to server mode if
+   it believes it is reachable, and 8.0.1 cannot switch that off: on an open network a Velora
+   node would then answer DHT queries and store other people's items.

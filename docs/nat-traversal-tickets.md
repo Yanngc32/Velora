@@ -5,8 +5,8 @@ Companion to [nat-traversal.md](nat-traversal.md) (revision 2). Status: in progr
 | Wave | Tickets | State |
 |---|---|---|
 | 0 | W0 | done, 2026-10-23 |
-| 1 | T0 S0 B1 B2 B3 C1 D1 | built and merged into `standalone-reach`, 2026-10-23 (S0: lifetime numbers pending) |
-| 2 | E1 F1 G1 C2 C3 D2 | not started |
+| 1 | T0 S0 B1 B2 B3 C1 D1 | built and merged into `standalone-reach`, 2026-10-23 (S0: the 120 and 180 minute lifetime rows and a run on another network are pending) |
+| 2 | E1 F1 G1 C2 C3 D2 | in progress since 2026-10-23 |
 | 3 | E2-E6 F2-F5 G2 G3 | not started |
 | 4 | I1-I4 H1 H2 | not started |
 
@@ -192,13 +192,15 @@ Owns `src/node.rs`.
   is one; `publish(keys, salt, bytes, seq)`; `resolve(public_key, salt) -> Option<(bytes,
   seq)>`; `observed_address()`; `save_cache()`; sequence number = unix time.
 - Done when: an integration test (ignored in CI, run by hand) publishes from one process and
-  resolves from another; the warm start is under a second with a cache.
+  resolves from another; the first value of a resolve comes in under a second from a saved
+  table (the spike's measure; `docs/dht-spike.md` §10 lists the other amendments to this ticket).
 
 ### C3 — Punch request item
 velora-dht · wave 2 · 0.5 d · after C1 · parallel with everything in wave 2.
 Owns `src/punch_item.rs`.
-- Salt `velora/punch/<host key prefix>`, value `{ endpoint, nonce, ts }` sealed for the host
-  only; `seq` = unix time.
+- Salt `velora/punch/1`, value `{ endpoint, nonce, ts }` sealed with the device secret as its
+  only recipient and signed by a key derived from that secret (HKDF), so the host can compute
+  the key of each paired device; `seq` = unix time.
 - Done when: round-trip test; a stale item (older than 60 s) is rejected on open.
 
 ### D1 — Relay framing
@@ -283,8 +285,8 @@ Owns `src/reach/punch.rs`, `src/reach/poll.rs`.
   NAT type in `ReachState`; on a `PunchRequest` (from a relay connection, or from the DHT
   poller) send toward the client's endpoint with `Endpoint::connect_with` and drop the
   attempt when the client's connection arrives; `poll.rs`: when standalone reach is on and no
-  relay is registered, resolve paired clients' punch items every 10 s, and every 2 s for five
-  minutes after a client disconnects.
+  relay is registered, resolve paired clients' punch items every 30-60 s, with a short burst
+  after a client disconnects (a poll every 10 s is about 10 datagrams a second per client).
 - Done when: a loopback test with a simulated endpoint-independent NAT (a small UDP proxy in
   the test) completes a handshake through the punch; the poller is tested with a fake node.
 
