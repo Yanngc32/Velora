@@ -10,7 +10,7 @@ use std::{
     net::SocketAddr,
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -25,7 +25,8 @@ use velora_protocol::{
     pairing::{pairing_uri_with, parse_pairing_uri, PairingCode},
     tls::{self, Fingerprint},
     wire::{
-        self, ClientMsg, Codec, FrameHeader, HostMsg, MouseMove, FEATURE_CLIPBOARD, FEATURE_FILES, PROTOCOL_VERSION,
+        self, ClientMsg, Codec, DisplayInfo, DisplayList, FrameHeader, HelloExt, HostMsg, MouseMove, FEATURE_CLIPBOARD,
+        FEATURE_FILES, PROTOCOL_VERSION,
     },
 };
 
@@ -295,7 +296,7 @@ async fn handle_connection(incoming: quinn::Incoming, shared: Arc<Shared>) -> Re
     let peer = Peer { shared: shared.clone(), name: name.clone(), fingerprint, clipboard };
     // The screen stays on while the device watches it.
     let _screen = shared.awake.screen_on();
-    let result = run_session(&conn, send, recv, &shared, features, addresses, peer).await;
+    let result = run_session(&conn, send, recv, &shared, ext, addresses, peer).await;
 
     shared.input.send(InputCmd::ReleaseAll);
     let mut active = shared.active.lock().unwrap();
@@ -756,6 +757,12 @@ struct Session {
     max_in_flight: AtomicU32,
     last_ack: Mutex<Instant>,
     stats: Mutex<Stats>,
+    /// The display the client asked for, by index in `capture::list()`.
+    display: AtomicUsize,
+    /// The display being captured, once the capture thread switched to it.
+    shown: AtomicUsize,
+    /// The capture thread switched displays (or could not): tell the client.
+    display_changed: tokio::sync::Notify,
 }
 
 /// Deliveries and waits of the current rate control period.
@@ -793,12 +800,16 @@ async fn run_session(
     mut control_send: quinn::SendStream,
     mut control_recv: quinn::RecvStream,
     shared: &Arc<Shared>,
-    features: Option<u32>,
+    ext: Option<HelloExt>,
     addresses: Vec<String>,
     peer: Peer,
 ) -> Result<()> {
     let client_name = peer.name.clone();
     let opts = &shared.options;
+    let features = ext.map(|_| FEATURE_FILES | FEATURE_CLIPBOARD);
+    // Sessions start on the primary display.
+    let displays = capture::list();
+    let first = displays.iter().position(|d| d.primary).unwrap_or(0);
     let session = Arc::new(Session {
         running: AtomicBool::new(true),
         keyframe_requested: AtomicBool::new(true),
@@ -808,6 +819,9 @@ async fn run_session(
         max_in_flight: AtomicU32::new(MIN_IN_FLIGHT + 1),
         last_ack: Mutex::new(Instant::now()),
         stats: Mutex::new(Stats::default()),
+        display: AtomicUsize::new(first),
+        shown: AtomicUsize::new(first),
+        display_changed: tokio::sync::Notify::new(),
     });
 
     let (frame_tx, mut frame_rx) = mpsc::channel::<OutFrame>(4);
@@ -851,6 +865,33 @@ async fn run_session(
         )
         .await?;
 
+    // Clients that can pick a display hear which there are, now and after every switch.
+    let offer_displays = ext.is_some_and(|e| e.displays) && displays.len() > 1;
+    let display_list = |current: usize| {
+        let list = displays
+            .iter()
+            .map(|d| DisplayInfo {
+                name: d.name.clone(),
+                width: d.rect.width.min(u16::MAX as u32) as u16,
+                height: d.rect.height.min(u16::MAX as u32) as u16,
+                primary: d.primary,
+            })
+            .collect();
+        HostMsg::Displays(DisplayList { current: current as u8, list })
+    };
+    if offer_displays {
+        control_send.write_all(&display_list(first).encode()).await?;
+    }
+    let announce = async {
+        if !offer_displays {
+            return std::future::pending().await;
+        }
+        loop {
+            session.display_changed.notified().await;
+            control_send.write_all(&display_list(session.shown.load(Ordering::Relaxed)).encode()).await?;
+        }
+    };
+
     let video = async {
         while let Some(frame) = frame_rx.recv().await {
             let header =
@@ -885,6 +926,10 @@ async fn run_session(
                 }
                 ClientMsg::Text { text } => shared.input.send(InputCmd::Text(text)),
                 ClientMsg::OfferPairing { link } => shared.offer(&client_name, link),
+                ClientMsg::SelectDisplay { index } if (index as usize) < displays.len() => {
+                    session.display.store(index as usize, Ordering::Relaxed)
+                }
+                ClientMsg::SelectDisplay { index } => tracing::debug!("no display {index}"),
                 ClientMsg::Unsupported { tag } => tracing::debug!("ignoring unsupported message {tag}"),
                 ClientMsg::Hello { .. } => bail!("unexpected hello"),
             }
@@ -947,6 +992,7 @@ async fn run_session(
         r = control => r,
         r = pointer => r,
         r = monitor => r,
+        r = announce => r,
         r = crate::transfer::accept(conn.clone(), peer) => r,
         e = conn.closed() => Err(e.into()),
     };
@@ -962,8 +1008,9 @@ fn capture_loop(
     ready: oneshot::Sender<Result<DisplayRect>>,
     input: &InputHandle,
 ) -> Result<()> {
+    let mut shown = session.display.load(Ordering::Relaxed);
     let setup = || -> Result<_> {
-        let capturer = capture::open()?;
+        let capturer = capture::open(shown)?;
         let rect = capturer.rect();
         let encoder = encode::open(choice, settings, rect.width, rect.height)?;
         tracing::info!("encoder: {}", encoder.name());
@@ -987,6 +1034,30 @@ fn capture_loop(
     let mut last_capture = Instant::now() - interval;
 
     while session.running.load(Ordering::Relaxed) {
+        // The client picked another display: capture it instead, at its size.
+        let wanted = session.display.load(Ordering::Relaxed);
+        if wanted != shown {
+            match capture::open(wanted) {
+                Ok(next) => {
+                    capturer = next;
+                    rect = capturer.rect();
+                    input.send(InputCmd::SetDisplay(rect));
+                    let settings = EncoderSettings { bitrate_kbps: bitrate, ..settings };
+                    encoder = encode::open(choice, settings, rect.width, rect.height)?;
+                    session.keyframe_requested.store(true, Ordering::Relaxed);
+                    have_picture = false;
+                    shown = wanted;
+                    tracing::info!("streaming display {}", wanted + 1);
+                }
+                Err(e) => {
+                    tracing::warn!("cannot capture display {}: {e:#}", wanted + 1);
+                    session.display.store(shown, Ordering::Relaxed);
+                }
+            }
+            session.shown.store(shown, Ordering::Relaxed);
+            session.display_changed.notify_one();
+        }
+
         // Never capture faster than the target frame rate.
         let since = last_capture.elapsed();
         if since < interval {

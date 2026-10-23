@@ -207,6 +207,12 @@ lists both under Velora. A closed laptop lid still puts it to sleep.
 Client shortcuts: <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>F</kbd> toggles
 fullscreen, <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>Q</kbd> quits.
 
+When a Windows host has several displays, a session starts on the main one and its window
+title says which is shown ("Display 2 of 3").
+<kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>M</kbd> moves to the next display and
+<kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>1</kbd>…<kbd>9</kbd> picks one; the mouse
+follows. A Linux host streams its whole desktop, every monitor at once.
+
 When a second paired device connects, it takes over the session. Switching from the phone to
 the laptop just works.
 
@@ -479,7 +485,7 @@ the Rust core and generates its Kotlin bindings.
 3. **Mobile:** an iOS app (Swift + VideoToolbox) on the same `velora-mobile` core. On Android:
    pinch to zoom, a direct-touch mode, and Play Store publishing.
 4. **NAT traversal.** A self-hostable rendezvous server, UDP hole punching, and a relay fallback.
-5. Wayland capture (xdg-desktop-portal + PipeWire), multi-monitor selection, cursor shape sync,
+5. Wayland capture (xdg-desktop-portal + PipeWire), display selection on Linux, cursor shape sync,
    audio, relative mouse mode for games.
 6. A systemd user service; installers.
 

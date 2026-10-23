@@ -12,21 +12,21 @@ use windows::{
     Win32::{
         Foundation::{E_INVALIDARG, HMODULE},
         Graphics::{
-            Direct3D::D3D_DRIVER_TYPE_HARDWARE,
+            Direct3D::D3D_DRIVER_TYPE_UNKNOWN,
             Direct3D11::{
                 D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_CPU_ACCESS_READ,
                 D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_SDK_VERSION,
                 D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
             },
             Dxgi::{
-                IDXGIDevice, IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_ACCESS_LOST,
-                DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
+                CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource,
+                DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
             },
         },
     },
 };
 
-use super::{Capturer, DisplayRect, Frame};
+use super::{Capturer, Display, DisplayRect, Frame};
 
 /// How long a new capture waits for the previous one in this process to release the output.
 const RELEASE_WAIT: Duration = Duration::from_secs(2);
@@ -43,15 +43,68 @@ pub struct DxgiCapturer {
     height: u32,
 }
 
+/// A display attached to the desktop, and the GPU that drives it.
+struct Output {
+    adapter: IDXGIAdapter1,
+    output: IDXGIOutput1,
+    display: Display,
+}
+
+/// Displays attached to the desktop, on every GPU, left to right.
+fn outputs() -> Result<Vec<Output>> {
+    // SAFETY: COM enumeration; each call returns an owned interface or an error that ends it.
+    unsafe {
+        let factory: IDXGIFactory1 = CreateDXGIFactory1()?;
+        let mut found = Vec::new();
+        for a in 0.. {
+            let Ok(adapter) = factory.EnumAdapters1(a) else { break };
+            for o in 0.. {
+                let Ok(output) = adapter.EnumOutputs(o) else { break };
+                let desc = output.GetDesc()?;
+                if !desc.AttachedToDesktop.as_bool() {
+                    continue;
+                }
+                let name = desc.DeviceName.split(|&c| c == 0).next().unwrap_or_default();
+                // `\\.\DISPLAY1` -> `DISPLAY1`.
+                let name = String::from_utf16_lossy(name).trim_start_matches(r"\\.\").to_string();
+                let r = desc.DesktopCoordinates;
+                let rect = DisplayRect {
+                    x: r.left,
+                    y: r.top,
+                    width: (r.right - r.left) as u32,
+                    height: (r.bottom - r.top) as u32,
+                };
+                let display = Display { name, rect, primary: r.left == 0 && r.top == 0 };
+                found.push(Output { adapter: adapter.clone(), output: output.cast()?, display });
+            }
+        }
+        found.sort_by_key(|o| (o.display.rect.x, o.display.rect.y));
+        Ok(found)
+    }
+}
+
+pub fn list() -> Vec<Display> {
+    match outputs() {
+        Ok(outputs) => outputs.into_iter().map(|o| o.display).collect(),
+        Err(e) => {
+            tracing::warn!("cannot list displays: {e:#}");
+            Vec::new()
+        }
+    }
+}
+
 impl DxgiCapturer {
-    pub fn new() -> Result<Self> {
+    /// Captures display `index` of [`list`], on the GPU that drives it: duplication only works
+    /// from a device on that GPU.
+    pub fn new(index: usize) -> Result<Self> {
+        let chosen = outputs()?.into_iter().nth(index).context("that display is no longer attached")?;
         let mut device = None;
         let mut context = None;
         // SAFETY: standard D3D11 device creation with out-pointers to locals.
         unsafe {
             D3D11CreateDevice(
-                None,
-                D3D_DRIVER_TYPE_HARDWARE,
+                &chosen.adapter,
+                D3D_DRIVER_TYPE_UNKNOWN,
                 HMODULE::default(),
                 D3D11_CREATE_DEVICE_BGRA_SUPPORT,
                 None,
@@ -64,17 +117,11 @@ impl DxgiCapturer {
         }
         let device = device.context("no D3D11 device")?;
         let context = context.context("no D3D11 context")?;
-
-        // SAFETY: COM calls on valid interfaces.
-        let output: IDXGIOutput1 = unsafe {
-            let dxgi: IDXGIDevice = device.cast()?;
-            let adapter = dxgi.GetAdapter()?;
-            adapter.EnumOutputs(0).context("no display attached to the primary GPU")?.cast()?
-        };
+        tracing::info!("capturing {}", chosen.display.name);
         let mut capturer = Self {
             device,
             context,
-            output,
+            output: chosen.output,
             duplication: None,
             staging: None,
             rect: DisplayRect::default(),
