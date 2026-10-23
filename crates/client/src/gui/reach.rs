@@ -5,12 +5,16 @@
 //! What the host reports (`Status.reach`) becomes text in plain functions, which the tests check
 //! without a window; the tests also draw the card in a headless egui frame.
 
-use std::path::Path;
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use eframe::egui::{self, Align, Layout, RichText, Sense};
+use velora_client_core::WakeOutcome;
 use velora_protocol::{
     control::{MappingStatus, ReachStatus, Request},
-    identity::KnownHost,
+    identity::{KnownHost, StateDir},
     wire::AddressKind,
 };
 
@@ -114,10 +118,30 @@ fn registered_names(reach: &ReachStatus) -> Option<String> {
     (!reach.registered_with.is_empty()).then(|| reach.registered_with.join(", "))
 }
 
-/// With no relay, say how to get one, but only where it matters: when no port is open to reach the
-/// computer by.
-fn relay_hint_wanted(reach: &ReachStatus) -> bool {
-    reach.registered_with.is_empty() && matches!(mapping_of(reach), Mapping::Closed | Mapping::Shared(_))
+/// What this computer still lacks to be reached from other networks, said only where it matters: no
+/// port is open and no relay is registered.
+#[derive(Debug, PartialEq, Eq)]
+enum Advice {
+    /// The DHT is off too (and there is no IPv6 address to try): nothing even tells this PC that a
+    /// device wants in, so a hole cannot be punched either.
+    Blind,
+    /// A device can still find this PC (the DHT or IPv6), but a relay would be the sure way.
+    NoRelay,
+}
+
+fn advice(reach: &ReachStatus) -> Option<Advice> {
+    let no_port = matches!(mapping_of(reach), Mapping::Closed | Mapping::Shared(_));
+    if !no_port || !reach.registered_with.is_empty() {
+        return None;
+    }
+    Some(if reach.dht || !reach.v6.is_empty() { Advice::NoRelay } else { Advice::Blind })
+}
+
+fn advice_text(advice: &Advice, s: &Strings) -> String {
+    match advice {
+        Advice::Blind => fill(s.reach_advice_blind, &[s.reach_dht]),
+        Advice::NoRelay => fill(s.reach_relays_none, &[s.reach_relay]),
+    }
 }
 
 /// The card on This PC. A host that predates standalone reach (`None`) gets nothing, not even the
@@ -140,14 +164,9 @@ pub(super) fn reach_card(ui: &mut egui::Ui, s: &Strings, reach: Option<&ReachSta
         switch_row(ui, s.reach_dht, s.reach_dht_text, &mut next.dht);
         section_break(ui);
         switch_row(ui, s.reach_relay, s.reach_relay_text, &mut next.relay_for_others);
-        if let Some(names) = registered_names(reach) {
-            ui.add_space(12.0);
-            labelled(ui, s.reach_relays, &[names], false);
-        } else if relay_hint_wanted(reach) {
-            ui.add_space(12.0);
-            let hint = fill(s.reach_relays_none, &[s.reach_relay]);
-            ui.add(egui::Label::new(RichText::new(hint).small().color(WEAK)).wrap());
-        }
+        ui.add_space(10.0);
+        let help = fill(s.reach_relay_help, &[s.offer_back]);
+        ui.add(egui::Label::new(RichText::new(help).small().color(WEAK)).wrap());
         if let Some(last) = &reach.last_reached {
             section_break(ui);
             labelled(ui, s.reach_last, &[last_reached_text(last, s)], false);
@@ -157,7 +176,8 @@ pub(super) fn reach_card(ui: &mut egui::Ui, s: &Strings, reach: Option<&ReachSta
     (next != current).then(|| next.request())
 }
 
-/// Under the standalone switch, while it is on: what the router did and the addresses it gave.
+/// Under the standalone switch, while it is on: what the router did, the addresses it gave and the
+/// relays this computer is registered with, or what would help it to have one.
 fn standalone_details(ui: &mut egui::Ui, s: &Strings, reach: &ReachStatus) {
     if let Some(line) = mapping_line(&mapping_of(reach), s) {
         ui.add_space(12.0);
@@ -168,6 +188,13 @@ fn standalone_details(ui: &mut egui::Ui, s: &Strings, reach: &ReachStatus) {
             ui.add_space(12.0);
             labelled(ui, label, addresses, true);
         }
+    }
+    if let Some(names) = registered_names(reach) {
+        ui.add_space(12.0);
+        labelled(ui, s.reach_relays, &[names], false);
+    } else if let Some(advice) = advice(reach) {
+        ui.add_space(12.0);
+        ui.add(egui::Label::new(RichText::new(advice_text(&advice, s)).small().color(WEAK)).wrap());
     }
 }
 
@@ -218,12 +245,10 @@ fn section_break(ui: &mut egui::Ui) {
     ui.add_space(14.0);
 }
 
-/// Where the wake-up of one computer stands, for its button. The states are what `hosts::wake` can
-/// answer, plus the time while it works.
-// reach: G2 builds every state but `Idle` from the outcome of `hosts::wake`.
-#[allow(dead_code)]
+/// Where the wake-up of one computer stands, for its button. The states are what `hosts::wake`
+/// answers, plus the time while it works.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(super) enum WakeState {
+enum WakeState {
     #[default]
     Idle,
     /// The request is on its way.
@@ -238,22 +263,74 @@ pub(super) enum WakeState {
     Failed(String),
 }
 
+/// How long an outcome stays beside the button.
+const OUTCOME_SECONDS: f64 = 12.0;
+/// How soon after an outcome the button takes another click: a relay lets a device start six things
+/// at once and then one every five seconds, and each wake-up is one of them.
+const COOLDOWN_SECONDS: f64 = 5.0;
+/// How long a request may take before the button stops waiting for it, so that a thread that died
+/// cannot leave "Waking…" up for ever.
+const SENDING_SECONDS: f64 = 30.0;
+
+/// A wake-up and when it last changed, on egui's clock.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct Wake {
+    state: WakeState,
+    at: f64,
+}
+
+impl Wake {
+    /// What the card shows at `now`: an outcome fades, and a request that never answered is given up.
+    fn shown(&self, now: f64) -> WakeState {
+        let age = now - self.at;
+        match &self.state {
+            WakeState::Sending if age >= SENDING_SECONDS => WakeState::Idle,
+            WakeState::Idle | WakeState::Sending => self.state.clone(),
+            _ if age >= OUTCOME_SECONDS => WakeState::Idle,
+            outcome => outcome.clone(),
+        }
+    }
+
+    /// Whether a click starts a wake-up at `now`.
+    fn ready(&self, now: f64) -> bool {
+        match self.shown(now) {
+            WakeState::Idle => true,
+            WakeState::Sending => false,
+            _ => now - self.at >= COOLDOWN_SECONDS,
+        }
+    }
+
+    /// Seconds from `now` until what is shown, or whether a click is taken, changes by itself.
+    fn next_change(&self, now: f64) -> Option<f64> {
+        let limits: &[f64] = match self.shown(now) {
+            WakeState::Idle => &[],
+            WakeState::Sending => &[SENDING_SECONDS],
+            _ => &[COOLDOWN_SECONDS, OUTCOME_SECONDS],
+        };
+        limits.iter().map(|limit| limit - (now - self.at)).filter(|left| *left > 0.0).reduce(f64::min)
+    }
+}
+
 /// What to tell about a wake-up, if anything; `Idle` has nothing to tell.
 fn wake_text(state: &WakeState, s: &Strings) -> Option<String> {
     match state {
         WakeState::Idle => None,
         WakeState::Sending => Some(s.wake_sending.to_string()),
         WakeState::Sent => Some(s.wake_sent.to_string()),
-        WakeState::NoRelay => Some(s.wake_no_relay.to_string()),
+        WakeState::NoRelay => Some(fill(s.wake_no_relay, &[s.reach_relay])),
         WakeState::Unsupported => Some(s.wake_unsupported.to_string()),
         WakeState::Failed(reason) => Some(fill(s.wake_failed, &[reason])),
     }
 }
 
-/// A computer that never told its MAC address cannot be woken: it gets no button, which could only
-/// say so. It learns the address the first time it is connected to with a host that sends it.
-fn wake_offered(host: &KnownHost) -> bool {
-    host.mac.is_some()
+/// What `hosts::wake` made of it, as the button tells it.
+fn outcome_state(result: anyhow::Result<WakeOutcome>) -> WakeState {
+    match result {
+        Ok(WakeOutcome::Sent) => WakeState::Sent,
+        Ok(WakeOutcome::NoRelay) => WakeState::NoRelay,
+        Ok(WakeOutcome::Unsupported) => WakeState::Unsupported,
+        Err(e) => WakeState::Failed(format!("{e:#}")),
+    }
 }
 
 fn wake_id(host: &str) -> egui::Id {
@@ -261,19 +338,38 @@ fn wake_id(host: &str) -> egui::Id {
 }
 
 /// The wake-up of `host`, kept in egui's memory so that the launcher needs no field for it.
-pub(super) fn wake_state(ctx: &egui::Context, host: &str) -> WakeState {
+fn wake_of(ctx: &egui::Context, host: &str) -> Wake {
     ctx.data(|data| data.get_temp(wake_id(host))).unwrap_or_default()
 }
 
-/// Called by the thread that wakes `host` when its state changes.
-// reach: G2 calls this.
-#[allow(dead_code)]
-pub(super) fn set_wake_state(ctx: &egui::Context, host: &str, state: WakeState) {
-    ctx.data_mut(|data| data.insert_temp(wake_id(host), state));
+/// Called when the wake-up of `host` changes, from the window or from the thread that does it.
+fn set_wake(ctx: &egui::Context, host: &str, state: WakeState) {
+    let at = ctx.input(|input| input.time);
+    ctx.data_mut(|data| data.insert_temp(wake_id(host), Wake { state, at }));
     ctx.request_repaint();
 }
 
-const WAKE_HEIGHT: f32 = 28.0;
+/// Wakes `host` and waits for the answer. The paired list is the launcher's own, as in `pair_back`.
+fn wake_up(config_dir: Option<PathBuf>, host: &str) -> WakeState {
+    let result = (|| -> anyhow::Result<WakeOutcome> {
+        let state = StateDir::open(config_dir, "client")?;
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+        runtime.block_on(velora_client_core::hosts::wake(&state, host))
+    })();
+    outcome_state(result)
+}
+
+/// Starts waking `host` on a thread of its own: the window never waits for the network.
+fn start_wake(ctx: &egui::Context, host: &str, config_dir: Option<&Path>) {
+    set_wake(ctx, host, WakeState::Sending);
+    let (ctx, host, config_dir) = (ctx.clone(), host.to_string(), config_dir.map(Path::to_path_buf));
+    std::thread::spawn(move || {
+        let state = wake_up(config_dir, &host);
+        set_wake(&ctx, &host, state);
+    });
+}
+
+const CHIP_HEIGHT: f32 = 28.0;
 
 /// The Wake button of a device card; the card calls it for a computer that has no session open.
 /// `card` is the card's area and `config_dir` the launcher's `--config-dir`, which the thread that
@@ -282,47 +378,81 @@ const WAKE_HEIGHT: f32 = 28.0;
 /// It sits in the card's top right corner, where a connected computer says so. The row of buttons
 /// below has no room for it: in Portuguese at the narrowest window, Connect, Files and Forget take
 /// about 370 of its 396 points and a fourth button would cover Forget.
+///
+/// Every computer gets one, also one that never said how it can be woken: the click then tells why
+/// it cannot, which is what that computer's owner has to hear. What came of a wake-up shows in a
+/// bubble under the card for a few seconds, and the button rests for part of them, because the
+/// relay a wake-up may go through allows a device only so many requests.
 pub(super) fn wake_button(
     ui: &mut egui::Ui,
     s: &Strings,
     host: &KnownHost,
     card: egui::Rect,
-    _config_dir: Option<&Path>,
+    config_dir: Option<&Path>,
 ) {
-    if !wake_offered(host) {
-        return;
-    }
-    let state = wake_state(ui.ctx(), &host.name);
+    let ctx = ui.ctx().clone();
+    let now = ui.input(|input| input.time);
+    let wake = wake_of(&ctx, &host.name);
+    let (state, ready) = (wake.shown(now), wake.ready(now));
     let label = if state == WakeState::Sending { s.wake_sending } else { s.wake };
-    let tip = wake_text(&state, s).unwrap_or_else(|| s.wake_tip.to_string());
-    let corner = egui::Rect::from_min_size(card.right_top() + egui::vec2(-178.0, 18.0), egui::vec2(160.0, WAKE_HEIGHT));
+    let corner = egui::Rect::from_min_size(card.right_top() + egui::vec2(-178.0, 18.0), egui::vec2(160.0, CHIP_HEIGHT));
     let layout = Layout::right_to_left(Align::Min);
     let mut corner = ui.new_child(egui::UiBuilder::new().max_rect(corner).layout(layout));
-    // reach: G2 starts the wake-up when this is clicked (`hosts::wake` on a thread, as `pair_back`
-    // does) and reports its outcome with `set_wake_state`.
-    small_button(&mut corner, label).on_hover_text(tip);
+    let chip = small_button(&mut corner, label, ready);
+    match wake_text(&state, s).filter(|_| state != WakeState::Sending) {
+        Some(outcome) => outcome_bubble(ui, chip.id, card, &outcome),
+        None => {
+            chip.clone().on_hover_text(s.wake_tip);
+        }
+    }
+    if chip.clicked() && ready {
+        start_wake(&ctx, &host.name, config_dir);
+    }
+    if let Some(left) = wake.next_change(now) {
+        ctx.request_repaint_after(Duration::from_secs_f64(left));
+    }
+}
+
+/// A tooltip that stays open without a hover, just under `card` and level with its right edge: over
+/// the card it would hide the buttons. A tooltip with only text lets the pointer through, so what
+/// it covers of the next card can still be clicked.
+fn outcome_bubble(ui: &egui::Ui, id: egui::Id, card: egui::Rect, text: &str) {
+    let under = egui::Rect::from_min_max(card.left_bottom(), card.right_bottom());
+    let mut tooltip = egui::Tooltip::always_open(ui.ctx().clone(), ui.layer_id(), id, under).width(300.0);
+    tooltip.popup = tooltip.popup.align(egui::RectAlign::BOTTOM_END);
+    tooltip.show(|ui| ui.add(egui::Label::new(text).wrap()));
 }
 
 /// An outlined button as small as a chip, for a corner of a card: `secondary_button` is a whole
-/// control tall.
-fn small_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
-    let galley = ui.painter().layout_no_wrap(text.to_string(), font(12.5, medium()), TEXT);
-    let size = egui::vec2(galley.size().x + 24.0, WAKE_HEIGHT);
-    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
-    let hover = ui.ctx().animate_bool_with_time(response.id.with("hover"), response.hovered(), HOVER_SECONDS);
+/// control tall. Dimmed, and deaf to clicks, while `enabled` is false.
+fn small_button(ui: &mut egui::Ui, text: &str, enabled: bool) -> egui::Response {
+    let color = if enabled { TEXT } else { FAINT };
+    let galley = ui.painter().layout_no_wrap(text.to_string(), font(12.5, medium()), color);
+    let size = egui::vec2(galley.size().x + 24.0, CHIP_HEIGHT);
+    let (rect, response) = ui.allocate_exact_size(size, if enabled { Sense::click() } else { Sense::hover() });
+    let hover =
+        ui.ctx().animate_bool_with_time(response.id.with("hover"), enabled && response.hovered(), HOVER_SECONDS);
     let fill = egui::Color32::TRANSPARENT.lerp_to_gamma(HOVER, hover);
     let edge = BORDER_STRONG.lerp_to_gamma(FAINT, hover * 0.5);
     ui.painter().rect(rect, RADIUS, fill, egui::Stroke::new(1.0, edge), egui::StrokeKind::Inside);
-    ui.painter().galley(rect.center() - galley.size() / 2.0, galley, TEXT);
-    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+    ui.painter().galley(rect.center() - galley.size() / 2.0, galley, color);
+    if enabled {
+        response.on_hover_cursor(egui::CursorIcon::PointingHand)
+    } else {
+        response
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use eframe::egui::{epaint::Shape, vec2, Event, Modifiers, PointerButton, Pos2, Rect};
+    use velora_protocol::tls::Fingerprint;
 
     use super::*;
     use crate::gui::{strings, theme};
+
+    /// A MAC address of the locally administered kind: made up.
+    const MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 0x01];
 
     /// Documentation addresses (RFC 5737, RFC 3849): nothing here is anyone's real network.
     fn reach() -> ReachStatus {
@@ -343,8 +473,18 @@ mod tests {
         }
     }
 
+    /// A paired computer, with or without the MAC address it reports.
     fn host(mac: Option<[u8; 6]>) -> KnownHost {
         KnownHost { name: "Desk".into(), address: "192.0.2.10:7420".into(), mac, ..Default::default() }
+    }
+
+    /// The area of a device card, and the middle of the Wake button in its top right corner.
+    fn card_area() -> Rect {
+        Rect::from_min_size(Pos2::ZERO, vec2(400.0, 150.0))
+    }
+
+    fn chip() -> Pos2 {
+        card_area().right_top() + vec2(-30.0, 32.0)
     }
 
     /// What one frame painted.
@@ -395,6 +535,24 @@ mod tests {
             output.drop_without_applying_deltas();
             painted
         }
+
+        /// The clock moves on without frames: the wake-up of a card fades by it.
+        fn advance(&mut self, seconds: f64) {
+            self.time += seconds;
+        }
+
+        /// Frames, pausing between them, until one paints what `done` wants: a wake-up runs on a
+        /// thread of its own.
+        fn until(&mut self, mut add: impl FnMut(&mut egui::Ui), done: impl Fn(&Painted) -> bool) -> Painted {
+            for _ in 0..500 {
+                let painted = self.run(Vec::new(), &mut add);
+                if done(&painted) {
+                    return painted;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            panic!("nothing came of it in ten seconds");
+        }
     }
 
     fn collect(shape: &Shape, painted: &mut Painted) {
@@ -414,6 +572,40 @@ mod tests {
             modifiers: Modifiers::NONE,
         };
         vec![Event::PointerMoved(at), button(true), button(false)]
+    }
+
+    /// Frames with the pointer resting on `at`, long enough for a tooltip: everything they painted.
+    fn hover(frames: &mut Frames, at: Pos2, mut add: impl FnMut(&mut egui::Ui)) -> Vec<String> {
+        frames.ctx.global_style_mut(|style| style.interaction.tooltip_delay = 0.0);
+        frames.run(vec![Event::PointerMoved(at)], &mut add);
+        (0..4).flat_map(|_| frames.run(Vec::new(), &mut add).texts).collect()
+    }
+
+    /// A scratch folder for the launcher's client state, removed when dropped.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("velora-g2-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            Self(dir)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+
+        /// Pairs `host`: it goes into the known hosts of the client side, as pairing writes it.
+        fn pair(&self, host: &KnownHost) {
+            let state = StateDir::open(Some(self.0.clone()), "client").unwrap();
+            state.save(StateDir::KNOWN_HOSTS, &vec![host.clone()]).unwrap();
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 
     #[test]
@@ -482,19 +674,79 @@ mod tests {
     }
 
     #[test]
-    fn relays_are_listed_by_name_and_asked_for_only_when_a_port_is_not_enough() {
+    fn relays_are_listed_by_name() {
         assert_eq!(registered_names(&reach()).as_deref(), Some("Office PC, Laptop"));
         assert_eq!(registered_names(&ReachStatus::default()), None);
+    }
 
-        let none = ReachStatus { registered_with: Vec::new(), ..reach() };
-        // A port is open: nobody needs a relay.
-        assert!(!relay_hint_wanted(&none));
-        assert!(relay_hint_wanted(&ReachStatus { mapping: None, ..none.clone() }));
-        let shared = Some(MappingStatus { public: false, ..none.mapping.clone().unwrap() });
-        assert!(relay_hint_wanted(&ReachStatus { mapping: shared, ..none.clone() }));
-        // Off asks for nothing, and a relay already registered needs no hint.
-        assert!(!relay_hint_wanted(&ReachStatus { standalone: false, mapping: None, ..none }));
-        assert!(!relay_hint_wanted(&ReachStatus { mapping: None, ..reach() }));
+    #[test]
+    fn advice_comes_only_where_a_port_and_a_relay_would_help() {
+        let bare = ReachStatus { registered_with: Vec::new(), v6: Vec::new(), ..reach() };
+        // An open port needs no advice.
+        assert_eq!(advice(&bare), None);
+        let no_port = ReachStatus { mapping: None, ..bare.clone() };
+        // With the DHT on, or an IPv6 address to try, a device can still find this PC: a relay is the
+        // sure way.
+        assert_eq!(advice(&no_port), Some(Advice::NoRelay));
+        let v6 = vec!["[2001:db8::7]:7420".to_string()];
+        assert_eq!(advice(&ReachStatus { dht: false, v6, ..no_port.clone() }), Some(Advice::NoRelay));
+        // With the DHT off and nothing else, nothing tells this PC that a device wants in.
+        assert_eq!(advice(&ReachStatus { dht: false, ..no_port.clone() }), Some(Advice::Blind));
+        let shared = Some(MappingStatus { public: false, ..reach().mapping.unwrap() });
+        assert_eq!(advice(&ReachStatus { mapping: shared, dht: false, ..bare }), Some(Advice::Blind));
+        // A relay already registered needs no advice, nor does standalone reach being off.
+        assert_eq!(advice(&ReachStatus { registered_with: vec!["Office PC".into()], ..no_port.clone() }), None);
+        assert_eq!(advice(&ReachStatus { standalone: false, ..no_port }), None);
+    }
+
+    #[test]
+    fn a_wake_up_fades_and_rests_by_the_clock() {
+        let at = 100.0;
+        let wake = |state| Wake { state, at };
+        // While it works the button waits, and gives up on a request that never answers.
+        let sending = wake(WakeState::Sending);
+        assert_eq!((sending.shown(at + 1.0), sending.ready(at + 1.0)), (WakeState::Sending, false));
+        assert_eq!((sending.shown(at + SENDING_SECONDS), sending.ready(at + SENDING_SECONDS)), (WakeState::Idle, true));
+        // An outcome shows for a while, and the button rests for part of it.
+        for outcome in [WakeState::Sent, WakeState::NoRelay, WakeState::Unsupported, WakeState::Failed("x".into())] {
+            let wake = wake(outcome.clone());
+            assert_eq!((wake.shown(at + 1.0), wake.ready(at + 1.0)), (outcome.clone(), false));
+            let rested = at + COOLDOWN_SECONDS;
+            assert_eq!((wake.shown(rested), wake.ready(rested)), (outcome.clone(), true));
+            let gone = at + OUTCOME_SECONDS;
+            assert_eq!((wake.shown(gone), wake.ready(gone)), (WakeState::Idle, true));
+        }
+        // Nothing to wait for before the first one.
+        let none = Wake::default();
+        assert_eq!((none.shown(5.0), none.ready(5.0), none.next_change(5.0)), (WakeState::Idle, true, None));
+        // When the card has to look again.
+        assert_eq!(wake(WakeState::Sending).next_change(at + 1.0), Some(SENDING_SECONDS - 1.0));
+        assert_eq!(wake(WakeState::Sent).next_change(at + 1.0), Some(COOLDOWN_SECONDS - 1.0));
+        assert_eq!(wake(WakeState::Sent).next_change(at + 6.0), Some(OUTCOME_SECONDS - 6.0));
+        assert_eq!(wake(WakeState::Sent).next_change(at + 20.0), None);
+    }
+
+    #[test]
+    fn what_hosts_wake_answers_becomes_what_the_button_says() {
+        assert_eq!(outcome_state(Ok(WakeOutcome::Sent)), WakeState::Sent);
+        assert_eq!(outcome_state(Ok(WakeOutcome::NoRelay)), WakeState::NoRelay);
+        assert_eq!(outcome_state(Ok(WakeOutcome::Unsupported)), WakeState::Unsupported);
+        let failed = outcome_state(Err(anyhow::anyhow!("'Desk' is not paired yet")));
+        assert_eq!(failed, WakeState::Failed("'Desk' is not paired yet".into()));
+    }
+
+    #[test]
+    fn a_wake_up_says_where_it_stands() {
+        for s in strings::all() {
+            assert_eq!(wake_text(&WakeState::Idle, s), None);
+            assert_eq!(wake_text(&WakeState::Sending, s).as_deref(), Some(s.wake_sending));
+            assert_eq!(wake_text(&WakeState::Sent, s).as_deref(), Some(s.wake_sent));
+            assert_eq!(wake_text(&WakeState::NoRelay, s), Some(fill(s.wake_no_relay, &[s.reach_relay])));
+            assert_eq!(wake_text(&WakeState::Unsupported, s).as_deref(), Some(s.wake_unsupported));
+            let failed = wake_text(&WakeState::Failed("timed out".into()), s).unwrap();
+            assert_eq!(failed, fill(s.wake_failed, &["timed out"]));
+            assert!(failed.contains("timed out"));
+        }
     }
 
     #[test]
@@ -541,20 +793,30 @@ mod tests {
             assert!(painted.has(&last_reached_text(status.last_reached.as_ref().unwrap(), s)));
             assert_eq!(painted.switches.len(), 3);
             assert!(!painted.mentions(s.reach_mapping_closed));
+            // Relaying costs bandwidth, and needs pairings that the card tells how to make.
+            assert!(painted.has(&fill(s.reach_relay_help, &[s.offer_back])));
+            assert!(s.reach_relay_text.contains("6") && s.reach_relay_text.contains("12 Mbit/s"));
+            // Registered relays make advice unnecessary.
+            assert!(!painted.mentions(s.reach_advice_blind.split("{}").next().unwrap()));
         }
     }
 
     #[test]
     fn what_the_router_did_not_do_is_said_plainly() {
         let s = strings::current();
-        let mut frames = Frames::new();
-        let status = ReachStatus { mapping: None, registered_with: Vec::new(), last_reached: None, ..reach() };
-        let painted = frames.run(Vec::new(), |ui| {
-            reach_card(ui, s, Some(&status));
-        });
-        assert!(painted.has(s.reach_mapping_closed) && painted.has(s.reach_mapping_closed_detail));
-        assert!(painted.has(&fill(s.reach_relays_none, &[s.reach_relay])));
-        assert!(!painted.has(s.reach_relays) && !painted.has(s.reach_last));
+        let closed = ReachStatus { mapping: None, registered_with: Vec::new(), last_reached: None, ..reach() };
+        let blind = ReachStatus { dht: false, v6: Vec::new(), ..closed.clone() };
+        for (status, advice) in
+            [(closed, fill(s.reach_relays_none, &[s.reach_relay])), (blind, fill(s.reach_advice_blind, &[s.reach_dht]))]
+        {
+            let mut frames = Frames::new();
+            let painted = frames.run(Vec::new(), |ui| {
+                reach_card(ui, s, Some(&status));
+            });
+            assert!(painted.has(s.reach_mapping_closed) && painted.has(s.reach_mapping_closed_detail));
+            assert!(painted.has(&advice), "{advice:?} was not painted, only {:#?}", painted.texts);
+            assert!(!painted.has(s.reach_relays) && !painted.has(s.reach_last));
+        }
     }
 
     #[test]
@@ -566,11 +828,11 @@ mod tests {
             reach_card(ui, s, Some(&status));
         });
         assert!(painted.has(s.reach_standalone) && painted.has(s.reach_dht) && painted.has(s.reach_relay));
-        for gone in [s.reach_mapping_open, s.reach_public, s.reach_v6, "203.0.113.7:51820"] {
+        for gone in [s.reach_mapping_open, s.reach_public, s.reach_v6, s.reach_relays, "203.0.113.7:51820"] {
             assert!(!painted.has(gone), "{gone:?} should be hidden");
         }
-        // What was true of past connections and relays still is.
-        assert!(painted.has(s.reach_last) && painted.has(s.reach_relays));
+        // The last connection was true whatever the switches say now.
+        assert!(painted.has(s.reach_last));
     }
 
     #[test]
@@ -601,65 +863,86 @@ mod tests {
     }
 
     #[test]
-    fn a_wake_up_says_where_it_stands() {
+    fn every_computer_gets_a_wake_button() {
+        let s = strings::current();
+        let mut frames = Frames::new();
+        // One that reported its MAC address, and one that never did: the click tells why it cannot.
+        for known in [host(Some(MAC)), host(None)] {
+            let painted = frames.run(Vec::new(), |ui| wake_button(ui, s, &known, card_area(), None));
+            assert_eq!(painted.texts, [s.wake]);
+        }
+        // While the request is on its way the button says so.
+        set_wake(&frames.ctx, "Desk", WakeState::Sending);
+        let painted = frames.run(Vec::new(), |ui| wake_button(ui, s, &host(None), card_area(), None));
+        assert_eq!(painted.texts, [s.wake_sending]);
+        // Each computer has its own state.
+        assert_eq!(wake_of(&frames.ctx, "Laptop"), Wake::default());
+    }
+
+    #[test]
+    fn the_button_tells_what_it_does_and_what_came_of_it() {
         for s in strings::all() {
-            assert_eq!(wake_text(&WakeState::Idle, s), None);
-            assert_eq!(wake_text(&WakeState::Sending, s).as_deref(), Some(s.wake_sending));
-            assert_eq!(wake_text(&WakeState::Sent, s).as_deref(), Some(s.wake_sent));
-            assert_eq!(wake_text(&WakeState::NoRelay, s).as_deref(), Some(s.wake_no_relay));
-            assert_eq!(wake_text(&WakeState::Unsupported, s).as_deref(), Some(s.wake_unsupported));
-            let failed = wake_text(&WakeState::Failed("timed out".into()), s).unwrap();
-            assert_eq!(failed, fill(s.wake_failed, &["timed out"]));
-            assert!(failed.contains("timed out"));
+            let known = host(Some(MAC));
+            let mut button = |ui: &mut egui::Ui| wake_button(ui, s, &known, card_area(), None);
+            // Resting on the button says what it does.
+            let mut frames = Frames::new();
+            assert!(hover(&mut frames, chip(), &mut button).contains(&s.wake_tip.to_string()));
+            // Every outcome stays beside the button, with no hover, and the button keeps its name.
+            for state in [WakeState::Sent, WakeState::NoRelay, WakeState::Unsupported, WakeState::Failed("x".into())] {
+                let mut frames = Frames::new();
+                set_wake(&frames.ctx, "Desk", state.clone());
+                let shown: Vec<String> = (0..4).flat_map(|_| frames.run(Vec::new(), &mut button).texts).collect();
+                let told = wake_text(&state, s).unwrap();
+                assert!(shown.contains(&told), "{state:?}: {told:?} was not shown, only {shown:#?}");
+                assert!(shown.contains(&s.wake.to_string()));
+                assert!(!shown.contains(&s.wake_tip.to_string()));
+            }
+            // After a while it is gone and the button is as before.
+            let mut frames = Frames::new();
+            set_wake(&frames.ctx, "Desk", WakeState::Sent);
+            frames.advance(OUTCOME_SECONDS);
+            let shown: Vec<String> = (0..4).flat_map(|_| frames.run(Vec::new(), &mut button).texts).collect();
+            assert!(shown.len() == 4 && shown.iter().all(|text| text == s.wake), "{shown:#?}");
         }
     }
 
     #[test]
-    fn only_a_computer_with_a_known_mac_gets_a_wake_button() {
+    fn a_click_wakes_the_computer_and_the_button_says_what_came_of_it() {
         let s = strings::current();
-        let mut frames = Frames::new();
-        let card = Rect::from_min_size(Pos2::ZERO, vec2(400.0, 150.0));
-        let painted = frames.run(Vec::new(), |ui| wake_button(ui, s, &host(None), card, None));
-        assert!(painted.texts.is_empty());
-        let known = host(Some([0x02, 0, 0, 0, 0, 0x01]));
-        let painted = frames.run(Vec::new(), |ui| wake_button(ui, s, &known, card, None));
-        assert_eq!(painted.texts, [s.wake]);
-        // While the request is on its way the button says so.
-        set_wake_state(&frames.ctx, "Desk", WakeState::Sending);
-        let painted = frames.run(Vec::new(), |ui| wake_button(ui, s, &known, card, None));
-        assert_eq!(painted.texts, [s.wake_sending]);
-        // Each computer has its own state.
-        assert_eq!(wake_state(&frames.ctx, "Laptop"), WakeState::Idle);
-    }
-
-    /// Frames with the pointer resting on `at`, long enough for a tooltip: everything they painted.
-    fn hover(frames: &mut Frames, at: Pos2, mut add: impl FnMut(&mut egui::Ui)) -> Vec<String> {
-        frames.ctx.global_style_mut(|style| style.interaction.tooltip_delay = 0.0);
-        frames.run(vec![Event::PointerMoved(at)], &mut add);
-        (0..4).flat_map(|_| frames.run(Vec::new(), &mut add).texts).collect()
-    }
-
-    #[test]
-    fn a_wake_up_shows_where_it_stands_on_the_button() {
-        for s in strings::all() {
-            let known = host(Some([0x02, 0, 0, 0, 0, 0x01]));
-            let card = Rect::from_min_size(Pos2::ZERO, vec2(400.0, 150.0));
-            for state in [
-                WakeState::Idle,
-                WakeState::Sending,
-                WakeState::Sent,
-                WakeState::NoRelay,
-                WakeState::Unsupported,
-                WakeState::Failed("timed out".into()),
-            ] {
-                let mut frames = Frames::new();
-                set_wake_state(&frames.ctx, "Desk", state.clone());
-                // The button is in the card's top right corner: the pointer rests on it.
-                let on_it = card.right_top() + vec2(-30.0, 32.0);
-                let shown = hover(&mut frames, on_it, |ui| wake_button(ui, s, &known, card, None));
-                let tip = wake_text(&state, s).unwrap_or_else(|| s.wake_tip.to_string());
-                assert!(shown.contains(&tip), "{state:?}: {tip:?} was not shown, only {shown:#?}");
-            }
+        // Neither wake-up touches the network: the first computer never told its MAC address, the
+        // second is on a network (RFC 5737) that no adapter of this PC has, and no relay is stored.
+        let silent = host(None);
+        let away = KnownHost {
+            kinds: vec![(AddressKind::Lan, "203.0.113.9:7420".into())],
+            fingerprint: Fingerprint([7; 32]).to_base64(),
+            ..host(Some(MAC))
+        };
+        for (known, tag, outcome) in [(silent, "silent", WakeState::Unsupported), (away, "away", WakeState::NoRelay)] {
+            let scratch = Scratch::new(tag);
+            scratch.pair(&known);
+            let mut frames = Frames::new();
+            let ctx = frames.ctx.clone();
+            let mut button = |ui: &mut egui::Ui| wake_button(ui, s, &known, card_area(), Some(scratch.path()));
+            let told = wake_text(&outcome, s).unwrap();
+            // Nothing is under way before the click.
+            assert!(frames.run(Vec::new(), &mut button).has(s.wake));
+            assert_eq!(wake_of(&ctx, "Desk").state, WakeState::Idle);
+            // The click starts it, and what came of it appears beside the button.
+            frames.run(click(chip()), &mut button);
+            let painted = frames.until(&mut button, |painted| painted.has(&told));
+            assert!(painted.has(s.wake), "{:#?}", painted.texts);
+            let first = wake_of(&ctx, "Desk");
+            assert_eq!(first.state, outcome);
+            // The relay lets a device start only so many things: no click for a few seconds.
+            frames.run(click(chip()), &mut button);
+            assert_eq!(wake_of(&ctx, "Desk"), first);
+            // After them a click starts another wake-up. (egui judges a click by the widgets of the
+            // frame before, so the button gets one frame to wake from its rest.)
+            frames.advance(COOLDOWN_SECONDS);
+            frames.run(Vec::new(), &mut button);
+            frames.run(click(chip()), &mut button);
+            assert!(wake_of(&ctx, "Desk").at > first.at);
+            frames.until(&mut button, |_| wake_of(&ctx, "Desk").state == outcome);
         }
     }
 
@@ -670,10 +953,12 @@ mod tests {
             let mut frames = Frames::new();
             let mut shown = Vec::new();
             let shared = MappingStatus { public: false, ..reach().mapping.unwrap() };
+            let closed = ReachStatus { mapping: None, registered_with: Vec::new(), last_reached: None, ..reach() };
             let mut statuses = vec![
                 reach(),
                 ReachStatus { mapping: Some(shared), registered_with: Vec::new(), ..reach() },
-                ReachStatus { mapping: None, registered_with: Vec::new(), last_reached: None, ..reach() },
+                ReachStatus { dht: false, v6: Vec::new(), ..closed.clone() },
+                closed,
             ];
             for kind in [AddressKind::Lan, AddressKind::Vpn, AddressKind::Relay("fp".into()), AddressKind::Other(9)] {
                 statuses.push(ReachStatus { last_reached: Some((kind, "192.0.2.5:7420".into())), ..reach() });
@@ -681,11 +966,22 @@ mod tests {
             for status in &statuses {
                 shown.extend(frames.run(Vec::new(), |ui| _ = reach_card(ui, s, Some(status))).texts);
             }
-            let known = host(Some([0x02, 0, 0, 0, 0, 0x01]));
-            let card = Rect::from_min_size(Pos2::ZERO, vec2(400.0, 150.0));
-            shown.extend(frames.run(Vec::new(), |ui| wake_button(ui, s, &known, card, None)).texts);
-            set_wake_state(&frames.ctx, "Desk", WakeState::Sending);
-            shown.extend(frames.run(Vec::new(), |ui| wake_button(ui, s, &known, card, None)).texts);
+            // The button: under way, then each outcome, then at rest with a hover.
+            let known = host(Some(MAC));
+            let mut button = |ui: &mut egui::Ui| wake_button(ui, s, &known, card_area(), None);
+            let states = [
+                WakeState::Sending,
+                WakeState::Sent,
+                WakeState::NoRelay,
+                WakeState::Unsupported,
+                WakeState::Failed("x".into()),
+                WakeState::Idle,
+            ];
+            for state in states {
+                set_wake(&frames.ctx, "Desk", state);
+                shown.extend((0..4).flat_map(|_| frames.run(Vec::new(), &mut button).texts));
+            }
+            shown.extend(hover(&mut frames, chip(), &mut button));
             // What a template says around its `{}` is what the filled text starts with.
             let is_shown = |text: &str| shown.iter().any(|t| t.contains(text.split("{}").next().unwrap()));
             for (name, text) in [
@@ -705,15 +1001,22 @@ mod tests {
                 ("reach_dht_text", s.reach_dht_text),
                 ("reach_relay", s.reach_relay),
                 ("reach_relay_text", s.reach_relay_text),
+                ("reach_relay_help", s.reach_relay_help),
                 ("reach_relays", s.reach_relays),
                 ("reach_relays_none", s.reach_relays_none),
+                ("reach_advice_blind", s.reach_advice_blind),
                 ("reach_last", s.reach_last),
                 ("reach_kind_lan", s.reach_kind_lan),
                 ("reach_kind_vpn", s.reach_kind_vpn),
                 ("reach_kind_relay", s.reach_kind_relay),
                 ("reach_kind_other", s.reach_kind_other),
                 ("wake", s.wake),
+                ("wake_tip", s.wake_tip),
                 ("wake_sending", s.wake_sending),
+                ("wake_sent", s.wake_sent),
+                ("wake_no_relay", s.wake_no_relay),
+                ("wake_unsupported", s.wake_unsupported),
+                ("wake_failed", s.wake_failed),
             ] {
                 assert!(is_shown(text), "{name} ({text:?}) is not shown in any state");
             }
