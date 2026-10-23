@@ -5498,6 +5498,7 @@ version = "0.4.0"
 dependencies = [
  "anyhow",
  "ed25519-dalek",
+ "futures-lite",
  "mainline",
  "postcard",
  "ring",
