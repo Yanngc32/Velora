@@ -14,6 +14,9 @@ tokio.workspace = true
 serde.workspace = true
 ring.workspace = true
 mainline.workspace = true
+# mainline's get_mutable stream implements only this crate's Stream trait, so polling it needs the crate by name
+# (the version and features mainline already builds).
+futures-lite = { version = "2", default-features = false }
 # The crate mainline signs with: SigningKey is re-exported, the other types come from here.
 ed25519-dalek.workspace = true
 postcard.workspace = true
