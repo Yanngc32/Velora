@@ -714,6 +714,11 @@ impl Shared {
             Request::SetReach { standalone, relay_for_others, dht } => {
                 self.reach.set_switches(Switches { standalone, relay_for_others, dht })
             }
+            // The protocol has them; the host answers them in the next commit.
+            Request::AddRelay { .. }
+            | Request::RemoveRelay { .. }
+            | Request::AllowRelayHost { .. }
+            | Request::RemoveRelayHost { .. } => Err(anyhow::anyhow!("this build does not manage relays yet")),
         };
         result.and_then(|()| self.status()).map_err(|e| format!("{e:#}"))
     }
