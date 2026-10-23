@@ -43,15 +43,36 @@ docs are now counted.
 
 | Area | Files | Owner |
 |---|---|---|
-| Workspace | `Cargo.toml`, `Cargo.lock`, `crates/{nat,dht,relay}/Cargo.toml` and `src/lib.rs`, `.github/workflows/*` | W0 |
+| Workspace | `Cargo.toml`, `Cargo.lock`, the three new crates' `Cargo.toml` and `src/lib.rs`, `.github/workflows/*` | W0 |
 | Protocol | `crates/protocol/src/{wire,pairing,control,identity}.rs` | T0 |
-| velora-nat | `src/mapping.rs` B1 · `src/addresses.rs`, `src/observe.rs` B2 · `src/wake.rs` B3 |
-| velora-dht | `src/{record,seal,keys}.rs` C1 · `src/node.rs` C2 · `src/punch_item.rs` C3 · `docs/dht-spike.md` S0 |
-| velora-relay | `src/frame.rs` D1 · `src/forward.rs` D2 |
-| Host | `src/server.rs`, `src/main.rs`, `src/control.rs`, `src/reach/mod.rs`, `src/reach/socket.rs`, `Cargo.toml` E1 · `src/reach/mapping.rs` E2 · `src/reach/dht.rs`, `src/reach/secrets.rs` E3 · `src/reach/relay.rs` E4 · `src/reach/punch.rs`, `src/reach/poll.rs` E5 · `src/reach/wake.rs` E6 |
-| client-core | `src/lib.rs`, `src/hosts.rs`, `src/reach/mod.rs`, `Cargo.toml` F1 · `src/reach/dht.rs` F2 · `src/reach/relay.rs` F3 · `src/reach/punch.rs` F4 · `crates/mobile/src/lib.rs` F5 |
-| Launcher | `gui/strings.rs`, `gui/this_pc.rs` (one call), `gui/mod.rs` (one call), `gui/reach.rs` skeleton G1 · `gui/reach.rs` body G2 · `crates/client/src/main.rs` G3 |
-| Docs | `README.md`, `docs/*.md` H1 · `Cargo.toml` version, release notes H2 |
+| velora-nat | `src/mapping.rs` | B1 |
+| velora-nat | `src/addresses.rs`, `src/observe.rs` | B2 |
+| velora-nat | `src/wake.rs` | B3 |
+| velora-dht | `src/record.rs`, `src/seal.rs`, `src/keys.rs` | C1 |
+| velora-dht | `src/node.rs` | C2 |
+| velora-dht | `src/punch_item.rs` | C3 |
+| velora-dht | `docs/dht-spike.md` | S0 |
+| velora-relay | `src/frame.rs` | D1 |
+| velora-relay | `src/forward.rs` | D2 |
+| Host | `src/server.rs`, `src/main.rs`, `src/control.rs`, `src/reach/mod.rs`, `src/reach/socket.rs`, `Cargo.toml` | E1 |
+| Host | `src/reach/mapping.rs` | E2 |
+| Host | `src/reach/dht.rs`, `src/reach/secrets.rs` | E3 |
+| Host | `src/reach/relay.rs` | E4 |
+| Host | `src/reach/punch.rs`, `src/reach/poll.rs` | E5 |
+| Host | `src/reach/wake.rs` | E6 |
+| client-core | `src/lib.rs`, `src/hosts.rs`, `src/reach/mod.rs`, `Cargo.toml` | F1 |
+| client-core | `src/reach/dht.rs` | F2 |
+| client-core | `src/reach/relay.rs` | F3 |
+| client-core | `src/reach/punch.rs` | F4 |
+| mobile | `crates/mobile/src/lib.rs` | F5 |
+| Launcher | `gui/strings.rs`, `gui/this_pc.rs` (one call), `gui/mod.rs` (one call), `gui/reach.rs` (skeleton) | G1 |
+| Launcher | `gui/reach.rs` (body) | G2, after G1 |
+| Launcher | `crates/client/src/main.rs` | G3 |
+| Docs | `README.md`, `docs/*.md` | H1 |
+| Release | workspace version, release notes | H2 |
+
+`gui/reach.rs` is created by G1 and filled by G2, which depends on G1, so the two never run
+at the same time: that is the only file with two owners, in sequence.
 
 ## 3. Tickets
 

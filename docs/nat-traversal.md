@@ -98,9 +98,10 @@ and worth measuring, not a solution on its own. Phase 1 includes it.
  │ race every address;       │ ──────────────────────▶ │  global v6 (phase 1)      │
  │ first handshake wins      │  3. hole punch          │  DHT record (phase 2)     │
  │                           │ ◀─────────────────────▶ │  punch on signal (ph 3)   │
- │                           │  4. through relay R     │                           │
- │   client ──▶ R ◀── host (both connect OUT to R; R copies datagrams)  (phase 4)  │
+ │                           │  4. through relay R     │  dials out to R (ph 4)    │
  └───────────────────────────┘                         └───────────────────────────┘
+
+ relay (phase 4):  client ──▶ R ◀── host   both ends dial out; R copies the datagrams
 ```
 
 Paths 1 and 2 are plain addresses. Path 4 needs a third machine that both ends can reach:
