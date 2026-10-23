@@ -591,7 +591,8 @@ fn drain(socket: &UdpSocket) {
 /// Pings DHT `nodes` from `socket` and returns the endpoint each one that answered saw. This is
 /// the endpoint of the socket itself: use the socket that will carry QUIC, since a NAT maps each
 /// source port on its own. Nodes that do not answer within `wait` (pinged again every 750 ms) or
-/// answer without BEP 42's `ip` are left out; an empty list is not an error.
+/// answer without BEP 42's `ip` are left out; an empty list is not an error. If not one ping can
+/// be sent (no route, an address family the socket lacks) the I/O error comes back at once.
 ///
 /// Returns as soon as three nodes gave their view or every node answered, and 400 ms after the
 /// second view when the rest stay silent. Of the default nodes only some send BEP 42's `ip`
@@ -648,6 +649,10 @@ pub fn observe_dht(socket: &UdpSocket, nodes: &[SocketAddr], wait: Duration) -> 
                 }
             }
             next_send = Instant::now() + RESEND_EVERY;
+            // Nothing left the socket (no route, wrong address family): waiting would only delay the error.
+            if !sent_any {
+                break;
+            }
         }
         let until = next_send.min(deadline).min(settle_by.unwrap_or(deadline));
         // Never zero: a zero read timeout is an error.
@@ -1347,10 +1352,12 @@ mod tests {
     fn nothing_sent_is_an_io_error() {
         // A socket without SO_BROADCAST is refused a send to the broadcast address, on every OS.
         let broadcast = addr("255.255.255.255:6881");
-        let error = observe_dht(&client(), &[broadcast], Duration::from_millis(300)).unwrap_err();
+        let started = Instant::now();
+        let error = observe_dht(&client(), &[broadcast], DEFAULT_WAIT).unwrap_err();
         assert!(matches!(error, ObserveError::Io(_)), "{error}");
-        let error = observe(&client(), &[broadcast], &[], Duration::from_millis(300)).unwrap_err();
+        let error = observe(&client(), &[broadcast], &[], DEFAULT_WAIT).unwrap_err();
         assert!(matches!(error, ObserveError::Io(_)), "{error}");
+        assert!(started.elapsed() < Duration::from_millis(500), "the error comes at once, not after the wait");
     }
 
     #[test]
