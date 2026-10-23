@@ -389,8 +389,11 @@ gives punching its signaling channel, and is the machine the Wake needs.
 | 3 (phase 4) | Relay registration and forwarding with chunking, the switch, relay addresses in Reach and in the record, Wake through the relay PC and the phone, `velora-relay` | 7-9 days |
 | 4 (phase 3) | Endpoint observation from the QUIC socket on both sides, signaling over the relay and over the DHT, simultaneous open, timeouts and messages | 6-8 days + field testing |
 
-About five weeks of work in all. Each step is a PR that works on its own and keeps older
-peers working. Step 1 can ship in the next release.
+About five weeks of feature work in all; counted as conflict-free tickets with plumbing,
+UI, mobile, field tests and docs it comes to about 54 person-days, or roughly three weeks of
+wall clock with four lanes in parallel (see [nat-traversal-tickets.md](nat-traversal-tickets.md)).
+Each step is a PR that works on its own and keeps older peers working. Step 1 can ship in the
+next release.
 
 ## 12. What to measure
 
