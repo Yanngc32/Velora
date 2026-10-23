@@ -320,9 +320,7 @@ fn run_window(
             let _ = proxy.send_event(());
         }));
     }
-    println!(
-        "Shortcuts: Ctrl+Alt+Shift+F fullscreen, Ctrl+Alt+Shift+M next display, Ctrl+Alt+Shift+1-9 a display,          Ctrl+Alt+Shift+Q quit"
-    );
+    println!("Shortcuts, with Ctrl+Alt+Shift: F fullscreen, M next display, 1-9 a display, A sound on/off, Q quit");
     let mut app = App {
         input: session.input.clone(),
         frames,
@@ -330,6 +328,7 @@ fn run_window(
         proxy,
         transfers,
         displays,
+        muted: false,
         title: format!("{} — Velora", session.host_name),
         shown_title: String::new(),
         remote_size: (session.width as u32, session.height as u32),
@@ -430,7 +429,9 @@ struct App {
     proxy: EventLoopProxy<()>,
     transfers: Arc<Mutex<Transfers>>,
     displays: Arc<Mutex<Option<DisplayList>>>,
-    /// Base title, and the one on screen (with the display and transfers).
+    /// The host's sound is muted here.
+    muted: bool,
+    /// Base title, and the one on screen (with the display, sound and transfers).
     title: String,
     shown_title: String,
     remote_size: (u32, u32),
@@ -485,6 +486,9 @@ impl App {
             let s = gui::strings::current();
             let (n, of) = ((d.current as usize + 1).to_string(), d.list.len().to_string());
             title = format!("{title} · {}", gui::strings::fill(s.session_display, &[&n, &of]));
+        }
+        if self.muted {
+            title = format!("{title} · {}", gui::strings::current().session_muted);
         }
         if let Some(summary) = self.transfers.lock().unwrap().summary() {
             title = format!("{title} · {summary}");
@@ -549,6 +553,11 @@ impl App {
             KeyCode::KeyQ => {
                 self.session.close();
                 event_loop.exit();
+            }
+            KeyCode::KeyA if self.session.has_audio() => {
+                self.muted = !self.muted;
+                self.session.set_muted(self.muted);
+                self.refresh_title();
             }
             // The host's next display, or one by its number.
             KeyCode::KeyM => {

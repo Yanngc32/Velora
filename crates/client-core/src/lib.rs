@@ -27,8 +27,8 @@ use velora_protocol::{
     identity::Identity,
     tls::{self, Fingerprint},
     wire::{
-        self, ClientMsg, DisplayList, FrameHeader, HelloExt, HostMsg, KeyState, MouseButton, MouseMove,
-        FEATURE_CLIPBOARD, FEATURE_FILES, PROTOCOL_VERSION,
+        self, AudioPacket, ClientMsg, DisplayList, FrameHeader, HelloExt, HostMsg, KeyState, MouseButton, MouseMove,
+        FEATURE_AUDIO, FEATURE_CLIPBOARD, FEATURE_FILES, PROTOCOL_VERSION,
     },
 };
 
@@ -227,6 +227,8 @@ pub struct Session {
     pub input: InputSender,
     features: u32,
     displays: Arc<Mutex<Displays>>,
+    /// Plays the host's sound, when it sends it.
+    audio: Option<Arc<velora_audio::Player>>,
     conn: quinn::Connection,
     runtime: tokio::runtime::Handle,
     _endpoint: quinn::Endpoint,
@@ -283,6 +285,18 @@ impl Session {
         };
         if let Some(list) = now {
             listener(&list);
+        }
+    }
+
+    /// The host's sound plays here.
+    pub fn has_audio(&self) -> bool {
+        self.audio.is_some()
+    }
+
+    /// Mutes or unmutes the host's sound.
+    pub fn set_muted(&self, muted: bool) {
+        if let Some(audio) = &self.audio {
+            audio.set_muted(muted);
         }
     }
 
@@ -350,7 +364,13 @@ pub async fn connect_files(params: ConnectParams) -> Result<FilesSession> {
 
 /// Connects, authenticates and starts delivering video to `output`.
 pub async fn connect(params: ConnectParams, output: VideoOutput) -> Result<Session> {
-    let ext = HelloExt { files_only: false, clipboard: true, addresses: true, displays: true };
+    let ext = HelloExt {
+        files_only: false,
+        clipboard: true,
+        addresses: true,
+        displays: true,
+        audio: velora_audio::SUPPORTED,
+    };
     let hs = match handshake(&params, Some(ext)).await {
         // Hosts that predate hello extensions drop the connection: ask again as they expect.
         Err(e) if e.is::<NoReply>() => handshake(&params, None).await?,
@@ -387,6 +407,31 @@ pub async fn connect(params: ConnectParams, output: VideoOutput) -> Result<Sessi
         });
     }
 
+    // The host's sound arrives in datagrams; newer ones only, a lost one is a short gap.
+    let audio = (features & FEATURE_AUDIO != 0).then(velora_audio::Player::start).and_then(|player| match player {
+        Ok(player) => Some(Arc::new(player)),
+        Err(e) => {
+            tracing::warn!("cannot play the host's sound: {e:#}");
+            None
+        }
+    });
+    if let Some(player) = audio.clone() {
+        let conn = conn.clone();
+        tokio::spawn(async move {
+            let mut last = 0;
+            while let Ok(datagram) = conn.read_datagram().await {
+                let Ok(packet) = AudioPacket::decode(&datagram) else { continue };
+                if packet.is_newer_than(last) {
+                    if last == 0 {
+                        tracing::info!("playing the host's sound");
+                    }
+                    last = packet.seq;
+                    player.push(packet.data);
+                }
+            }
+        });
+    }
+
     let decoder = match output {
         #[cfg(feature = "decode")]
         VideoOutput::Decoded { slot, on_frame } => video::spawn_decoder(slot, control_tx.clone(), on_frame),
@@ -418,6 +463,7 @@ pub async fn connect(params: ConnectParams, output: VideoOutput) -> Result<Sessi
         input: InputSender { conn: conn.clone(), control: control_tx, seq: Arc::new(AtomicU32::new(0)) },
         features,
         displays,
+        audio,
         conn,
         runtime: tokio::runtime::Handle::current(),
         _endpoint: endpoint,

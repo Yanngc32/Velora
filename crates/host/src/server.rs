@@ -25,8 +25,8 @@ use velora_protocol::{
     pairing::{pairing_uri_with, parse_pairing_uri, PairingCode},
     tls::{self, Fingerprint},
     wire::{
-        self, ClientMsg, Codec, DisplayInfo, DisplayList, FrameHeader, HelloExt, HostMsg, MouseMove, FEATURE_CLIPBOARD,
-        FEATURE_FILES, PROTOCOL_VERSION,
+        self, AudioPacket, ClientMsg, Codec, DisplayInfo, DisplayList, FrameHeader, HelloExt, HostMsg, MouseMove,
+        FEATURE_AUDIO, FEATURE_CLIPBOARD, FEATURE_FILES, PROTOCOL_VERSION,
     },
 };
 
@@ -806,7 +806,9 @@ async fn run_session(
 ) -> Result<()> {
     let client_name = peer.name.clone();
     let opts = &shared.options;
-    let features = ext.map(|_| FEATURE_FILES | FEATURE_CLIPBOARD);
+    // The host's sound goes to clients that play it, from builds that can capture it.
+    let audio = ext.is_some_and(|e| e.audio) && velora_audio::SUPPORTED;
+    let features = ext.map(|_| FEATURE_FILES | FEATURE_CLIPBOARD | if audio { FEATURE_AUDIO } else { 0 });
     // Sessions start on the primary display.
     let displays = capture::list();
     let first = displays.iter().position(|d| d.primary).unwrap_or(0);
@@ -864,6 +866,24 @@ async fn run_session(
             .encode(),
         )
         .await?;
+
+    if audio {
+        let (conn, session) = (conn.clone(), session.clone());
+        std::thread::Builder::new().name("audio".into()).spawn(move || {
+            let mut seq = 0u32;
+            let sent = velora_audio::stream_loopback(
+                || session.running.load(Ordering::Relaxed),
+                |data| {
+                    seq = seq.wrapping_add(1);
+                    // Fails only once the connection is gone.
+                    conn.send_datagram(AudioPacket { seq, data: data.to_vec() }.encode().into()).is_ok()
+                },
+            );
+            if let Err(e) = sent {
+                tracing::warn!("sound not shared: {e:#}");
+            }
+        })?;
+    }
 
     // Clients that can pick a display hear which there are, now and after every switch.
     let offer_displays = ext.is_some_and(|e| e.displays) && displays.len() > 1;

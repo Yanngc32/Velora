@@ -40,6 +40,8 @@ pub const MAX_DISPLAYS: usize = 16;
 pub const FEATURE_FILES: u32 = 1;
 /// [`HostMsg::Welcome`] feature bit: the host shares its clipboard (see `files::FileMsg::Clipboard`).
 pub const FEATURE_CLIPBOARD: u32 = 2;
+/// [`HostMsg::Welcome`] feature bit: the host sends its sound (see [`AudioPacket`]).
+pub const FEATURE_AUDIO: u32 = 4;
 
 /// What a client that knows about extensions adds to its hello. Hosts that predate them reject
 /// such a hello, and only hellos with it are answered with `features` in the welcome.
@@ -53,6 +55,8 @@ pub struct HelloExt {
     pub addresses: bool,
     /// The client can pick among the host's displays (see [`HostMsg::Displays`]).
     pub displays: bool,
+    /// The client plays the host's sound (see [`AudioPacket`]).
+    pub audio: bool,
 }
 
 /// One of the host's displays, as [`HostMsg::Displays`] lists it.
@@ -258,6 +262,36 @@ impl MouseMove {
     }
 }
 
+/// Host -> client datagram: 20 ms of the host's sound in Opus (see `velora-audio`). Lost ones
+/// are gaps, not retransmissions; `seq` lets the client drop reordered ones.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AudioPacket {
+    pub seq: u32,
+    pub data: Vec<u8>,
+}
+
+impl AudioPacket {
+    const TAG: u8 = 2;
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut b = Vec::with_capacity(5 + self.data.len());
+        b.push(Self::TAG);
+        b.extend_from_slice(&self.seq.to_le_bytes());
+        b.extend_from_slice(&self.data);
+        b
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Self> {
+        ensure!(b.len() > 5 && b[0] == Self::TAG, "invalid audio datagram");
+        Ok(Self { seq: u32::from_le_bytes(b[1..5].try_into().unwrap()), data: b[5..].to_vec() })
+    }
+
+    /// Whether `self` is newer than `last`, tolerating sequence wrap-around.
+    pub fn is_newer_than(&self, last: u32) -> bool {
+        (self.seq.wrapping_sub(last) as i32) > 0
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameHeader {
     pub frame_id: u32,
@@ -419,7 +453,8 @@ impl ClientMsg {
                     w.u8(ext.files_only as u8
                         | (ext.clipboard as u8) << 1
                         | (ext.addresses as u8) << 2
-                        | (ext.displays as u8) << 3);
+                        | (ext.displays as u8) << 3
+                        | (ext.audio as u8) << 4);
                 }
                 w.finish()
             }
@@ -490,6 +525,7 @@ impl ClientMsg {
                         clipboard: flags & 2 != 0,
                         addresses: flags & 4 != 0,
                         displays: flags & 8 != 0,
+                        audio: flags & 16 != 0,
                     })
                 };
                 Self::Hello { version, name, pairing_secret, password, ext }
@@ -666,7 +702,13 @@ mod tests {
                 name: "a".into(),
                 pairing_secret: None,
                 password: None,
-                ext: Some(HelloExt { files_only: false, clipboard: true, addresses: true, displays: true }),
+                ext: Some(HelloExt {
+                    files_only: false,
+                    clipboard: true,
+                    addresses: true,
+                    displays: true,
+                    audio: true,
+                }),
             });
         }
         roundtrip_client(ClientMsg::Key { code: 30, state: KeyState::Repeat });
@@ -749,6 +791,14 @@ mod tests {
         assert!(ClientMsg::decode(&[7, 0]).is_err()); // trailing byte
         assert!(ClientMsg::decode(&[3, 9, 1, 0, 0, 0, 0]).is_err()); // bad button
         assert!(HostMsg::decode(&[1, 1, 0, 0, 0, 9, 0, 0, 0, 0]).is_err()); // bad codec
+    }
+
+    #[test]
+    fn audio_packet_roundtrip_and_ordering() {
+        let packet = AudioPacket { seq: 7, data: vec![1, 2, 3] };
+        assert_eq!(AudioPacket::decode(&packet.encode()).unwrap(), packet);
+        assert!(AudioPacket::decode(&MouseMove { seq: 1, x: 0, y: 0 }.encode()).is_err());
+        assert!(packet.is_newer_than(6) && !packet.is_newer_than(7) && packet.is_newer_than(u32::MAX));
     }
 
     #[test]

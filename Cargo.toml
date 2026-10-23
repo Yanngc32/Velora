@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/protocol", "crates/clipboard", "crates/host", "crates/client-core", "crates/client", "crates/update", "crates/release", "crates/mobile", "crates/uniffi-bindgen"]
+members = ["crates/protocol", "crates/clipboard", "crates/audio", "crates/host", "crates/client-core", "crates/client", "crates/update", "crates/release", "crates/mobile", "crates/uniffi-bindgen"]
 
 [workspace.package]
 version = "0.4.0"
@@ -14,6 +14,7 @@ velora-protocol = { path = "crates/protocol" }
 velora-client-core = { path = "crates/client-core", default-features = false }
 velora-update = { path = "crates/update" }
 velora-clipboard = { path = "crates/clipboard" }
+velora-audio = { path = "crates/audio" }
 anyhow = "1"
 thiserror = "2"
 tracing = "0.1"

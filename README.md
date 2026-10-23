@@ -243,6 +243,14 @@ velora-host password [--clear]      # password paired devices must also type to 
 velora-host run --fps 60 --bitrate 12000 --bind 0.0.0.0:7420 --encoder auto
 ```
 
+### Sound
+
+On Windows, what the host plays comes out of the client during a session. It travels as Opus
+at 96 kbit/s, 20 ms per datagram, through a short buffer: a lost packet is a 20 ms gap, never
+a delay for the ones after it. <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>A</kbd>
+mutes it. Sound needs builds with FFmpeg (the released ones) on both computers; Linux hosts
+and the Android app don't send or play it yet.
+
 ### Lock screen access (Windows)
 
 **This PC → Access on the lock screen** (or `velora-host service install` as administrator)
@@ -377,6 +385,7 @@ project yet (no GPU in CI).
 | `crates/mobile` (`velora-mobile`) | Client core exported to the mobile apps through [UniFFI](https://mozilla.github.io/uniffi-rs/) |
 | `crates/uniffi-bindgen` | Generates the Kotlin (later Swift) bindings for `velora-mobile` |
 | `android/` | Android app (Kotlin): MediaCodec hardware decoding, trackpad, soft and physical keyboards |
+| `crates/audio` (`velora-audio`) | The host's sound: WASAPI loopback capture and playback, Opus through FFmpeg |
 | `crates/update` | Self-updates from GitHub Releases |
 | `crates/release` (`velora-release`) | Release tooling used by CI: packaging and the update manifest |
 
@@ -486,7 +495,7 @@ the Rust core and generates its Kotlin bindings.
    pinch to zoom, a direct-touch mode, and Play Store publishing.
 4. **NAT traversal.** A self-hostable rendezvous server, UDP hole punching, and a relay fallback.
 5. Wayland capture (xdg-desktop-portal + PipeWire), display selection on Linux, cursor shape sync,
-   audio, relative mouse mode for games.
+   sound on Linux and Android, relative mouse mode for games.
 6. A systemd user service; installers.
 
 ## Releasing (maintainers)
