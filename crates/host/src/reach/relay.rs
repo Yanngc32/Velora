@@ -38,10 +38,11 @@
 //!
 //! The host registers under its *host* identity, because clients ask the relay for the host by
 //! the fingerprint they pinned, and the forwarder keys its table by the connection's
-//! certificate. The relay's `authorize` (`server.rs`) lets in the client identities of
-//! `authorized_clients.json`, which a host's identity is not unless it was put there by hand; it
-//! is meant to ask [`trusts`] too, for a link from a host the relay's own user paired with. See
-//! `docs/reach-handover/E4-host-relay.md`.
+//! certificate. That is not one of the client identities in the relay's `authorized_clients.json`,
+//! so the relay's `authorize` (`server.rs`) also lets in a *link* hello from a host that the
+//! relay's own user paired with, one in `known_hosts.json` of the client side of the relay's
+//! computer ([`trusts`]): a link and nothing else. `docs/reach-handover/E4-host-relay.md` says
+//! which pairings a relayed connection needs.
 
 use std::{
     collections::{hash_map::RandomState, BTreeMap, HashMap, HashSet},
@@ -409,9 +410,9 @@ pub fn busy(ctx: &ReachContext) -> bool {
 /// a *link* to this relay without being in `authorized_clients.json`: it registers under its host
 /// identity, which only a pairing in this direction can have put there. A blocking file read.
 ///
-/// The host's `authorize` is meant to ask this for a link hello (`files_only` and `reach`) from a
-/// fingerprint it does not know, and to let it in as a link only: no session, and no access
-/// password, since a link reaches no screen.
+/// The host's `authorize` asks this for a link hello (`files_only` and `reach`, no pairing secret)
+/// from a fingerprint it does not know, and lets it in as a link only: no session, no files, and no
+/// access password, since a link reaches no screen. Nothing else is trusted because of it.
 pub fn trusts(ctx: &ReachContext, fingerprint: &Fingerprint) -> bool {
     let wanted = fingerprint.to_base64();
     client_side_hosts(ctx).is_some_and(|hosts| hosts.iter().any(|host| host.fingerprint == wanted))
@@ -1833,10 +1834,25 @@ mod tests {
         }
     }
 
+    /// The client side of the computer whose host state is `state` pairs with `host`: it is put in the
+    /// `known_hosts.json` beside that state, which is what lets that host register here without being
+    /// one of this host's paired devices.
+    fn trust_host(state: &Path, host: Fingerprint, address: SocketAddr) {
+        let client_dir = state.parent().unwrap().join("client");
+        std::fs::create_dir_all(&client_dir).unwrap();
+        let paired = [entry("home PC", host, &address.to_string())];
+        std::fs::write(client_dir.join(StateDir::KNOWN_HOSTS), serde_json::to_vec(&paired).unwrap()).unwrap();
+    }
+
     impl Prepared {
         /// Lists the client devices (`authorized_clients.json`) this host serves.
         fn pair(&self, devices: &[Fingerprint]) {
             self.state.save(StateDir::AUTHORIZED_CLIENTS, &clients(devices)).unwrap();
+        }
+
+        /// This host's computer has paired with `host` as a client of it.
+        fn trust(&self, host: Fingerprint, address: SocketAddr) {
+            trust_host(self.state.dir(), host, address);
         }
 
         async fn start(self, addr: SocketAddr, relay_only: bool) -> Machine {
@@ -1910,8 +1926,11 @@ mod tests {
         let client_fp = client.fingerprint();
         let (relay, host) = (prepare("relay"), prepare("host"));
         let [relay_addr, host_addr] = free_addrs();
-        // The registering host presents its own (host) identity, which the relay must let in.
-        relay.pair(&[client_fp, host.fingerprint]);
+        // The pairing triangle. The client is a paired client of the relay and of the host. The relay's
+        // computer has paired with the host too (the host is in its `known_hosts.json`), and that is what
+        // lets the host register under its host identity, which is not one of the relay's paired devices.
+        relay.pair(&[client_fp]);
+        relay.trust(host.fingerprint, host_addr);
         host.pair(&[client_fp]);
         Switches { standalone: true, ..Default::default() }.save(&host.state).unwrap();
         host.state.save(RELAYS_FILE, &[entry("relay", relay.fingerprint, &relay_addr.to_string())]).unwrap();
@@ -1976,20 +1995,16 @@ mod tests {
         let Ended::Wait { why, .. } = attempt(&ctx, &candidate(&relay), &slots).await else { panic!("turned away") };
         assert!(why.contains("not paired"), "{why}");
 
-        // A computer that is paired but does not relay for others.
+        // A computer that knows this host but does not relay for others.
         let plain = prepare("attempt-plain");
-        plain.pair(&[ctx.fingerprint]);
+        plain.trust(ctx.fingerprint, ctx.socket.local_addr());
         let plain = plain.start(plain_addr, false).await;
         let Ended::Wait { why, .. } = attempt(&ctx, &candidate(&plain), &slots).await else { panic!("left alone") };
         assert!(why.contains("does not relay"), "{why}");
 
-        // Once the relay's user pairs it, a paired computer is still turned away when this host is
-        // registered with as many relays as it allows.
-        std::fs::write(
-            relay_state.join(StateDir::AUTHORIZED_CLIENTS),
-            serde_json::to_vec(&clients(&[ctx.fingerprint])).unwrap(),
-        )
-        .unwrap();
+        // Once the relay's user pairs with the host, a paired computer is still turned away when this
+        // host is registered with as many relays as it allows.
+        trust_host(&relay_state, ctx.fingerprint, ctx.socket.local_addr());
         let derived = Candidate { explicit: false, ..candidate(&relay) };
         let full = Arc::new(Semaphore::new(0));
         let Ended::Wait { why, wait } = attempt(&ctx, &derived, &full).await else { panic!("turned away by the cap") };
@@ -2034,7 +2049,7 @@ mod tests {
         let (ctx, _scratch) = testing::context("relay-derived");
         let relay = prepare("derived-relay");
         let [relay_addr] = free_addrs();
-        relay.pair(&[ctx.fingerprint]);
+        relay.trust(ctx.fingerprint, ctx.socket.local_addr());
         let relay = relay.start(relay_addr, true).await;
         // The client side of this computer is paired with it; the user listed nothing.
         let client_dir = ctx.client_state_dir().unwrap();
@@ -2071,7 +2086,7 @@ mod tests {
         let (listed_ctx, _listed_scratch) = testing::context("relay-listed");
         let listed = prepare("listed-relay");
         let [listed_addr] = free_addrs();
-        listed.pair(&[listed_ctx.fingerprint]);
+        listed.trust(listed_ctx.fingerprint, listed_ctx.socket.local_addr());
         let listed = listed.start(listed_addr, true).await;
         listed_ctx.reach.update(|state| state.set_addresses(AddressKind::Public, vec!["198.51.100.4:51820".into()]));
         listed_ctx.state_dir.save(RELAYS_FILE, &[entry("mine", listed.fingerprint, &listed_addr.to_string())]).unwrap();
