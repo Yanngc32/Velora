@@ -353,9 +353,19 @@ fn allowed(ctx: &ReachContext) -> Option<HashSet<String>> {
 /// the blocking pool) and `PunchRequest` (the relay opens a stream on the host's connection, which
 /// may take two seconds) are answered from a task of their own, so that the device's control
 /// stream is read meanwhile.
+///
+/// A host that got in because this computer's user paired with it (see [`trusts`]) is not a paired
+/// device: it may register, and a request to be relayed to a host, to wake one or to punch toward
+/// one is refused unless the sender is in `authorized_clients.json`.
 pub async fn handle_message(ctx: &ReachContext, from: &ClientConn, msg: ClientMsg) -> Result<()> {
     let state = ctx.ext::<RelayState>();
     let relay = state.relay.clone();
+    let asks_for_a_host =
+        matches!(msg, ClientMsg::RelayTo { .. } | ClientMsg::Wake { .. } | ClientMsg::PunchRequest { .. });
+    if asks_for_a_host && !is_paired_client(ctx, &from.fingerprint).await {
+        let reason = "only a paired device may ask this computer to relay to a host";
+        return from.control.try_send(HostMsg::RelayStatus { ok: false, reason: reason.into() });
+    }
     match msg {
         ClientMsg::RelayRegister { .. } | ClientMsg::RelayTo { .. } => {
             let registering = matches!(msg, ClientMsg::RelayRegister { .. });
@@ -382,6 +392,16 @@ pub async fn handle_message(ctx: &ReachContext, from: &ClientConn, msg: ClientMs
         _ => {}
     }
     Ok(())
+}
+
+/// Whether `fingerprint` is one of the client devices paired with this host (`authorized_clients.json`).
+async fn is_paired_client(ctx: &ReachContext, fingerprint: &Fingerprint) -> bool {
+    let (ctx, wanted) = (ctx.clone(), fingerprint.to_base64());
+    let reading = tokio::task::spawn_blocking(move || {
+        let clients: Vec<AuthorizedClient> = ctx.state_dir.load(StateDir::AUTHORIZED_CLIENTS).unwrap_or_default();
+        clients.iter().any(|client| client.fingerprint == wanted)
+    });
+    reading.await.unwrap_or(false)
 }
 
 /// A paired device was removed in the launcher (called through `reach::on_revoked`, from a
@@ -1631,11 +1651,22 @@ mod tests {
 
     // Serving ----------------------------------------------------------------------------------
 
-    /// A throwaway device connected to the host of `ctx`, and what the hooks are given for it.
+    /// A throwaway device connected to the host of `ctx`, and what the hooks are given for it. It is
+    /// a paired client of that host (in its `authorized_clients.json`).
     async fn device(ctx: &ReachContext, name: &str) -> (testing::Link, ClientConn, mpsc::Receiver<HostMsg>) {
+        let (link, from, outbox) = unpaired_device(ctx, name).await;
+        let mut paired: Vec<AuthorizedClient> = ctx.state_dir.load(StateDir::AUTHORIZED_CLIENTS).unwrap_or_default();
+        paired.extend(clients(&[from.fingerprint]));
+        ctx.state_dir.save(StateDir::AUTHORIZED_CLIENTS, &paired).unwrap();
+        (link, from, outbox)
+    }
+
+    /// Like [`device`], but not paired: a host that got in because its computer is trusted.
+    async fn unpaired_device(ctx: &ReachContext, name: &str) -> (testing::Link, ClientConn, mpsc::Receiver<HostMsg>) {
         let link = testing::connect(ctx).await;
         let (from, outbox) = testing::client_conn(&link, name);
-        (link, from, outbox)
+        let fingerprint = tls::peer_fingerprint(&link.server).unwrap();
+        (link, ClientConn { fingerprint, ..from }, outbox)
     }
 
     /// The `RelayStatus` the hooks queued for a device.
@@ -1695,6 +1726,33 @@ mod tests {
         assert!(state.relay.registered().is_empty() && !busy(&ctx));
         let saved: Vec<KnownRecord> = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
         assert!(saved.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_host_that_is_only_trusted_may_register_and_nothing_more() {
+        let (ctx, _scratch) = testing::context("relay-trusted-only");
+        let (_host_link, host, mut host_outbox) = unpaired_device(&ctx, "home PC").await;
+        handle_message(&ctx, &host, ClientMsg::RelayRegister { mac: None }).await.unwrap();
+        assert_eq!(answer(&mut host_outbox).await, (true, String::new()));
+
+        // It cannot ask to be relayed to a host, to wake one, or to punch toward one.
+        let other = Fingerprint([5; 32]).to_base64();
+        let requests = [
+            ClientMsg::RelayTo { fingerprint: other.clone() },
+            ClientMsg::Wake { fingerprint: other.clone() },
+            ClientMsg::PunchRequest { to: other.clone(), endpoint: "198.51.100.7:4000".into(), nonce: 1 },
+        ];
+        for request in requests {
+            handle_message(&ctx, &host, request).await.unwrap();
+            let (ok, reason) = answer(&mut host_outbox).await;
+            assert!(!ok && reason.contains("only a paired device"), "{reason}");
+        }
+
+        // A paired client is not turned away by that rule: the forwarder answers it, about the host it asked for.
+        let (_client_link, client, mut client_outbox) = device(&ctx, "phone").await;
+        handle_message(&ctx, &client, ClientMsg::RelayTo { fingerprint: other }).await.unwrap();
+        let (ok, reason) = answer(&mut client_outbox).await;
+        assert!(!ok && reason.contains("never registered"), "{reason}");
     }
 
     #[tokio::test]
