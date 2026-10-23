@@ -26,7 +26,7 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic))]
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt, fs,
     future::Future,
     io::{self, Read, Write},
@@ -154,7 +154,9 @@ pub struct Config {
     /// The address of the DHT socket. `None`: all interfaces.
     pub bind_address: Option<Ipv4Addr>,
     /// The port of the DHT socket. `None`: 6881, or any free port when that one is taken, which is what production
-    /// wants (a busy fixed port is an error).
+    /// wants (a busy fixed port is an error). A fixed port also means that a node cannot be replaced while the one
+    /// it replaces is alive, since that one holds the port: an idle node is kept, and one whose table stays empty is
+    /// not built again.
     pub port: Option<u16>,
     /// How long a node is waited for. `None`: `mainline`'s 2 s. A lookup lasts at least this long whenever one of the
     /// nodes it asks never answers, as on a test network, whose servers hand out the addresses of its clients.
@@ -198,7 +200,9 @@ impl Config {
 #[derive(Debug, Clone, Default)]
 pub struct ResolveOptions {
     /// A poll for changes: only a record with a higher `seq` counts, and the nodes do not send the one the caller
-    /// already has. An unchanged record reads as `None`.
+    /// already has. An unchanged record reads as `None`. `mainline` joins a lookup to one already running for the same
+    /// record and keeps the first one's question, so polls of one record must not go backwards: a poll with a lower
+    /// `newer_than` than one still running (a lookup lasts up to 3 s) hears "nothing newer" and reads as unchanged.
     pub newer_than: Option<i64>,
     /// Gives up after this long. `None`: [`Config::resolve_deadline`].
     pub deadline: Option<Duration>,
@@ -300,7 +304,9 @@ impl Node {
     /// bootstrap nodes behind it, and that saves its table there after its lookups and publishes.
     ///
     /// It does not fail: a network that is not there yet, or a socket that cannot be opened, are reported by the first
-    /// call that needs the DHT, which tries again.
+    /// call that needs the DHT, which tries again. It does wait for the node to start, which takes a few milliseconds
+    /// and, with no saved nodes and a slow resolver for the default names, up to two seconds: `tokio::spawn` it where
+    /// the caller must not wait.
     pub async fn open(cache_path: impl AsRef<Path>, mode: Mode) -> Node {
         let mut config = Config::new(mode);
         config.cache_path = Some(cache_path.as_ref().to_path_buf());
@@ -472,6 +478,8 @@ struct State {
     saved: Vec<SocketAddrV4>,
     /// What each default name resolved to the last time it did.
     defaults: HashMap<String, Vec<SocketAddrV4>>,
+    /// The default names being looked up now: a resolver that hangs is not asked again by every call.
+    pending: HashSet<String>,
     seqs: HashMap<SeqKey, SeqEntry>,
     /// Counts the changes to `seqs` that are ours to keep; the file is up to date when `seqs_saved` has caught up.
     seqs_version: u64,
@@ -479,11 +487,6 @@ struct State {
     /// The blob this process last put under a key's `seq`: another blob under the same `seq` would be ignored by the
     /// nodes that kept the first, and the lookup before a put may not have heard from them.
     spent: HashMap<SeqKey, (i64, [u8; 32])>,
-    /// What the cache file holds, as far as this process knows.
-    written: Option<Vec<u8>>,
-    /// The cache file is there but could not be read (a sharing violation, say): nothing is written over it from a table
-    /// too small to be worth more than it holds.
-    cache_unreadable: bool,
     last_save: Option<Instant>,
     observed: Option<SocketAddrV4>,
 }
@@ -513,6 +516,18 @@ struct Handle {
     quorum: usize,
     /// The list had a table's worth of saved nodes, so the node does not need to wait for its table to fill.
     warm: bool,
+}
+
+/// A default name being looked up; the name is free again when this is dropped, however the thread ended.
+struct Pending {
+    inner: Arc<Inner>,
+    name: String,
+}
+
+impl Drop for Pending {
+    fn drop(&mut self) {
+        self.inner.lock().pending.remove(&self.name);
+    }
 }
 
 /// A record to publish, signed.
@@ -563,12 +578,9 @@ impl Inner {
     }
 
     fn adopt(&self, loaded: Loaded) {
-        let Loaded { cache, readable } = loaded;
+        let Loaded { cache, .. } = loaded;
         let limit = unix_now().saturating_add(MAX_SEQ_AHEAD);
         let mut state = self.lock();
-        state.cache_unreadable = !readable;
-        // What the file holds, so that a save that would write the same thing does not.
-        state.written = Some(cache.render());
         state.saved = spread(&cache.nodes, MAX_SAVED_NODES);
         for (key, entry) in cache.seqs {
             if entry.seq <= limit {
@@ -603,7 +615,13 @@ impl Inner {
         if let Some(handle) = self.fresh_handle() {
             return Ok(handle);
         }
-        let _building = self.build.lock().await;
+        let _building = match until {
+            Some(until) => match timeout_at(until, self.build.lock()).await {
+                Ok(guard) => guard,
+                Err(_) => return Err(Error::TimedOut),
+            },
+            None => self.build.lock().await,
+        };
         if let Some(handle) = self.fresh_handle() {
             return Ok(handle);
         }
@@ -640,7 +658,7 @@ impl Inner {
 
     /// The saved nodes, then the default ones. Saved ones first: they answer in 25 ms, and a start that only had the
     /// four names sometimes hears from none of them.
-    async fn bootstrap_list(&self, until: Option<Instant>) -> (Vec<SocketAddrV4>, bool) {
+    async fn bootstrap_list(self: &Arc<Self>, until: Option<Instant>) -> (Vec<SocketAddrV4>, bool) {
         let saved = spread(&self.lock().saved, MAX_SAVED_NODES);
         let warm = saved.len() >= self.warm_at();
         let defaults = match &self.config.default_nodes {
@@ -662,36 +680,46 @@ impl Inner {
 
     /// `mainline` resolves the names one after the other inside its blocking `build()`, with no limit on the wait, and
     /// silently without the ones that fail. Here each name has a thread of its own and the wait has a limit: the names
-    /// that answered in time are used, so a slow one does not cost the others, and a name that did not keeps the last
-    /// answer it gave.
-    async fn resolve_defaults<R>(&self, names: &[&str], wait: Duration, resolver: R) -> Vec<SocketAddrV4>
+    /// that answered in time are used, so a slow one does not cost the others. A thread keeps its answer when it has
+    /// one, even after the wait, so a name that did not answer in time uses the last answer it gave. A name is looked
+    /// up by one thread at a time: a resolver that hangs is not asked again by every call.
+    async fn resolve_defaults<R>(self: &Arc<Self>, names: &[&str], wait: Duration, resolver: R) -> Vec<SocketAddrV4>
     where
         R: Fn(&str) -> Vec<SocketAddrV4> + Send + Sync + 'static,
     {
         let resolver = Arc::new(resolver);
-        let tasks: Vec<_> = names
-            .iter()
-            .map(|name| {
-                let (name, resolver) = ((*name).to_owned(), resolver.clone());
-                (name.clone(), tokio::task::spawn_blocking(move || resolver(&name)))
-            })
-            .collect();
+        let mut tasks = Vec::new();
+        for name in names {
+            let name = (*name).to_owned();
+            if !self.lock().pending.insert(name.clone()) {
+                tasks.push((name, None));
+                continue;
+            }
+            let (pending, resolver) = (Pending { inner: self.clone(), name: name.clone() }, resolver.clone());
+            let task = tokio::task::spawn_blocking(move || {
+                let found = resolver(&pending.name);
+                if !found.is_empty() {
+                    pending.inner.lock().defaults.insert(pending.name.clone(), found.clone());
+                }
+                found
+            });
+            tasks.push((name, Some(task)));
+        }
         let limit = after(wait);
         let mut addresses = Vec::new();
         for (name, task) in tasks {
-            let fresh = match timeout_at(limit, task).await {
-                Ok(Ok(found)) if !found.is_empty() => Some(found),
-                _ => None,
+            let fresh = match task {
+                Some(task) => match timeout_at(limit, task).await {
+                    Ok(Ok(found)) if !found.is_empty() => Some(found),
+                    _ => None,
+                },
+                None => None,
             };
-            let mut state = self.lock();
             match fresh {
-                Some(found) => {
-                    addresses.extend(found.iter().copied());
-                    state.defaults.insert(name, found);
-                }
+                Some(found) => addresses.extend(found),
                 None => {
                     debug!(name, "a default bootstrap name did not resolve in time");
-                    addresses.extend(state.defaults.get(&name).into_iter().flatten().copied());
+                    addresses.extend(self.lock().defaults.get(&name).into_iter().flatten().copied());
                 }
             }
         }
@@ -869,13 +897,16 @@ impl Inner {
         }
     }
 
-    /// Out of time with the lookup still running. Nodes in the table mean the network is there.
-    async fn out_of_time(&self, handle: &Handle) -> Result<Option<Resolved>, Error> {
+    /// Out of time with the lookup still running. Nodes in the table mean the network is there, and the node has been
+    /// used all the same: a caller that always gives a lookup less time than it needs (a poll) keeps its node fresh and
+    /// its cache up to date.
+    async fn out_of_time(self: &Arc<Self>, handle: &Handle) -> Result<Option<Resolved>, Error> {
         if handle.dht.to_bootstrap().await.is_empty() {
-            Err(Error::NoNetwork)
-        } else {
-            Ok(None)
+            return Err(Error::NoNetwork);
         }
+        self.touch(handle.generation);
+        self.schedule_save(handle.clone());
+        Ok(None)
     }
 
     // === publish ===
@@ -929,6 +960,10 @@ impl Inner {
             // From here this `seq` is spent, even if the put fails: a node may have kept it, and another blob under
             // the same `seq` would be ignored there.
             self.record_seq(public, &salt_bytes, seq, Some(digest));
+            // Written ahead: a process that dies in the put must know, when it starts again, that this `seq` is spent.
+            if let Err(e) = self.save(true, Some(handle.clone()), used).await {
+                debug!(error = %e, "could not save the DHT cache");
+            }
             let put = match timeout_at(deadline, handle.dht.put_mutable(item.clone(), None)).await {
                 Ok(put) => put,
                 Err(_) => return Err(Error::TimedOut),
@@ -1039,12 +1074,13 @@ impl Inner {
                 *spent = (seq, digest);
             }
         }
-        if state.seqs.len() > MAX_SEQS {
-            let oldest = state.seqs.iter().min_by_key(|(_, entry)| entry.at).map(|(key, _)| key.clone());
-            if let Some(oldest) = oldest {
-                state.seqs.remove(&oldest);
-                state.spent.remove(&oldest);
-            }
+        Self::trim_seqs(&mut state);
+    }
+
+    /// Keeps the records used most lately, `MAX_SEQS` of them.
+    fn trim_seqs(state: &mut State) {
+        for key in keep_newest(&mut state.seqs) {
+            state.spent.remove(&key);
         }
     }
 
@@ -1072,10 +1108,12 @@ impl Inner {
         });
     }
 
-    /// Writes the table of the node `from` (the running one when `None`) and the `seq` numbers. A table smaller than a
-    /// quorum is not written over a better one (a node that has just started, or has been idle, has almost nothing in
-    /// it); the old nodes stay and only the `seq` numbers are updated. `force` writes even if the file was written
-    /// lately. The file is read first, for the `seq` numbers other nodes put there since: the highest of each is kept.
+    /// Writes the table of the node `from` (the running one when `None`) and the `seq` numbers. The file is read first:
+    /// the highest `seq` of each key in it and ours is kept, so two nodes on one file keep each other's, and nothing is
+    /// written when the file already says what would be written. A table smaller than a quorum is not written over a
+    /// better one (a node that has just started, or has been idle, has almost nothing in it): the nodes of the file
+    /// stay and only the `seq` numbers are updated; a file that cannot be read now is not touched from such a table.
+    /// `force` writes even if the file was written lately.
     async fn save(self: &Arc<Self>, force: bool, from: Option<Handle>, used: &AtomicU64) -> Result<bool, Error> {
         let Some(path) = self.config.cache_path.clone() else {
             return Ok(false);
@@ -1100,40 +1138,50 @@ impl Inner {
         let (bytes, nodes, version) = {
             let mut state = self.lock();
             let good = table.len() >= quorum;
-            if state.cache_unreadable && !on_disk.readable && !good {
+            if !on_disk.readable && !good {
                 return Ok(false);
             }
-            for (key, entry) in on_disk.cache.seqs {
-                if entry.seq <= limit {
-                    let ours = state.seqs.entry(key).or_insert(entry);
-                    if entry.seq > ours.seq {
-                        *ours = entry;
+            // The file lacks something of ours: another writer replaced it. Worth a write whatever the last one was.
+            let disk_behind = state
+                .seqs
+                .iter()
+                .any(|(key, ours)| on_disk.cache.seqs.get(key).is_none_or(|theirs| theirs.seq < ours.seq));
+            for (key, theirs) in &on_disk.cache.seqs {
+                if theirs.seq <= limit {
+                    let ours = state.seqs.entry(key.clone()).or_insert(*theirs);
+                    if theirs.seq > ours.seq {
+                        *ours = *theirs;
                     }
                 }
             }
-            let nodes = if good { spread(&table, MAX_SAVED_NODES) } else { state.saved.clone() };
-            let bytes = CacheFile { nodes: nodes.clone(), seqs: state.seqs.clone() }.render();
-            if state.written.as_deref() == Some(bytes.as_slice()) {
+            Self::trim_seqs(&mut state);
+            let nodes = if good {
+                spread(&table, MAX_SAVED_NODES)
+            } else if on_disk.readable && !on_disk.cache.nodes.is_empty() {
+                spread(&on_disk.cache.nodes, MAX_SAVED_NODES)
+            } else {
+                state.saved.clone()
+            };
+            let ours = CacheFile { nodes, seqs: state.seqs.clone() };
+            if on_disk.readable && on_disk.cache == ours {
+                state.saved = ours.nodes;
+                state.seqs_saved = state.seqs_version;
                 return Ok(false);
             }
             let lately = state.last_save.is_some_and(|saved| saved.elapsed() < SAVE_EVERY);
-            if !force && state.seqs_version == state.seqs_saved && lately {
+            if !force && state.seqs_version == state.seqs_saved && !disk_behind && lately {
                 return Ok(false);
             }
-            (bytes, nodes, state.seqs_version)
+            (ours.render(), ours.nodes, state.seqs_version)
         };
-        let to_write = bytes.clone();
-        let written = tokio::task::spawn_blocking(move || write_atomically(&path, &to_write))
-            .await
-            .map_err(|_| Error::Stopped)?;
+        let written =
+            tokio::task::spawn_blocking(move || write_atomically(&path, &bytes)).await.map_err(|_| Error::Stopped)?;
         let mut state = self.lock();
         state.last_save = Some(Instant::now());
         if let Err(e) = written {
             return Err(Error::Cache(e));
         }
-        state.written = Some(bytes);
         state.seqs_saved = version;
-        state.cache_unreadable = false;
         state.saved = nodes;
         Ok(true)
     }
@@ -1383,7 +1431,7 @@ impl CacheFile {
                 }
                 Some("seq") => {
                     if let Some((key, entry)) = parse_seq(&mut words) {
-                        if cache.seqs.len() < MAX_SEQS {
+                        if cache.seqs.len() < 4 * MAX_SEQS {
                             cache.seqs.insert(key, entry);
                         }
                     }
@@ -1391,6 +1439,7 @@ impl CacheFile {
                 _ => {}
             }
         }
+        keep_newest(&mut cache.seqs);
         cache
     }
 
@@ -1460,6 +1509,21 @@ fn check_salt(salt: &[u8]) -> Result<(), Error> {
 fn after(span: Duration) -> Instant {
     let now = Instant::now();
     now.checked_add(span).unwrap_or_else(|| now + Duration::from_secs(24 * 60 * 60))
+}
+
+/// Drops the records used longest ago until `MAX_SEQS` are left, and says which.
+fn keep_newest(seqs: &mut HashMap<SeqKey, SeqEntry>) -> Vec<SeqKey> {
+    let extra = seqs.len().saturating_sub(MAX_SEQS);
+    if extra == 0 {
+        return Vec::new();
+    }
+    let mut by_age: Vec<(i64, SeqKey)> = seqs.iter().map(|(key, entry)| (entry.at, key.clone())).collect();
+    by_age.sort();
+    let dropped: Vec<SeqKey> = by_age.into_iter().take(extra).map(|(_, key)| key).collect();
+    for key in &dropped {
+        seqs.remove(key);
+    }
+    dropped
 }
 
 fn digest_of(blob: &[u8]) -> [u8; 32] {
@@ -2489,7 +2553,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_slow_default_name_costs_the_others_nothing() {
-        let inner = Inner::new(Config::new(Mode::Client));
+        let inner = Arc::new(Inner::new(Config::new(Mode::Client)));
         let (fast, slow) = (
             SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 1), 6881),
             SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 2), 6881),
@@ -2501,23 +2565,46 @@ mod tests {
             .resolve_defaults(&names, Duration::from_millis(300), move |name: &str| match name {
                 "fast.example" => vec![fast],
                 "slow.example" => {
-                    std::thread::sleep(Duration::from_millis(1500));
+                    std::thread::sleep(Duration::from_millis(1000));
                     vec![slow]
                 }
                 _ => Vec::new(),
             })
             .await;
         assert_eq!(first, vec![fast], "the one that answered in time");
-        assert!(started.elapsed() < Duration::from_secs(1), "{:?}", started.elapsed());
+        assert!(started.elapsed() < Duration::from_millis(900), "{:?}", started.elapsed());
 
-        // Next time the slow one answers and the fast one does not: it keeps the address it had.
-        let second = inner
-            .resolve_defaults(&names, Duration::from_millis(300), move |name: &str| match name {
-                "slow.example" => vec![slow],
-                _ => Vec::new(),
+        // Later the fast one does not answer and the slow one, which did, after the wait, is remembered: each keeps the
+        // last address it gave.
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        let second = inner.resolve_defaults(&names, Duration::from_millis(300), move |_: &str| Vec::new()).await;
+        assert_eq!(second, vec![fast, slow]);
+    }
+
+    #[tokio::test]
+    async fn a_default_name_that_hangs_is_not_asked_again_by_every_call() {
+        let inner = Arc::new(Inner::new(Config::new(Mode::Client)));
+        let slow = SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 2), 6881);
+        let asked = Arc::new(AtomicU32::new(0));
+        let counter = asked.clone();
+        let names = ["slow.example"];
+
+        let first = inner
+            .resolve_defaults(&names, Duration::from_millis(100), move |_: &str| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(600));
+                vec![slow]
             })
             .await;
-        assert_eq!(second, vec![fast, slow]);
+        assert!(first.is_empty(), "not in time");
+        // The thread is still waiting: another call does not start a second one.
+        let again = inner.resolve_defaults(&names, Duration::from_millis(100), move |_: &str| vec![slow]).await;
+        assert!(again.is_empty());
+        assert_eq!(asked.load(Ordering::SeqCst), 1);
+        // Its answer came after the wait; the next call has it, whatever the resolver says by then.
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        let later = inner.resolve_defaults(&names, Duration::from_millis(100), move |_: &str| Vec::new()).await;
+        assert_eq!(later, vec![slow]);
     }
 
     #[tokio::test]
@@ -2551,6 +2638,103 @@ mod tests {
         assert!(matches!(err, Error::NoNetwork), "{err:?}");
         let err = node.publish(&signer, SALT, b"second", 1001).await.unwrap_err();
         assert!(matches!(err, Error::NoNetwork), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_cache_that_could_not_be_read_at_start_keeps_its_nodes_once_it_can_be() {
+        let dir = Scratch::new();
+        let path = dir.file("cache.txt");
+        // A directory where the file should be: nothing can be read at the start.
+        fs::create_dir(&path).unwrap();
+        let mut config = Config::new(Mode::Host);
+        config.default_nodes = DefaultNodes::fixed(Vec::new());
+        config.cache_path = Some(path.clone());
+        let node = Node::open_with(config).await;
+
+        // Then it is a file, with a good table in it. A seq to write, from a node with no table: the nodes stay.
+        fs::remove_dir(&path).unwrap();
+        let good = CacheFile {
+            nodes: (1..=12).map(|n| SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, n), 6881)).collect(),
+            seqs: HashMap::new(),
+        };
+        fs::write(&path, good.render()).unwrap();
+        node.inner.record_seq([4; 32], b"s", 9, None);
+        assert!(node.save_cache().await.unwrap());
+        let after = CacheFile::parse(&fs::read_to_string(&path).unwrap());
+        assert_eq!(after.nodes, good.nodes);
+        assert_eq!(after.seqs.get(&([4; 32], b"s".to_vec())).map(|e| e.seq), Some(9));
+    }
+
+    #[tokio::test]
+    async fn a_file_that_another_writer_replaced_gets_our_seq_back_without_waiting() {
+        let dir = Scratch::new();
+        let path = dir.file("cache.txt");
+        let mut config = Config::new(Mode::Host);
+        config.default_nodes = DefaultNodes::fixed(Vec::new());
+        config.cache_path = Some(path.clone());
+        let node = Node::open_with(config).await;
+        node.inner.record_seq([5; 32], b"s", 11, None);
+        assert!(node.save_cache().await.unwrap());
+
+        // Another writer replaces the file with one that lacks our seq. A save that is not forced, soon after the last
+        // one, sees that and writes again.
+        fs::write(&path, CacheFile::default().render()).unwrap();
+        let used = AtomicU64::new(0);
+        assert!(node.inner.save(false, None, &used).await.unwrap());
+        assert!(fs::read_to_string(&path).unwrap().contains(&format!("seq {} ", to_hex(&[5; 32]))));
+        // And when the file says what we would write, nothing is written.
+        assert!(!node.inner.save(false, None, &used).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_lookup_that_runs_out_of_time_still_counts_as_use() {
+        let net = testnet(3);
+        let host = Node::open_with(config(&net, Mode::Host)).await;
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        let before = SystemTime::now();
+
+        // A deadline shorter than a lookup (the testnet's clients never answer, so one lasts as long as a timeout):
+        // nothing is found in time, and the node was used all the same.
+        let options = ResolveOptions { newer_than: None, deadline: Some(Duration::from_millis(300)) };
+        assert_eq!(host.resolve_with(&key(34).public_key(), SALT, &options).await.unwrap(), None);
+        let fresh_since = host.inner.lock().running.as_ref().map(|running| running.fresh_since).unwrap();
+        assert!(fresh_since >= before, "the node counts as used");
+    }
+
+    #[tokio::test]
+    async fn a_call_does_not_wait_for_a_build_in_progress_past_its_deadline() {
+        let net = testnet(3);
+        let host = Node::open_with(config(&net, Mode::Host)).await;
+        // The node is gone and a build is in progress that does not end.
+        host.inner.forget(generation(&host));
+        let _building = host.inner.build.lock().await;
+
+        let options = ResolveOptions { newer_than: None, deadline: Some(Duration::from_millis(400)) };
+        let started = std::time::Instant::now();
+        let public = key(35).public_key();
+        let call = host.resolve_with(&public, SALT, &options);
+        let err = tokio::time::timeout(Duration::from_secs(10), call).await.expect("the call gives up by itself");
+        assert!(matches!(err, Err(Error::TimedOut)), "{err:?}");
+        assert!(started.elapsed() < Duration::from_secs(3), "{:?}", started.elapsed());
+    }
+
+    #[test]
+    fn only_the_seq_numbers_used_most_lately_are_kept() {
+        let mut seqs: HashMap<SeqKey, SeqEntry> =
+            (0..100u8).map(|n| (([n; 32], Vec::new()), SeqEntry { seq: 1, at: i64::from(n) })).collect();
+        let dropped = keep_newest(&mut seqs);
+        assert_eq!((seqs.len(), dropped.len()), (MAX_SEQS, 100 - MAX_SEQS));
+        assert!(dropped.iter().all(|key| usize::from(key.0[0]) < 100 - MAX_SEQS), "the oldest go");
+        assert!(seqs.keys().all(|key| usize::from(key.0[0]) >= 100 - MAX_SEQS));
+
+        // A file with more lines than that keeps the newest too, and not the first in some order.
+        let mut text = format!("{CACHE_HEADER}\n");
+        for n in 0..100u8 {
+            text += &format!("seq {} - 1 {n}\n", to_hex(&[n; 32]));
+        }
+        let parsed = CacheFile::parse(&text);
+        assert_eq!(parsed.seqs.len(), MAX_SEQS);
+        assert!(parsed.seqs.keys().all(|key| usize::from(key.0[0]) >= 100 - MAX_SEQS));
     }
 
     #[tokio::test]

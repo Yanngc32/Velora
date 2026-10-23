@@ -4,12 +4,13 @@ Branch `claude/reach-c2-dht-node-f27e6c` (from 35081ec). Files: `crates/dht/src/
 dependency the coordinator allowed: `futures-lite = { version = "2", default-features = false }` in
 `crates/dht/Cargo.toml` (mainline's `get_mutable` stream implements only that crate's `Stream` and has no method of
 its own) with the matching line in `Cargo.lock` (only the name in the `velora-dht` entry). fmt, clippy `-D warnings` and
-`cargo test -p velora-dht` green on Windows (98 tests, 1 `#[ignore]` against the public DHT); Linux not compiled here.
+`cargo test -p velora-dht` green on Windows (104 tests, 1 `#[ignore]` against the public DHT); Linux not compiled here.
 `node.rs` carries `#![cfg_attr(not(test), deny(clippy::unwrap_used, expect_used, indexing_slicing, panic))]` like `seal.rs`.
-An independent read of the module (a fresh agent, read-only, no conclusions given) found ten defects; each was checked
-against `mainline`'s source and fixed, with a test that fails when the defect is put back (the lookups that `mainline`
-joins, the quorum on the public network, a fixed port, panics in detached tasks, DNS names resolved all or nothing,
-deadlines, the cache file, a second blob under a spent `seq`).
+Two independent reads of the module (fresh agents, read-only, the first given no conclusions) found ten defects and then
+nine more; each was checked against `mainline`'s source and fixed or documented, and each fix has a test that fails when
+the defect is put back (checked by putting 18 of them back by hand): the lookups that `mainline` joins, the quorum on the
+public network, a fixed port, panics in detached tasks, default names that resolve slowly, deadlines, the cache file read
+and written by two nodes or after a failed read, a second blob under a spent `seq`, a `seq` spent when the process dies.
 
 ## API
 
@@ -53,15 +54,17 @@ enum Error { NoNetwork, TooBig { len }, SaltTooBig { len }, Refused { acknowledg
 - **Publish.** Reads first (a whole lookup, which also leaves the nodes and tokens the put goes to): a stored record with a
   higher `seq`, or the same one and another value, is `SeqTooLow` before anything is sent, and so is another blob under a
   `seq` this node already put one under (checked first, without asking). Then the put; fewer than a quorum of
-  acknowledgements means a second round (new lookup, new put), then `Refused`. The `seq` counts as spent from the put on,
-  even if it fails, and is saved to the cache even then. One publish at a time per node; waiting for the one before ends
-  at the call's deadline.
+  acknowledgements means a second round (new lookup, new put), then `Refused`. The `seq` counts as spent from the put on:
+  it is written to the cache before the put, so that a process that dies in it still knows. One publish at a time per
+  node; waiting for the one before, or for a build in progress, ends at the call's deadline.
 - **Cache.** Text file (`velora-dht-cache 1`, `node ip:port` lines, `seq <key> <salt> <seq> <time>` lines), written
   atomically (a temporary file of its own per write) right after a publish and 3 s after a resolve (when its lookup has
   ended; at most every 5 minutes), never from a table smaller than a quorum (the old nodes stay, only the `seq` lines
-  change). The file is read first at every save and the highest `seq` of each key kept, so two nodes on one file keep
-  each other's. A file that is not ours or too big is an empty cache; one that is there but cannot be read (a sharing
-  violation) is not written over from a small table; a saved `seq` more than 7 days ahead of the clock is dropped.
+  change). The file is read first at every save: the highest `seq` of each key in it and ours is kept (so two nodes on
+  one file keep each other's, and a write that another writer undid is redone), nothing is written when the file already
+  says it, and a table below quorum keeps the nodes the file has. A file that is not ours or too big is an empty cache; one
+  that is there but cannot be read (a sharing violation) is not written over from a small table. The 64 `seq` numbers
+  kept are the ones used most lately; one more than 7 days ahead of the clock is dropped.
 - **Host mode** replaces a node left alone for 10 minutes before the next use (its table rotted in 15; a night asleep counts,
   the clock is the wall clock). `Client` never does. If a new node cannot be made (a fixed `port` that the old one still
   holds), the idle one is kept. Without a fixed port the new node takes 6881 or any free port, so the DHT port changes.
@@ -116,14 +119,22 @@ were refused as `SeqTooLow` by the read, and a client read the newer record afte
   `seal::open(&r.value, SALT, r.seq, &secret)`; `Ok(None)` and every error: no candidates, `debug!` it. The cache is
   written 3 s after the resolve by a task the node keeps, so a process that ends sooner skips it.
 - **E5/F4 (punch items).** `resolve_with` with `newer_than: Some(last seq)` is the poll: an unchanged item is `Ok(None)`.
-  Every call is a lookup (about 70 datagrams from a running node, 2.5-2.8 s), so poll slowly. `Signer` is also
-  implemented for a bare `mainline::SigningKey`: C3's derived key goes straight into `publish_with`.
+  Every call is a lookup (about 70 datagrams from a running node, 2.5-2.8 s), so poll slowly, and never with a lower
+  `newer_than` than a poll of the same record still running (`mainline` joins the two and the second hears the first one's
+  "nothing newer"). A poll that gives a lookup less time than it needs ends `Ok(None)` and still counts as use.
+  `Signer` is implemented for a bare `mainline::SigningKey`, so C3's `Built` goes straight in:
+  `node.publish(&built.0, built.1, &built.3, built.2)`. C3 chooses its own `seq` (`build_after` applies max(clock, last + 1)
+  to the `last_seq` F4 keeps); the node still refuses a `seq` that cannot win: on `Error::SeqTooLow { seen, .. }` F4 builds
+  again with `build_after(.., seen)` and publishes again.
 - **E2.** `observed_address()` is `None` until a lookup has ended (about 3 s after the node started; a publish or a resolve
   gets there) and is the raw BEP 42 vote: it can be a private address, and its port is the DHT socket's, not QUIC's. Ask E3's
   node; do not open a second one.
 - **E1/G3.** `mainline=error` in the tracing filters is still needed (the 10060 warning, 17 a second, S0 §9.2).
 - **Everyone.** A node is one OS thread and one UDP socket (6881 when free, else any port). The first bind may bring a
   Windows firewall prompt for an executable without a rule. `Config` is `non_exhaustive`: `Config::new(mode)` and set fields.
+  `Node::open` waits for the node to start (milliseconds; up to 2 s with no saved nodes and a slow resolver): `tokio::spawn`
+  it where the caller must not wait. F2's 5 s cap fits a record that exists (1-2 s cold, 0.3-1 s warm); the retry of an empty
+  cold lookup needs about 6 s and may be cut.
 
 ## Not tested
 
