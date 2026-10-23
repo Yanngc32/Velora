@@ -1653,6 +1653,15 @@ mod tests {
         config
     }
 
+    /// [`config`] with a majority as the quorum: what a put reached and what a lookup heard from then have a node in
+    /// common, which is what a test needs when the lookup before a put must see the record an earlier put stored. With
+    /// a quorum of one, a lookup can hear only from the nodes that lost that put.
+    fn majority(testnet: &Testnet, mode: Mode) -> Config {
+        let mut config = config(testnet, mode);
+        config.quorum = Some(testnet.nodes.len() / 2 + 1);
+        config
+    }
+
     fn key(seed: u8) -> SigningKey {
         SigningKey::from_bytes(&[seed; 32])
     }
@@ -1858,18 +1867,18 @@ mod tests {
 
     #[tokio::test]
     async fn a_seq_that_cannot_win_is_refused_before_it_is_sent() {
-        let net = testnet(3);
-        let host = Node::open_with(config(&net, Mode::Host)).await;
+        let net = testnet(5);
+        let host = Node::open_with(majority(&net, Mode::Host)).await;
         let signer = key(8);
 
-        stored(&host, &signer, SALT, b"A", 1000, 2).await;
+        stored(&host, &signer, SALT, b"A", 1000, 3).await;
         let lower = host.publish(&signer, SALT, b"B", 999).await.unwrap_err();
         assert!(matches!(lower, Error::SeqTooLow { seq: 999, seen: 1000 }), "{lower:?}");
         // The nodes would acknowledge an equal seq and keep the old value; here it is an error.
         let equal = host.publish(&signer, SALT, b"B", 1000).await.unwrap_err();
         assert!(matches!(equal, Error::SeqTooLow { seq: 1000, seen: 1000 }), "{equal:?}");
         // The same record again is a refresh, not a conflict.
-        stored(&host, &signer, SALT, b"A", 1000, 2).await;
+        stored(&host, &signer, SALT, b"A", 1000, 3).await;
 
         let resolved = found(&host, &signer.public_key(), SALT, |r| r.seq == 1000).await;
         assert_eq!(resolved.value, b"A");
@@ -1877,14 +1886,14 @@ mod tests {
 
     #[tokio::test]
     async fn publish_with_seals_again_above_what_is_stored() {
-        let net = testnet(3);
-        let old = Node::open_with(config(&net, Mode::Host)).await;
+        let net = testnet(5);
+        let old = Node::open_with(majority(&net, Mode::Host)).await;
         let signer = key(9);
         let ahead = unix_now() + 500;
-        stored(&old, &signer, SALT, b"from a copy of this key", ahead, 2).await;
+        stored(&old, &signer, SALT, b"from a copy of this key", ahead, 3).await;
 
         // A node that knows nothing of it: its first seq is the clock, which is behind.
-        let fresh = Node::open_with(config(&net, Mode::Host)).await;
+        let fresh = Node::open_with(majority(&net, Mode::Host)).await;
         let mut asked = Vec::new();
         let published = fresh
             .publish_with(&signer, SALT, |seq| {
