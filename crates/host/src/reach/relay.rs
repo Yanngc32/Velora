@@ -2361,6 +2361,30 @@ mod tests {
         assert_eq!(saved.len(), 60, "the last save held the latest state");
     }
 
+    #[test]
+    fn a_save_takes_its_snapshot_only_when_it_holds_the_lock() {
+        let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+        let (ctx, _scratch) = runtime.block_on(async { testing::context("relay-save-order") });
+        let state = ctx.ext::<RelayState>();
+        assert!(state.load_known(&ctx));
+
+        // Another save is writing: this one waits for it. What was remembered meanwhile must be in
+        // what it writes, or the older state would be the one that stays.
+        let writing = lock(&state.saved);
+        state.relay.remember(known(1));
+        let waiting = {
+            let (ctx, state) = (ctx.clone(), state.clone());
+            std::thread::spawn(move || state.save_known(&ctx))
+        };
+        std::thread::sleep(Duration::from_millis(300));
+        state.relay.remember(known(2));
+        drop(writing);
+        waiting.join().unwrap();
+        let saved: Vec<KnownRecord> =
+            serde_json::from_slice(&std::fs::read(ctx.state_dir.path(KNOWN_FILE)).unwrap()).unwrap();
+        assert_eq!(saved.len(), 2);
+    }
+
     #[tokio::test]
     async fn a_list_that_cannot_be_read_changes_nothing() {
         let (ctx, _scratch) = testing::context("relay-lists");
