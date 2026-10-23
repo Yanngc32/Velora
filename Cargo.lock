@@ -5475,7 +5475,10 @@ dependencies = [
  "tokio",
  "tracing",
  "velora-audio",
+ "velora-dht",
+ "velora-nat",
  "velora-protocol",
+ "velora-relay",
  "windows",
 ]
 
