@@ -11,6 +11,10 @@ velora-protocol.workspace = true
 velora-update.workspace = true
 velora-clipboard.workspace = true
 velora-audio.workspace = true
+# Standalone reach (docs/nat-traversal.md): router mappings and addresses, the DHT record, relaying.
+velora-nat.workspace = true
+velora-dht.workspace = true
+velora-relay.workspace = true
 # This computer's addresses on a VPN mesh (Tailscale, Netbird), to announce them.
 if-addrs = "0.13"
 anyhow.workspace = true
@@ -18,10 +22,13 @@ serde_json.workspace = true
 serde.workspace = true
 ring.workspace = true
 base64.workspace = true
+bytes.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-tokio = { workspace = true, features = ["io-util", "io-std"] }
+tokio = { workspace = true, features = ["io-util", "io-std", "signal"] }
 quinn.workspace = true
+# The dual-stack socket (IPV6_V6ONLY off); the version quinn and tokio already use.
+socket2 = "0.6"
 clap.workspace = true
 openh264.workspace = true
 qrcode = { version = "0.14", default-features = false }
