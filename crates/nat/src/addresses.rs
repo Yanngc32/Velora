@@ -526,7 +526,7 @@ mod tests {
     #[test]
     fn ipv6_leaves_out_addresses_configured_by_hand() {
         // A VPN adapter gives itself a global-looking address that only its peers can reach.
-        let hamachi = V6Candidate { manual: true, ..candidate("2620:9b::1926:6314", 23, Some(FOREVER), true) };
+        let hamachi = V6Candidate { manual: true, ..candidate("2620:9b::10:2030", 23, Some(FOREVER), true) };
         let list = best_first(vec![hamachi, candidate("2804:14d:1::1", 7, Some(1000), true)]);
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].addr, "2804:14d:1::1".parse::<Ipv6Addr>().unwrap());
