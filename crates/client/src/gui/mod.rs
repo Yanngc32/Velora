@@ -9,6 +9,7 @@ mod file_icons;
 mod files;
 mod icons;
 mod motion;
+mod reach;
 pub(crate) mod strings;
 mod theme;
 mod this_pc;
@@ -18,7 +19,7 @@ mod widgets;
 
 use std::{
     io::{Read, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -650,7 +651,14 @@ impl Launcher {
                         };
                         // A pairing session is labelled with the address it dialed.
                         let running = self.sessions.iter().any(|x| x.label == host.name || x.label == host.address);
-                        let card = DeviceCard { host, running, fresh, now: self.now, width: card_width };
+                        let card = DeviceCard {
+                            host,
+                            running,
+                            fresh,
+                            now: self.now,
+                            width: card_width,
+                            config_dir: self.config_dir.as_deref(),
+                        };
                         let (picked, rect) = card.show(ui, s, &self.icons);
                         if let Some(a) = picked {
                             action = Some((a, host.name.clone()));
@@ -1248,6 +1256,8 @@ struct DeviceCard<'a> {
     fresh: Option<f64>,
     now: f64,
     width: f32,
+    /// The launcher's `--config-dir`, for what a card does on its own (waking the computer).
+    config_dir: Option<&'a Path>,
 }
 
 impl DeviceCard<'_> {
@@ -1318,6 +1328,10 @@ impl DeviceCard<'_> {
         }
         if secondary_button(&mut buttons, s.files).clicked() {
             action = Some(DeviceAction::Files);
+        }
+        // No use for it while a session is open: the computer is awake.
+        if !self.running {
+            reach::wake_button(&mut buttons, s, self.host, rect, self.config_dir);
         }
         buttons.with_layout(Layout::left_to_right(Align::Center), |ui| {
             if hold_to_forget(ui, s) {

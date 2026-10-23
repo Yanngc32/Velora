@@ -190,6 +190,37 @@ pub struct Strings {
     /// Explorer's Send To entry, which only Windows has.
     #[cfg_attr(not(windows), allow(dead_code))]
     pub files_send_to_description: &'static str,
+    // Standalone reach: the card on This PC (gui/reach.rs) and the Wake button of a device.
+    pub reach_title: &'static str,
+    pub reach_text: &'static str,
+    pub reach_standalone: &'static str,
+    pub reach_standalone_text: &'static str,
+    pub reach_mapping_open: &'static str,
+    pub reach_mapping_open_detail: &'static str,
+    pub reach_mapping_shared: &'static str,
+    pub reach_mapping_shared_detail: &'static str,
+    pub reach_mapping_closed: &'static str,
+    pub reach_mapping_closed_detail: &'static str,
+    pub reach_public: &'static str,
+    pub reach_v6: &'static str,
+    pub reach_dht: &'static str,
+    pub reach_dht_text: &'static str,
+    pub reach_relay: &'static str,
+    pub reach_relay_text: &'static str,
+    pub reach_relays: &'static str,
+    pub reach_relays_none: &'static str,
+    pub reach_last: &'static str,
+    pub reach_kind_lan: &'static str,
+    pub reach_kind_vpn: &'static str,
+    pub reach_kind_relay: &'static str,
+    pub reach_kind_other: &'static str,
+    pub wake: &'static str,
+    pub wake_tip: &'static str,
+    pub wake_sending: &'static str,
+    pub wake_sent: &'static str,
+    pub wake_no_relay: &'static str,
+    pub wake_unsupported: &'static str,
+    pub wake_failed: &'static str,
 }
 
 const PT: Strings = Strings {
@@ -371,6 +402,36 @@ const PT: Strings = Strings {
     files_send_started: "Enviando {} item(ns) para {}. Eles chegam na pasta Downloads de lá.",
     files_send_failed: "Não foi possível enviar: {}",
     files_send_to_description: "Envia para o dispositivo conectado a este PC pelo Velora",
+    reach_title: "Acesso de outras redes",
+    reach_text: "Formas de seus dispositivos pareados encontrarem este PC quando não estão na mesma rede. Se você já usa Tailscale ou outra VPN, não precisa de nada disso.",
+    reach_standalone: "Acessar este PC de outras redes, sem VPN",
+    reach_standalone_text: "Pede ao roteador que abra uma porta e informa aos seus dispositivos os endereços deste PC na internet. Não precisa de conta e o Velora não usa servidor próprio.",
+    reach_mapping_open: "Porta aberta no roteador",
+    reach_mapping_open_detail: "Aberta com {}; o Velora a mantém renovada.",
+    reach_mapping_shared: "Seu provedor divide este endereço com outros clientes, então o roteador não consegue abrir uma porta",
+    reach_mapping_shared_detail: "CGNAT ou NAT duplo: o endereço do roteador ({}) é compartilhado ou privado, então a porta só chega ao próximo roteador e não é divulgada.",
+    reach_mapping_closed: "O roteador não abriu uma porta",
+    reach_mapping_closed_detail: "Ele não respondeu ao NAT-PMP nem ao UPnP, que podem estar desligados nas configurações dele. O Velora tenta de novo de tempos em tempos.",
+    reach_public: "Endereço público",
+    reach_v6: "Endereço IPv6",
+    reach_dht: "Encontrar este PC quando o endereço dele mudar",
+    reach_dht_text: "Publica onde este PC está, criptografado para que só seus dispositivos pareados consigam ler, na rede BitTorrent (Mainline DHT).",
+    reach_relay: "Deixar meus outros PCs conectarem por este",
+    reach_relay_text: "Quando um PC seu não pode ser alcançado direto, a imagem dele pode passar por este PC. Isso usa a velocidade de envio (upload) da internet deste PC.",
+    reach_relays: "Acessível por meio de",
+    reach_relays_none: "Nenhum outro PC seu retransmite para este ainda. Para usar, ligue “{}” em outro PC seu.",
+    reach_last: "A última conexão chegou por",
+    reach_kind_lan: "Rede local",
+    reach_kind_vpn: "VPN",
+    reach_kind_relay: "Outro PC seu (retransmissão)",
+    reach_kind_other: "Outro caminho",
+    wake: "Acordar",
+    wake_tip: "Envia um sinal para acordar este PC, desta rede ou por meio de outro PC seu que esteja na rede dele.",
+    wake_sending: "Acordando…",
+    wake_sent: "Sinal enviado. O PC pode levar um minuto para ligar.",
+    wake_no_relay: "Você não está na rede deste PC e nenhum outro PC seu lá conseguiu enviar o sinal.",
+    wake_unsupported: "Este PC ainda não informou ao Velora como acordá-lo. Conecte nele uma vez enquanto estiver ligado, com um Velora recente nos dois lados.",
+    wake_failed: "Não foi possível enviar o sinal para acordar: {}",
 };
 
 const EN: Strings = Strings {
@@ -552,6 +613,36 @@ const EN: Strings = Strings {
     files_send_started: "Sending {} item(s) to {}. They arrive in its Downloads folder.",
     files_send_failed: "Couldn't send: {}",
     files_send_to_description: "Send to the device connected to this PC with Velora",
+    reach_title: "Reach from other networks",
+    reach_text: "Ways for your paired devices to find this PC when they are not on the same network. If you already use Tailscale or another VPN, you need none of this.",
+    reach_standalone: "Reach this PC from other networks without a VPN",
+    reach_standalone_text: "Asks your router to open a port and tells your devices this PC's addresses on the internet. No account is needed and Velora runs no server.",
+    reach_mapping_open: "Port open on the router",
+    reach_mapping_open_detail: "Opened with {}; Velora keeps it renewed.",
+    reach_mapping_shared: "Your internet provider shares this address with other customers, so the router cannot open a port",
+    reach_mapping_shared_detail: "CGNAT or double NAT: the router's address ({}) is shared or private, so the port only reaches the next router and is not advertised.",
+    reach_mapping_closed: "The router has not opened a port",
+    reach_mapping_closed_detail: "It did not answer NAT-PMP or UPnP, which may be turned off in its settings. Velora tries again from time to time.",
+    reach_public: "Public address",
+    reach_v6: "IPv6 address",
+    reach_dht: "Find this PC when its address changes",
+    reach_dht_text: "Publishes where this PC is, encrypted so that only your paired devices can read it, in the BitTorrent network (Mainline DHT).",
+    reach_relay: "Let my other PCs connect through this one",
+    reach_relay_text: "When one of your PCs cannot be reached directly, its picture can pass through this PC. That uses this PC's internet upload speed.",
+    reach_relays: "Reachable through",
+    reach_relays_none: "No other PC of yours relays for this one yet. To use it, turn on “{}” on another PC of yours.",
+    reach_last: "The last connection came in through",
+    reach_kind_lan: "Local network",
+    reach_kind_vpn: "VPN",
+    reach_kind_relay: "Another PC of yours (relay)",
+    reach_kind_other: "Another route",
+    wake: "Wake",
+    wake_tip: "Sends a signal to wake this PC, from this network or through another PC of yours on its network.",
+    wake_sending: "Waking…",
+    wake_sent: "Wake-up signal sent. The PC can take a minute to start.",
+    wake_no_relay: "You are not on this PC's network, and no other PC of yours there could send the signal.",
+    wake_unsupported: "This PC has not told Velora how to wake it. Connect to it once while it is on, with a recent Velora on both sides.",
+    wake_failed: "Could not send the wake-up signal: {}",
 };
 
 pub fn current() -> &'static Strings {
@@ -559,6 +650,12 @@ pub fn current() -> &'static Strings {
         Some(l) if l.to_lowercase().starts_with("pt") => &PT,
         _ => &EN,
     }
+}
+
+/// Both languages, for tests that check a screen in each.
+#[cfg(test)]
+pub fn all() -> [&'static Strings; 2] {
+    [&PT, &EN]
 }
 
 /// Fills `{}` placeholders in order.
@@ -579,5 +676,50 @@ mod tests {
     fn fills_placeholders() {
         assert_eq!(super::fill("a {} b {}", &["1", "2"]), "a 1 b 2");
         assert_eq!(super::fill("no args", &[]), "no args");
+    }
+
+    /// The text of standalone reach: that it exists in both languages is up to the compiler (one
+    /// struct, two values), that a translation did not lose or gain a `{}` is up to this.
+    #[test]
+    fn reach_texts_agree_between_languages() {
+        macro_rules! texts {
+            ($($name:ident),* $(,)?) => { [$((stringify!($name), super::PT.$name, super::EN.$name)),*] };
+        }
+        let texts = texts![
+            reach_title,
+            reach_text,
+            reach_standalone,
+            reach_standalone_text,
+            reach_mapping_open,
+            reach_mapping_open_detail,
+            reach_mapping_shared,
+            reach_mapping_shared_detail,
+            reach_mapping_closed,
+            reach_mapping_closed_detail,
+            reach_public,
+            reach_v6,
+            reach_dht,
+            reach_dht_text,
+            reach_relay,
+            reach_relay_text,
+            reach_relays,
+            reach_relays_none,
+            reach_last,
+            reach_kind_lan,
+            reach_kind_vpn,
+            reach_kind_relay,
+            reach_kind_other,
+            wake,
+            wake_tip,
+            wake_sending,
+            wake_sent,
+            wake_no_relay,
+            wake_unsupported,
+            wake_failed,
+        ];
+        for (name, pt, en) in texts {
+            assert!(!pt.trim().is_empty() && !en.trim().is_empty(), "{name} is empty in one language");
+            assert_eq!(pt.matches("{}").count(), en.matches("{}").count(), "{name}: the placeholders differ");
+        }
     }
 }

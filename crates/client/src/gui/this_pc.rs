@@ -511,6 +511,10 @@ impl Launcher {
                     self.stay_awake_card(ui, on, &mut action);
                     ui.add_space(16.0);
                 }
+                // Nothing from a host that predates standalone reach.
+                if let Some(request) = super::reach::reach_card(ui, s, status.reach.as_ref()) {
+                    self.host.send(request);
+                }
                 ui.horizontal(|ui| {
                     // The service would only start the host again.
                     if !status.service && secondary_button(ui, s.share_stop).clicked() {
