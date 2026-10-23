@@ -97,18 +97,21 @@ impl HostLink {
     }
 
     /// The same link, for another thread (the tray icon's).
+    #[cfg(windows)]
     pub fn handle(&self) -> HostHandle {
         HostHandle { view: self.view.clone(), requests: self.requests.clone() }
     }
 }
 
 /// A [`HostLink`] seen from another thread.
+#[cfg(windows)]
 #[derive(Clone)]
 pub struct HostHandle {
     view: Arc<Mutex<Arc<HostView>>>,
     requests: mpsc::Sender<Request>,
 }
 
+#[cfg(windows)]
 impl HostHandle {
     pub fn view(&self) -> Arc<HostView> {
         self.view.lock().unwrap().clone()

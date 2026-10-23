@@ -130,13 +130,22 @@ pub struct Strings {
     pub open_at_login_tray_text: &'static str,
     pub close_to_tray: &'static str,
     pub close_to_tray_text: &'static str,
+    // The tray icon exists on Windows only.
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub tray_open: &'static str,
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub tray_sharing: &'static str,
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub tray_sharing_service: &'static str,
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub tray_quit: &'static str,
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub tray_tip_off: &'static str,
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub tray_tip_on: &'static str,
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub tray_tip_connected: &'static str,
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub tray_still_running: &'static str,
     pub files: &'static str,
     pub files_label: &'static str,
