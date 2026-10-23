@@ -8,6 +8,10 @@ A client should reach a paired host from any network, the way it does over Tails
 without installing a mesh VPN and without anyone running a server for Velora: not the
 project, not the user.
 
+Everything here is optional and off the critical path: Tailscale and Netbird keep working as
+they do today, and a user who has them needs none of this. "Standalone reach" is a switch on
+This PC, and each piece below (router mapping, DHT record, relaying for others) has its own.
+
 Out of scope: a general-purpose VPN. Velora only needs one thing, that a QUIC packet reaches
 the host's UDP port. Everything else (authentication, encryption, sessions, files, sound)
 already works end to end over any path.
@@ -205,7 +209,44 @@ the race, the switch. One PR.
 Risks: the relay PC's upload link becomes the bottleneck; a laptop on Wi-Fi may relay at 2
 Mbit/s. The adaptive bitrate already handles that, at the cost of picture quality.
 
-## 7. Protocol and compatibility
+## 7. Effects on what Velora already does
+
+**Security.** End to end nothing changes: mutual TLS 1.3 with pinned certificates over any
+path, and relays and the DHT see ciphertext only. What changes is exposure: with a mapping,
+the host accepts UDP from the whole internet on 7420, as it already does when a user forwards
+the port by hand; quinn drops anything that is not a valid handshake for the host's
+certificate before any application code runs, and the access password stays as a second
+layer. The new secret is the mesh secret: whoever has a pairing link can read the host's
+addresses in the DHT (not connect), and revoking a device cannot take it back; rotating it
+means pairing again. A relay must check its paired list before copying a byte and rate-limit
+new flows, or it becomes an amplifier.
+
+**Smoothness.** Direct paths (mapping, IPv6, a successful punch) add nothing: it is the same
+packet a hand-made port forward would carry, equal to or better than a direct Tailscale link.
+A punch costs 3-15 s to open, nothing after. A relay adds one hop, 5-40 ms plus the relaying
+PC's jitter, like Tailscale's DERP when it finds no direct path. NAT mappings expire after
+30 s to 2 min of silence, so the host sends QUIC keepalives on punched paths. The client's
+own network changes (Wi-Fi to 4G) are handled by QUIC migration, as today.
+
+**Picture quality.** Unchanged on direct paths. Through a relay the ceiling is the relaying
+PC's upload: residential fibre in Brazil (50-300 Mbit/s up) carries 1080p at 12 Mbit/s
+easily; a laptop on weak Wi-Fi relays at a few Mbit/s and the adaptive bitrate settles there,
+softer picture, nothing broken.
+
+**Wake (turning the PC on from away).** A sleeping host publishes nothing: its mapping and
+DHT record expire, and it cannot answer a punch. So waking has to come first and by another
+means. A magic packet from outside almost never works directly: forwarding UDP 9 to the PC
+fails once the router forgets the sleeping PC's ARP entry, and most routers refuse to
+forward to the broadcast address. What works is a device that is awake on the same LAN
+sending the packet, which is exactly the relaying PC of phase 4 (or the phone on the home
+Wi-Fi). So "wake STUDIO-PC" becomes a request to any paired device on that LAN that is on,
+and the relay machine doubles as the waker. After waking, the host redoes everything at once:
+mapping, public address, DHT record. The host's keep-awake (added in 0.5) stays, as the
+alternative for people who would rather not sleep the PC. Wake-on-LAN also needs the Windows
+side: "Wake on Magic Packet" on in the adapter, fast startup off, and a wired link (Wi-Fi
+wake depends on the adapter).
+
+## 8. Protocol and compatibility
 
 - Pairing link: `velora://pair?address=..&code=..&also=..` gains `key=<ed25519 pub>` and
   `mesh=<secret>`; old clients ignore unknown parameters (already true).
@@ -220,7 +261,7 @@ Mbit/s. The adaptive bitrate already handles that, at the cost of picture qualit
   and the host still checks the client's. A fake DHT record can only point a client at a
   wrong address, where the TLS handshake fails.
 
-## 8. Security and privacy
+## 9. Security and privacy
 
 - End-to-end security is unchanged: mutual TLS 1.3 with pinned certificates over any path.
 - The host accepts UDP from the whole internet once a mapping exists. It already does when a
@@ -234,7 +275,7 @@ Mbit/s. The adaptive bitrate already handles that, at the cost of picture qualit
   limit new flows, or it becomes an amplifier.
 - No telemetry: nothing is reported to anyone. The DHT sees a key and a blob.
 
-## 9. Feasibility verdict
+## 10. Feasibility verdict
 
 | Phase | Feasible | Confidence | Why |
 |---|---|---|---|
@@ -252,19 +293,23 @@ covers whatever is left, as long as one of their machines is reachable.
 Tailscale stays supported and stays the better choice where it is already installed: it has
 relays worldwide and handles every NAT. This plan removes the requirement, not the option.
 
-## 10. Order of work and effort
+## 11. Order of work and effort
+
+Recommended order is 1, 2, 4, 3, not the numbering: the relay is simpler than hole punching,
+guarantees a path, and is the same machine the Wake needs, so it comes before punching, which
+only removes the relay's extra hop where it succeeds.
 
 | Step | Deliverable | Estimate |
 |---|---|---|
-| 1 | Router mapping, public v4/v6 in the race, "This PC" shows the public address | 2-3 days |
-| 2 | ed25519 key in identity, link parameters, DHT publish/resolve, encrypted record | 4-5 days |
-| 3 | NAT probe, punch request/poll, simultaneous open, timeouts and messages | 6-8 days + field testing |
-| 4 | Relay flows in the host, the switch, relay addresses in records, `velora-relay` binary | 4-5 days |
+| 1 (phase 1) | Router mapping, public v4/v6 in the race, "This PC" shows the public address and the standalone switch | 2-3 days |
+| 2 (phase 2) | ed25519 key in identity, link parameters, DHT publish/resolve, encrypted record | 4-5 days |
+| 3 (phase 4) | Relay flows in the host, the "relay for my other PCs" switch, relay addresses in records, Wake through the relay PC, `velora-relay` binary | 5-6 days |
+| 4 (phase 3) | NAT probe, punch request/poll, simultaneous open, timeouts and messages | 6-8 days + field testing |
 
 Each step is a PR that works on its own and keeps older peers working. Step 1 can ship in
 the next release.
 
-## 11. What to measure
+## 12. What to measure
 
 - Phase 1: share of hosts that obtain a mapping (log line "reachable at pub:…"), per protocol.
 - Phase 2: DHT resolve time, cold and warm; publish failures.
