@@ -8,6 +8,8 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 
 use anyhow::{bail, Context, Result};
 
+use crate::addresses::{local_macs, Ipv4Network};
+
 /// A hardware (MAC) address.
 pub type Mac = [u8; 6];
 
@@ -46,54 +48,23 @@ pub fn format_mac(mac: &Mac) -> String {
     mac.iter().map(|byte| format!("{byte:02x}")).collect::<Vec<_>>().join(":")
 }
 
-/// One IPv4 network of this PC that a magic packet can leave through.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Lan {
-    /// This PC's address on the network.
-    pub local: Ipv4Addr,
-    pub prefix_len: u8,
-    /// The directed broadcast address of the network (`192.168.1.255` for `192.168.1.0/24`).
-    pub broadcast: Ipv4Addr,
-}
-
-fn mask(prefix_len: u8) -> u32 {
-    u32::MAX.checked_shl(32 - u32::from(prefix_len.min(32))).unwrap_or(0)
-}
-
-impl Lan {
-    pub fn new(local: Ipv4Addr, prefix_len: u8) -> Self {
-        Self { local, prefix_len, broadcast: Ipv4Addr::from(u32::from(local) | !mask(prefix_len)) }
-    }
-
-    /// Whether `ip` is on this network.
-    pub fn contains(&self, ip: Ipv4Addr) -> bool {
-        let mask = mask(self.prefix_len);
-        u32::from(ip) & mask == u32::from(self.local) & mask
-    }
-}
-
-/// The networks of this PC a broadcast can reach: up, not loopback or a tunnel, with a real
-/// broadcast address (so no /31 or /32) and not the link-local range a PC gives itself without DHCP.
-pub fn local_lans() -> Vec<Lan> {
-    let mut lans = Vec::new();
-    for interface in netdev::get_interfaces() {
-        if !interface.is_up() || interface.is_loopback() || interface.is_point_to_point() {
-            continue;
-        }
-        for net in &interface.ipv4 {
-            let local = net.addr();
-            if net.prefix_len() >= 31 || local.is_link_local() || local.is_unspecified() {
-                continue;
-            }
-            lans.push(Lan::new(local, net.prefix_len()));
+/// The IPv4 networks of this PC a broadcast can reach: those of its adapters that are up, have a
+/// usable MAC and a real address (see [`local_macs`], which lists real adapters before virtual
+/// ones). Blocking: async callers should use `spawn_blocking`.
+pub fn wake_networks() -> Vec<Ipv4Network> {
+    let mut networks: Vec<Ipv4Network> = Vec::new();
+    for network in local_macs().into_iter().flat_map(|adapter| adapter.networks) {
+        // /31 and /32 have no broadcast address.
+        if network.prefix_len < 31 && !networks.contains(&network) {
+            networks.push(network);
         }
     }
-    lans
+    networks
 }
 
-/// The network `host` is on, among `lans`.
-pub fn lan_of(lans: &[Lan], host: Ipv4Addr) -> Option<Lan> {
-    lans.iter().copied().find(|lan| lan.contains(host))
+/// The network `host` is on, among `networks`.
+pub fn network_of(networks: &[Ipv4Network], host: Ipv4Addr) -> Option<Ipv4Network> {
+    networks.iter().copied().find(|network| network.contains(host))
 }
 
 /// Sends the packet from `local` to each of `targets`. Binding to `local` makes the packet leave
@@ -118,38 +89,39 @@ fn send(packet: &[u8], local: Ipv4Addr, targets: &[SocketAddrV4]) -> Result<usiz
     }
 }
 
-/// Wakes `mac` on `lan`: the directed broadcast and the limited broadcast (`255.255.255.255`, which
-/// Windows sends through the adapter `local` belongs to), each on both ports. Returns how many
-/// datagrams went out; an error only when none did.
-pub fn wake_on(mac: &Mac, lan: &Lan) -> Result<usize> {
-    let targets: Vec<SocketAddrV4> = [lan.broadcast, Ipv4Addr::BROADCAST]
+/// Wakes `mac` on `network`: the directed broadcast and the limited broadcast (`255.255.255.255`,
+/// which Windows sends through the adapter the network belongs to), each on both ports. Returns
+/// how many datagrams went out; an error only when none did.
+pub fn wake_on(mac: &Mac, network: &Ipv4Network) -> Result<usize> {
+    let targets: Vec<SocketAddrV4> = [network.broadcast(), Ipv4Addr::BROADCAST]
         .iter()
         .flat_map(|&ip| PORTS.map(|port| SocketAddrV4::new(ip, port)))
         .collect();
-    let sent = send(&magic_packet(mac), lan.local, &targets)?;
-    tracing::info!("magic packet for {} sent from {} ({sent} datagrams)", format_mac(mac), lan.local);
+    let sent = send(&magic_packet(mac), network.addr, &targets)?;
+    tracing::info!("magic packet for {} sent from {} ({sent} datagrams)", format_mac(mac), network.addr);
     Ok(sent)
 }
 
 /// Wakes `mac` on the network `host` (its last known address) is on. Errors when none of this PC's
-/// networks contains it: this PC cannot wake what is not on its own LAN.
+/// networks contains it: this PC cannot wake what is not on its own LAN. Blocking, like
+/// [`wake_networks`].
 pub fn wake_lan_of(mac: &Mac, host: Ipv4Addr) -> Result<usize> {
-    match lan_of(&local_lans(), host) {
-        Some(lan) => wake_on(mac, &lan),
+    match network_of(&wake_networks(), host) {
+        Some(network) => wake_on(mac, &network),
         None => bail!("{host} is not on a network of this PC"),
     }
 }
 
 /// Wakes `mac` on every network of this PC, for when its address is not known. Returns how many
-/// datagrams went out in all; an error only when none did.
+/// datagrams went out in all; an error only when none did. Blocking, like [`wake_networks`].
 pub fn wake_all(mac: &Mac) -> Result<usize> {
-    let lans = local_lans();
-    if lans.is_empty() {
+    let networks = wake_networks();
+    if networks.is_empty() {
         bail!("this PC has no network to send a magic packet on");
     }
     let mut sent = 0;
-    for lan in &lans {
-        match wake_on(mac, lan) {
+    for network in &networks {
+        match wake_on(mac, network) {
             Ok(n) => sent += n,
             Err(e) => tracing::warn!("{e:#}"),
         }
@@ -165,6 +137,10 @@ mod tests {
     use super::*;
 
     const MAC: Mac = [0x02, 0x1a, 0x2b, 0x3c, 0x4d, 0x5e];
+
+    fn network(a: u8, b: u8, c: u8, d: u8, prefix_len: u8) -> Ipv4Network {
+        Ipv4Network { addr: Ipv4Addr::new(a, b, c, d), prefix_len }
+    }
 
     #[test]
     fn magic_packet_is_six_ff_then_the_mac_sixteen_times() {
@@ -189,31 +165,13 @@ mod tests {
     }
 
     #[test]
-    fn lan_knows_its_broadcast_and_its_hosts() {
-        let lan = Lan::new(Ipv4Addr::new(192, 168, 1, 20), 24);
-        assert_eq!(lan.broadcast, Ipv4Addr::new(192, 168, 1, 255));
-        assert!(lan.contains(Ipv4Addr::new(192, 168, 1, 7)));
-        assert!(!lan.contains(Ipv4Addr::new(192, 168, 2, 7)));
-
-        let wide = Lan::new(Ipv4Addr::new(10, 1, 2, 3), 16);
-        assert_eq!(wide.broadcast, Ipv4Addr::new(10, 1, 255, 255));
-        assert!(wide.contains(Ipv4Addr::new(10, 1, 200, 9)));
-        assert!(!wide.contains(Ipv4Addr::new(10, 2, 0, 1)));
-
-        // The edges of the prefix length do not overflow the shift.
-        assert_eq!(Lan::new(Ipv4Addr::new(10, 0, 0, 1), 0).broadcast, Ipv4Addr::BROADCAST);
-        assert!(Lan::new(Ipv4Addr::new(10, 0, 0, 1), 0).contains(Ipv4Addr::new(8, 8, 8, 8)));
-        assert!(!Lan::new(Ipv4Addr::new(10, 0, 0, 1), 32).contains(Ipv4Addr::new(10, 0, 0, 2)));
-    }
-
-    #[test]
     fn the_host_is_woken_on_the_network_it_is_on() {
-        let wifi = Lan::new(Ipv4Addr::new(192, 168, 1, 20), 24);
-        let vpn = Lan::new(Ipv4Addr::new(10, 8, 0, 2), 24);
-        let lans = [wifi, vpn];
-        assert_eq!(lan_of(&lans, Ipv4Addr::new(10, 8, 0, 9)), Some(vpn));
-        assert_eq!(lan_of(&lans, Ipv4Addr::new(192, 168, 1, 50)), Some(wifi));
-        assert_eq!(lan_of(&lans, Ipv4Addr::new(172, 16, 0, 1)), None);
+        let (wifi, vpn) = (network(192, 168, 1, 20, 24), network(10, 8, 0, 2, 24));
+        let networks = [wifi, vpn];
+        assert_eq!(network_of(&networks, Ipv4Addr::new(10, 8, 0, 9)), Some(vpn));
+        assert_eq!(network_of(&networks, Ipv4Addr::new(192, 168, 1, 50)), Some(wifi));
+        assert_eq!(network_of(&networks, Ipv4Addr::new(172, 16, 0, 1)), None);
+        assert_eq!(wifi.broadcast(), Ipv4Addr::new(192, 168, 1, 255));
         assert!(wake_lan_of(&MAC, Ipv4Addr::new(203, 0, 113, 5)).is_err());
     }
 
@@ -238,7 +196,7 @@ mod tests {
     #[ignore = "sends a real magic packet on the LAN"]
     fn manual() {
         let mac = parse_mac(&std::env::var("VELORA_WAKE_MAC").expect("set VELORA_WAKE_MAC")).unwrap();
-        println!("networks: {:?}", local_lans());
+        println!("networks: {:?}", wake_networks());
         println!("datagrams sent: {}", wake_all(&mac).unwrap());
     }
 }
