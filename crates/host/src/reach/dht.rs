@@ -16,7 +16,9 @@ use super::{DeviceKeys, ReachContext};
 /// every 30 minutes and whenever `ctx.reach.subscribe()` says something changed. That signal fires
 /// for any change, including ones the record does not hold (`last_reached`, `clients`): compare
 /// the record to the last one published before putting it on the network. The record's addresses
-/// are `state.addresses` (LAN, VPN, public, IPv6 and relays, already in order), `state.nat`,
+/// are `state.record_addresses()` (LAN, VPN, public, IPv6 and relays, already in order, and the
+/// endpoint E5 observed as a `Public` one where a client could punch to it: that is how F2 learns
+/// where to punch, so do not build the list from `state.addresses`), then `state.nat`,
 /// `state.relays` and `state.mac`.
 ///
 /// Having no network is not an error: wait and try again.

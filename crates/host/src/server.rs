@@ -227,11 +227,28 @@ pub async fn run(options: HostOptions, state: StateDir, pair: bool, auto_update:
         }
     };
     tokio::pin!(updated);
-    // Ctrl-C ends the host the same way the launcher does, so the router mapping is removed. A
-    // process with no console cannot get one, and then this never fires.
+    // Ctrl-C (and, where there is such a thing, SIGTERM) ends the host the same way the launcher
+    // does, so the router mapping is removed. A process with no console cannot get Ctrl-C, and
+    // then this never fires.
     let interrupted = async {
-        if tokio::signal::ctrl_c().await.is_err() {
-            std::future::pending().await
+        #[cfg(unix)]
+        let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+        #[cfg(unix)]
+        let terminated = async {
+            match terminate.as_mut() {
+                Some(signal) => signal.recv().await,
+                None => std::future::pending().await,
+            }
+        };
+        #[cfg(not(unix))]
+        let terminated = std::future::pending::<Option<()>>();
+        tokio::select! {
+            ended = tokio::signal::ctrl_c() => {
+                if ended.is_err() {
+                    std::future::pending::<()>().await
+                }
+            }
+            _ = terminated => {}
         }
     };
     tokio::pin!(interrupted);
@@ -239,7 +256,10 @@ pub async fn run(options: HostOptions, state: StateDir, pair: bool, auto_update:
     loop {
         tokio::select! {
             incoming = endpoint.accept() => {
-                let Some(incoming) = incoming else { return Ok(false) };
+                let Some(incoming) = incoming else {
+                    shared.reach.stop().await;
+                    return Ok(false);
+                };
                 on_incoming(&shared, incoming);
             }
             () = &mut updated => {
@@ -253,7 +273,7 @@ pub async fn run(options: HostOptions, state: StateDir, pair: bool, auto_update:
                 return Ok(false);
             }
             () = &mut interrupted => {
-                tracing::info!("stopping on Ctrl-C");
+                tracing::info!("stopping on Ctrl-C or SIGTERM");
                 shutdown(&shared, &endpoint, b"host stopped").await;
                 return Ok(false);
             }
@@ -269,19 +289,20 @@ async fn shutdown(shared: &Shared, endpoint: &quinn::Endpoint, reason: &[u8]) {
 }
 
 /// Whether a connection attempt must prove its address before the host spends anything on it: a
-/// host that is reachable from the internet (standalone reach is on) would otherwise answer a
+/// host that means to be reached from the internet (`exposed`: standalone reach is on, or it
+/// relays for others, as a `--relay-only` machine does by definition) would otherwise answer a
 /// spoofed first packet with more bytes than it received. Attempts that came through a relay
 /// tunnel are exempt: the relay's own connection is authenticated, and a round trip through it
 /// would cost more than it protects.
-fn wants_retry(standalone: bool, validated: bool, may_retry: bool, remote: SocketAddr) -> bool {
-    standalone && !validated && may_retry && !reach::socket::is_tunnel_addr(remote)
+fn wants_retry(exposed: bool, validated: bool, may_retry: bool, remote: SocketAddr) -> bool {
+    exposed && !validated && may_retry && !reach::socket::is_tunnel_addr(remote)
 }
 
 /// Starts handling a connection attempt, or asks it to prove its address first.
 fn on_incoming(shared: &Arc<Shared>, incoming: quinn::Incoming) {
-    let standalone = shared.reach.reach().read().switches.standalone;
+    let exposed = shared.reach.reach().read().exposed();
     let remote = incoming.remote_address();
-    let incoming = if wants_retry(standalone, incoming.remote_address_validated(), incoming.may_retry(), remote) {
+    let incoming = if wants_retry(exposed, incoming.remote_address_validated(), incoming.may_retry(), remote) {
         match incoming.retry() {
             Ok(()) => {
                 shared.retries.fetch_add(1, Ordering::Relaxed);
@@ -393,16 +414,18 @@ async fn handle_connection(incoming: quinn::Incoming, shared: Arc<Shared>) -> Re
     // For the rest of the connection: standalone reach looks at who is connected.
     let _connected = shared.reach.reach().client_connected(fingerprint);
     let (control, outbox) = ControlSender::channel();
+    // A relay link: the device only talks to the relay service. Under `--relay-only` that is
+    // every connection.
+    let link = shared.options.relay_only || ext.is_some_and(|e| e.files_only && e.reach);
     let client = ClientConn {
         conn: conn.clone(),
         fingerprint,
         name: name.clone(),
         control,
         via_relay: shared.reach.context().socket.tunnel_relay(conn.remote_address()),
+        link,
     };
-    // A relay link: the device only talks to the relay service. Under `--relay-only` that is
-    // every connection.
-    if shared.options.relay_only || ext.is_some_and(|e| e.files_only && e.reach) {
+    if link {
         tracing::info!("client '{name}' ({fingerprint}) linked from {remote}");
         return serve_link(client, send, recv, outbox, &shared, ext, addresses).await;
     }
@@ -1872,20 +1895,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn new_addresses_prove_themselves_only_while_standalone_reach_is_on() {
-        let host = host("retry", true).await;
+    async fn new_addresses_prove_themselves_only_while_the_host_means_to_be_reached_from_outside() {
+        let host = host("retry", false).await;
         let identity = Identity::generate().unwrap();
         host.pair(&identity, "phone");
+        let retries = || host.shared.retries.load(Ordering::Relaxed);
+        let set = |standalone, relay_for_others| {
+            host.shared.control(Request::SetReach { standalone, relay_for_others, dht: false }, true).unwrap();
+        };
+        // Links stand in for sessions, which need a screen. A new client socket is a new address.
+        let connect = || async {
+            let mut client = host.connect(&identity, Some(link_hello())).await;
+            assert!(matches!(client.next().await, HostMsg::Welcome { .. }));
+            client
+        };
 
+        let _first = connect().await;
+        assert_eq!(retries(), 0, "everything is off: the host behaves as it always has");
+        set(true, false);
+        let _second = connect().await;
+        assert_eq!(retries(), 1, "asked to prove itself, and then connected");
+        set(false, false);
+        let _third = connect().await;
+        assert_eq!(retries(), 1);
+        set(false, true);
+        let _fourth = connect().await;
+        assert_eq!(retries(), 2, "a host that relays for others is reached from outside too");
+    }
+
+    #[tokio::test]
+    async fn a_relay_only_host_asks_for_proof_with_every_switch_off() {
+        let host = host("retry-relay", true).await;
+        let identity = Identity::generate().unwrap();
+        host.pair(&identity, "phone");
         let mut client = host.connect(&identity, None).await;
         assert!(matches!(client.next().await, HostMsg::Welcome { .. }));
-        assert_eq!(host.shared.retries.load(Ordering::Relaxed), 0);
-
-        host.shared.control(Request::SetReach { standalone: true, relay_for_others: false, dht: false }, true).unwrap();
-        // A new client socket is a new address: it is asked to prove itself, and then it connects.
-        let mut client = host.connect(&identity, None).await;
-        assert!(matches!(client.next().await, HostMsg::Welcome { .. }));
-        assert_eq!(host.shared.retries.load(Ordering::Relaxed), 1);
+        assert_eq!(host.shared.retries.load(Ordering::Relaxed), 1, "it faces the internet by definition");
     }
 
     /// A real session, which needs a screen to capture: run it by hand with `--ignored` on a
@@ -1919,14 +1964,73 @@ mod tests {
             until(|| host.shared.active.lock().unwrap().is_none()).await;
             host.reach().update(|state| state.last_reached = None);
         }
+
+        // A session that did not set the bit gets the welcome and no Reach.
+        let to = SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port));
+        let mut client = host.connect_to(to, &identity, Some(HelloExt { addresses: true, ..Default::default() })).await;
+        assert!(matches!(client.next().await, HostMsg::Welcome { .. }));
+        assert!(client.silent().await, "no Reach for a client that did not ask");
+    }
+
+    /// Stands in for the relay between a client and a tunnel of the host: what arrives on the
+    /// returned address goes into the tunnel, what the tunnel sends goes back to the client.
+    async fn relay_for(host: &TestHost, relay: [u8; 32]) -> (SocketAddr, SocketAddr, tokio::task::JoinHandle<()>) {
+        let mut tunnel = host.shared.reach.context().socket.open_tunnel(relay, std::num::NonZeroU16::MIN).unwrap();
+        let peer = tunnel.addr();
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = socket.local_addr().unwrap();
+        let pump = tokio::spawn(async move {
+            let inbound = tunnel.inbound();
+            let (mut client, mut buf) = (None, vec![0u8; 2048]);
+            loop {
+                tokio::select! {
+                    received = socket.recv_from(&mut buf) => {
+                        let Ok((n, from)) = received else { break };
+                        client = Some(from);
+                        let _ = inbound.deliver(bytes::Bytes::copy_from_slice(&buf[..n]));
+                    }
+                    packet = tunnel.next_outbound() => {
+                        let (Some(packet), Some(client)) = (packet, client) else { continue };
+                        let _ = socket.send_to(&packet, client).await;
+                    }
+                }
+            }
+        });
+        (address, peer, pump)
+    }
+
+    #[tokio::test]
+    async fn a_device_that_comes_through_a_relay_is_a_link_like_any_other_and_is_known_to_have_come_through_it() {
+        let host = host("relayed", true).await;
+        let identity = Identity::generate().unwrap();
+        host.pair(&identity, "laptop");
+        // A host reached from outside makes every ordinary address prove itself: this one need not.
+        host.shared.control(Request::SetReach { standalone: true, relay_for_others: true, dht: false }, true).unwrap();
+        let (relay_address, tunnel_peer, _pump) = relay_for(&host, [3; 32]).await;
+
+        let mut client = host.connect_to(relay_address, &identity, Some(link_hello())).await;
+        assert!(matches!(client.next().await, HostMsg::Welcome { .. }));
+        assert!(matches!(client.next().await, HostMsg::Reach { .. }));
+        assert_eq!(
+            host.shared.retries.load(Ordering::Relaxed),
+            0,
+            "a relayed connection is not asked to prove its address"
+        );
+
+        client.send(ClientMsg::Reached { address: "198.51.100.77:7420".into() }).await;
+        until(|| host.reach().read().last_reached.is_some()).await;
+        let relay_kind = AddressKind::Relay(Fingerprint([3; 32]).to_base64());
+        assert_eq!(host.reach().read().last_reached, Some((relay_kind, "198.51.100.77:7420".to_string())));
+        assert!(reach::socket::is_tunnel_addr(tunnel_peer));
+        assert!(host.shared.reach.context().socket.stats().tunnel_in > 0);
     }
 
     #[test]
-    fn retry_is_for_unvalidated_addresses_while_standalone_reach_is_on() {
+    fn retry_is_for_unvalidated_addresses_of_a_host_reached_from_outside() {
         let direct: SocketAddr = "203.0.113.5:40000".parse().unwrap();
         let relayed = reach::socket::tunnel_addr(&[1; 32], std::num::NonZeroU16::MIN);
         assert!(wants_retry(true, false, true, direct));
-        assert!(!wants_retry(false, false, true, direct), "off: the host behaves as it always has");
+        assert!(!wants_retry(false, false, true, direct), "not exposed: the host behaves as it always has");
         assert!(!wants_retry(true, true, true, direct), "already validated");
         assert!(!wants_retry(true, false, false, direct), "quinn cannot retry this one");
         assert!(!wants_retry(true, false, true, relayed), "the relay's own connection is authenticated");

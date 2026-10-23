@@ -10,9 +10,9 @@
 //! |---|---|---|
 //! | `mapping.rs` | E2 | [`mapping::run`] |
 //! | `dht.rs`, `secrets.rs` | E3 | [`dht::run`], [`dht::reach_message`], [`secrets::get`], [`secrets::all`], [`secrets::on_paired`], [`secrets::on_revoked`] |
-//! | `relay.rs` | E4 | [`relay::serve`], [`relay::register_with`], [`relay::handle_message`], [`relay::busy`] |
+//! | `relay.rs` | E4 | [`relay::serve`], [`relay::register_with`], [`relay::handle_message`], [`relay::on_revoked`], [`relay::busy`] |
 //! | `punch.rs`, `poll.rs` | E5 | [`punch::run`], [`punch::respond`], [`poll::run`] |
-//! | `wake.rs` | E6 | [`wake::local_mac`], [`wake::same_lan`] |
+//! | `wake.rs` | E6 | [`wake::local_mac`] |
 //!
 //! Each of those has its contract in its doc comment (when it runs, what it gets, what it must
 //! return). The rules they share:
@@ -21,7 +21,8 @@
 //!   on and told to end through [`Stop`] when it goes off or the host shuts down. They end by
 //!   returning, after their own clean-up (the mapping is removed there). An `Err` is logged and
 //!   the task is not restarted until its switch is turned off and on; a task that fails
-//!   routinely (no network yet) retries inside itself.
+//!   routinely (no network yet) retries inside itself. One that does not return within a few
+//!   seconds is aborted, and what it handed to `spawn_blocking` runs on: keep such calls short.
 //! - **State** is [`ReachContext::reach`]: read it with `read()`, change it with `update()`, which
 //!   tells everyone who `subscribe`d. Never hold a guard across an `.await` or a call into another
 //!   hook.
@@ -35,6 +36,7 @@
 //! *link* (`files_only` and `reach`, or any connection to a `--relay-only` host). Only a session
 //! starts a capture or sends another device away; a link carries control messages and nothing
 //! else, and its datagrams belong to whoever relays them. The relay service speaks on links.
+//!
 //! The socket the QUIC endpoint runs on is [`socket::Multiplexer`]: besides ordinary QUIC it
 //! carries probes (E5) and relay tunnels (E4).
 
@@ -85,6 +87,8 @@ use socket::Multiplexer;
 const SWITCHES_FILE: &str = "reach.json";
 /// How long a task gets to clean up after it is told to stop (the router mapping is removed there).
 const STOP_GRACE: Duration = Duration::from_secs(4);
+/// How long an aborted task is waited for: it is dropped at its next yield, which is at once.
+const ABORT_WAIT: Duration = Duration::from_secs(1);
 /// How often the host looks at its own LAN and VPN addresses again.
 const HOUSEKEEPING_INTERVAL: Duration = Duration::from_secs(30);
 /// How often it looks for its MAC address again once it has one. While it has none it asks after
@@ -205,6 +209,12 @@ impl ReachState {
         self.switches.relay_for_others || self.relay_only
     }
 
+    /// The host means to be reached from the internet: standalone reach is on, or it relays for
+    /// others. Then a connection from an address that has not proved itself is asked to (Retry).
+    pub fn exposed(&self) -> bool {
+        self.switches.standalone || self.relays_for_others()
+    }
+
     /// Replaces every address of `kind` (for `Relay(fingerprint)`, only that relay's) with
     /// `addresses`, and keeps the list in the order of usefulness: LAN, VPN, public, IPv6,
     /// relays. Within a kind the order given is kept.
@@ -241,6 +251,22 @@ impl ReachState {
     /// What `HostMsg::Reach` lists: all of them with their kinds, up to the most the message holds.
     pub fn reach_addresses(&self) -> Vec<(AddressKind, String)> {
         self.addresses.iter().take(MAX_ADDRESSES).cloned().collect()
+    }
+
+    /// What the host's record in the DHT lists (E3 builds it from this): `addresses`, and, when no
+    /// public address is advertised (no mapping, or one behind a CGNAT) but a NAT that keeps one
+    /// endpoint per socket shows `observed` to the world, that endpoint as a `Public` address:
+    /// it is how a client learns where to punch to. It is for the record only: dialled
+    /// straight from a welcome or a `Reach` it would only fail, so it is not in `addresses`.
+    pub fn record_addresses(&self) -> Vec<(AddressKind, String)> {
+        let mut list = self.addresses.clone();
+        let punchable = matches!(self.nat, Some(NatType::Open | NatType::EndpointIndependent));
+        let advertised = list.iter().any(|(kind, _)| *kind == AddressKind::Public);
+        if let (Some(observed), true, false) = (self.observed, punchable, advertised) {
+            list.push((AddressKind::Public, observed.to_string()));
+            list.sort_by_key(|(kind, _)| rank(kind));
+        }
+        list
     }
 
     /// What This PC shows.
@@ -483,6 +509,9 @@ pub struct ClientConn {
     /// The relay (raw fingerprint) the connection came through, when it did; see
     /// [`socket::Multiplexer::open_tunnel`].
     pub via_relay: Option<[u8; 32]>,
+    /// The connection is a link (see the module docs): no session reads its datagrams, so a relay
+    /// may take them over. `RelayRegister` and `RelayTo`, which do that, are only answered on links.
+    pub link: bool,
 }
 
 impl ClientConn {
@@ -537,6 +566,7 @@ pub fn on_revoked(ctx: &ReachContext, fingerprint: &Fingerprint) {
     #[cfg(test)]
     ctx.ext::<testing::Calls>().revoked.lock().unwrap().push(*fingerprint);
     secrets::on_revoked(ctx, fingerprint);
+    relay::on_revoked(ctx, fingerprint);
 }
 
 /// The `HostMsg::Reach` for the device `fingerprint`, sent right after the welcome to clients that
@@ -596,9 +626,14 @@ pub async fn handle_client_msg(ctx: &ReachContext, from: &ClientConn, msg: Clien
         | ClientMsg::RelayTo { .. }
         | ClientMsg::Wake { .. }
         | ClientMsg::PunchRequest { .. } => {
+            let refuse =
+                |reason: &str| from.control.try_send(HostMsg::RelayStatus { ok: false, reason: reason.into() });
             if !ctx.reach.read().relays_for_others() {
-                let reason = "this computer does not relay for other devices".to_string();
-                return from.control.try_send(HostMsg::RelayStatus { ok: false, reason });
+                return refuse("this computer does not relay for other devices");
+            }
+            // These two make the connection's datagrams the relay's, which a session also reads.
+            if matches!(msg, ClientMsg::RelayRegister { .. } | ClientMsg::RelayTo { .. }) && !from.link {
+                return refuse("ask for a relay on a link connection, not on a session");
             }
             relay::handle_message(ctx, from, msg).await
         }
@@ -845,8 +880,7 @@ impl Tasks {
         let deadline = tokio::time::Instant::now() + self.grace;
         for (task, mut handle) in waiting {
             if tokio::time::timeout_at(deadline, &mut handle).await.is_err() {
-                tracing::warn!("reach: {} did not stop in time", task.name());
-                handle.abort();
+                abort(task, &mut handle).await;
             }
         }
     }
@@ -856,23 +890,38 @@ fn stop_in_background(task: Task, mut running: Running, grace: Duration) -> Join
     let _ = running.stop.send(true);
     tokio::spawn(async move {
         if tokio::time::timeout(grace, &mut running.handle).await.is_err() {
-            tracing::warn!("reach: {} did not stop in time", task.name());
-            running.handle.abort();
+            abort(task, &mut running.handle).await;
         }
     })
+}
+
+/// Aborts a task that did not stop in time and waits until it is really gone, so that the next run
+/// of the same task never overlaps it (what it gave to `spawn_blocking` can still go on).
+async fn abort(task: Task, handle: &mut JoinHandle<()>) {
+    tracing::warn!("reach: {} did not stop in time", task.name());
+    handle.abort();
+    let _ = tokio::time::timeout(ABORT_WAIT, handle).await;
 }
 
 /// Owns the switches and the tasks they start. One per host, in `server::Shared`.
 pub struct Runtime {
     ctx: ReachContext,
     tasks: Mutex<Tasks>,
+    /// Held while the switches change, so two requests at once cannot leave the file with one
+    /// answer and the state with the other.
+    changing: Mutex<()>,
     runtime: tokio::runtime::Handle,
 }
 
 impl Runtime {
     /// Needs a Tokio runtime. Starts nothing yet: see [`Runtime::start`].
     pub fn new(ctx: ReachContext) -> Runtime {
-        Runtime { ctx, tasks: Mutex::new(Tasks::new()), runtime: tokio::runtime::Handle::current() }
+        Runtime {
+            ctx,
+            tasks: Mutex::new(Tasks::new()),
+            changing: Mutex::new(()),
+            runtime: tokio::runtime::Handle::current(),
+        }
     }
 
     pub fn context(&self) -> &ReachContext {
@@ -900,6 +949,7 @@ impl Runtime {
     /// Saves and applies new switches: the tasks of those turned on start, those turned off are
     /// told to stop (and finish in the background). Nothing changes when saving fails.
     pub fn set_switches(&self, switches: Switches) -> Result<()> {
+        let _changing = lock(&self.changing);
         switches.save(&self.ctx.state_dir).context("saving the standalone reach switches")?;
         self.ctx.reach.update(|state| state.switches = switches);
         self.apply();
@@ -1039,6 +1089,7 @@ pub(crate) mod testing {
             name: name.into(),
             control,
             via_relay: None,
+            link: true,
         };
         (client, outbox)
     }
@@ -1096,6 +1147,57 @@ mod tests {
         let listed = state.reach_addresses();
         assert_eq!(listed.len(), MAX_ADDRESSES);
         assert!(listed.iter().all(|(kind, _)| !matches!(kind, AddressKind::Relay(_))), "relays are cut first");
+    }
+
+    #[test]
+    fn a_host_is_exposed_when_it_means_to_be_reached_from_outside() {
+        let mut state = ReachState::default();
+        assert!(!state.exposed());
+        state.switches.dht = true;
+        assert!(!state.exposed(), "a record in the DHT opens nothing");
+        state.switches.standalone = true;
+        assert!(state.exposed());
+        state.switches = Switches { relay_for_others: true, ..Default::default() };
+        assert!(state.exposed());
+        state.switches = Switches::default();
+        state.relay_only = true;
+        assert!(state.exposed(), "a relay-only host faces the internet by definition");
+    }
+
+    #[test]
+    fn the_record_lists_the_observed_endpoint_as_public_only_where_it_can_be_punched_to() {
+        let observed: SocketAddr = "198.51.100.77:40123".parse().unwrap();
+        let mut state = ReachState { observed: Some(observed), ..Default::default() };
+        state.set_addresses(AddressKind::Lan, texts(&["192.168.1.9:7420"]));
+        state.set_addresses(AddressKind::V6, texts(&["[2001:db8::1]:7420"]));
+        let record = |state: &ReachState| state.record_addresses();
+        let observed_entry = addr(AddressKind::Public, "198.51.100.77:40123");
+
+        // Not measured, or a NAT that gives every peer another endpoint: nothing to punch to.
+        assert_eq!(record(&state), state.addresses);
+        state.nat = Some(NatType::Dependent);
+        assert_eq!(record(&state), state.addresses);
+        state.nat = Some(NatType::Unknown);
+        assert_eq!(record(&state), state.addresses);
+        // A NAT that keeps one endpoint per socket: it is where a client punches to, after the LAN
+        // address and before the IPv6 one, as a public address is listed.
+        state.nat = Some(NatType::EndpointIndependent);
+        assert_eq!(
+            record(&state),
+            vec![
+                addr(AddressKind::Lan, "192.168.1.9:7420"),
+                observed_entry.clone(),
+                addr(AddressKind::V6, "[2001:db8::1]:7420")
+            ]
+        );
+        state.nat = Some(NatType::Open);
+        assert!(record(&state).contains(&observed_entry));
+        // It is the record's alone: what a welcome and a Reach list is untouched.
+        assert!(!state.reach_addresses().contains(&observed_entry));
+        assert!(!state.welcome_addresses().contains(&"198.51.100.77:40123".to_string()));
+        // An advertised public address (a mapping that works) wins.
+        state.set_addresses(AddressKind::Public, texts(&["203.0.113.8:7420"]));
+        assert_eq!(record(&state), state.addresses);
     }
 
     #[test]
@@ -1283,6 +1385,33 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(2), "stop_all must not wait for a task that never ends");
     }
 
+    #[tokio::test]
+    async fn a_run_that_had_to_be_aborted_is_gone_before_the_next_one_starts() {
+        let journal = Journal::default();
+        let launch = {
+            let journal = journal.clone();
+            move |task: Task, _ignored: Stop, after: Option<JoinHandle<()>>| {
+                let journal = journal.clone();
+                tokio::spawn(async move {
+                    if let Some(earlier) = after {
+                        let _ = earlier.await;
+                    }
+                    journal.note(format!("{} up", task.name()));
+                    std::future::pending::<()>().await;
+                })
+            }
+        };
+        let mut tasks = Tasks { grace: Duration::from_millis(100), ..Tasks::new() };
+        tasks.apply(|task| task == Task::Mapping, &launch);
+        journal.until(1).await;
+        let turned_off = Instant::now();
+        tasks.apply(|_| false, &launch);
+        tasks.apply(|task| task == Task::Mapping, &launch);
+        assert_eq!(journal.until(2).await, ["port mapping up", "port mapping up"]);
+        assert!(turned_off.elapsed() >= Duration::from_millis(100), "the second run waited out the first");
+        tasks.stop_all().await;
+    }
+
     #[test]
     fn what_each_task_needs() {
         let mut state = ReachState::default();
@@ -1433,6 +1562,22 @@ mod tests {
             handle_client_msg(&ctx, &from, request).await.unwrap();
             let Some(HostMsg::RelayStatus { ok: false, reason }) = outbox.recv().await else { panic!("a status") };
             assert_ne!(reason, "this computer does not relay for other devices");
+        }
+        // A session cannot give its datagrams to the relay, whatever the switch: the two requests
+        // that would are refused there. The other two take nothing from the connection.
+        let on_a_session = ClientConn { link: false, ..from.clone() };
+        for request in [ClientMsg::RelayRegister { mac: None }, ClientMsg::RelayTo { fingerprint: "f".into() }] {
+            handle_client_msg(&ctx, &on_a_session, request).await.unwrap();
+            let Some(HostMsg::RelayStatus { ok: false, reason }) = outbox.recv().await else { panic!("a refusal") };
+            assert_eq!(reason, "ask for a relay on a link connection, not on a session");
+        }
+        for request in [
+            ClientMsg::Wake { fingerprint: "f".into() },
+            ClientMsg::PunchRequest { to: "f".into(), endpoint: "e".into(), nonce: 1 },
+        ] {
+            handle_client_msg(&ctx, &on_a_session, request).await.unwrap();
+            let Some(HostMsg::RelayStatus { reason, .. }) = outbox.recv().await else { panic!("a status") };
+            assert_eq!(reason, "this build cannot relay yet", "the hook answered");
         }
         // Anything else is not for reach.
         handle_client_msg(&ctx, &from, ClientMsg::RequestKeyframe).await.unwrap();

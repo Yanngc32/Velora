@@ -11,7 +11,11 @@ use super::{PunchRequest, ReachContext};
 /// It measures the endpoint the NAT shows for the QUIC socket with a probe on the multiplexer
 /// (`ctx.socket.probe(..)` and `velora_nat::observe::DhtProbe`: send its pings with
 /// `Probe::send_to`, offer every datagram the probe hears to `DhtProbe::handle`) and writes
-/// `state.observed` and `state.nat`. Repeat when the network may have changed, not in a tight loop.
+/// `state.observed` and `state.nat` (both `None` when it learnt nothing). Repeat when the network
+/// may have changed, not in a tight loop. Do not add the observed endpoint to `state.addresses`:
+/// `ReachState::record_addresses()` puts it in the DHT record as a `Public` address when the NAT
+/// keeps one endpoint per socket and no mapped address is advertised, and nowhere else, since a
+/// client dialling it straight would only fail.
 pub async fn run(ctx: ReachContext) -> Result<()> {
     // reach: filled in by E5
     let _ = ctx;

@@ -7,7 +7,10 @@
 //! `docs/reach-handover/E1-host-plumbing.md`.
 
 use anyhow::Result;
-use velora_protocol::wire::{ClientMsg, HostMsg};
+use velora_protocol::{
+    tls::Fingerprint,
+    wire::{ClientMsg, HostMsg},
+};
 
 use super::{ClientConn, ReachContext};
 
@@ -38,13 +41,25 @@ pub async fn register_with(ctx: ReachContext) -> Result<()> {
 
 /// A relay request arrived from a paired device (`RelayRegister`, `RelayTo`, `Wake` or
 /// `PunchRequest`) and this host relays for others (otherwise `reach::handle_client_msg` already
-/// answered no). `from.control` sends the `RelayStatus` reply; `from.conn` is the connection to
-/// hand to the forwarder. Return promptly: the connection's control stream is not read while this
-/// runs, so spawn what takes long.
+/// answered no, and `RelayRegister` and `RelayTo` came from a session, which has no business
+/// handing over its datagrams). `from.control` sends the `RelayStatus` reply; `from.conn` is the
+/// connection to hand to the forwarder; `from.link` says it is a link, which is always true for
+/// the two requests that take the connection over. Return promptly: the connection's control
+/// stream is not read while this runs, so spawn what takes long.
 pub async fn handle_message(ctx: &ReachContext, from: &ClientConn, msg: ClientMsg) -> Result<()> {
     // reach: filled in by E4
     let _ = (ctx, msg);
     from.control.try_send(HostMsg::RelayStatus { ok: false, reason: "this build cannot relay yet".into() })
+}
+
+/// A paired device was removed in the launcher (called through `reach::on_revoked`, from a
+/// blocking thread, with no lock held). Drop it from the forwarder (`velora_relay::forward::Relay::remove`):
+/// its registration and any flow it is part of end. The forwarder holds its own handle on a
+/// device's connection, so the host closing the device's link is not enough. Removals made with
+/// `velora-host revoke` while the host runs do not come here.
+pub fn on_revoked(ctx: &ReachContext, fingerprint: &Fingerprint) {
+    // reach: filled in by E4
+    let _ = (ctx, fingerprint);
 }
 
 /// Whether relayed traffic is flowing through this host right now. The host does not install an
