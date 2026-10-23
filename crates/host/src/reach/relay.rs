@@ -60,7 +60,7 @@ use tokio::{
     task::{JoinHandle, JoinSet},
     time::{sleep, timeout, timeout_at},
 };
-use velora_nat::wake::{format_mac, parse_mac};
+use velora_nat::wake::{format_mac, parse_mac, Mac};
 use velora_protocol::{
     identity::{AuthorizedClient, KnownHost, StateDir},
     tls::{self, Fingerprint},
@@ -139,6 +139,12 @@ const MAX_PUNCH_STREAMS: usize = 8;
 const PUNCH_READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// How often the pump gives up the pieces of packets whose other piece never came.
 const SWEEP_EVERY: Duration = Duration::from_secs(1);
+/// How often a host with a MAC address the relay has not accepted yet tries to tell it again, and
+/// how long the end of the control stream waits for the connection to say why it ended.
+const MAC_RETRY: Duration = Duration::from_secs(10);
+const CLOSE_GRACE: Duration = Duration::from_secs(1);
+/// Longest text from a peer that goes in a log line.
+const MAX_LOGGED: usize = 200;
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
@@ -153,9 +159,12 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 struct RelayState {
     /// The forwarder of the serving half.
     relay: Relay,
-    /// Set once the state file was read into the forwarder; whoever asks first reads it and the
-    /// others wait for that, so a save never writes over entries that were not loaded yet.
-    loaded: OnceLock<()>,
+    /// Whether the state file was read into the forwarder. Held while it is read, so that whoever
+    /// asks first reads it and the others wait for that: a save never writes over entries that were
+    /// not loaded yet.
+    loaded: Mutex<bool>,
+    /// The computer's name for the hello, found once and off the async workers.
+    name: OnceLock<String>,
     /// What the state file holds now, so that it is written only when something changed.
     saved: Mutex<Vec<KnownRecord>>,
     /// The relays this host is registered with now, by the relay's raw fingerprint.
@@ -198,36 +207,53 @@ impl KnownRecord {
 }
 
 impl RelayState {
-    /// Reads the state file into the forwarder, once. Blocking.
-    fn load_known(&self, ctx: &ReachContext) {
-        self.loaded.get_or_init(|| {
-            let records: Vec<KnownRecord> = ctx.state_dir.load(KNOWN_FILE).unwrap_or_else(|e| {
-                tracing::warn!("ignoring {KNOWN_FILE}: {e:#}");
+    /// Reads the state file into the forwarder, once. Blocking. Returns whether it has been read: a
+    /// file that is missing or damaged reads as empty (the next save writes it afresh), but one that
+    /// cannot be read at all is left for the next try, and nothing is saved until then, or the
+    /// sleeping hosts it holds would be lost.
+    fn load_known(&self, ctx: &ReachContext) -> bool {
+        let mut loaded = lock(&self.loaded);
+        if *loaded {
+            return true;
+        }
+        let records: Vec<KnownRecord> = match std::fs::read(ctx.state_dir.path(KNOWN_FILE)) {
+            Ok(data) => serde_json::from_slice(&data).unwrap_or_else(|e| {
+                tracing::warn!("ignoring {KNOWN_FILE}: {e}");
                 Vec::new()
-            });
-            let mut loaded = 0;
-            for record in &records {
-                match record.known() {
-                    Some(known) => {
-                        self.relay.remember(known);
-                        loaded += 1;
-                    }
-                    None => tracing::debug!("{KNOWN_FILE}: skipping an entry that does not read"),
+            }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => {
+                tracing::warn!("cannot read {KNOWN_FILE} yet: {e}");
+                return false;
+            }
+        };
+        let mut remembered = 0;
+        for record in &records {
+            match record.known() {
+                Some(known) => {
+                    self.relay.remember(known);
+                    remembered += 1;
                 }
+                None => tracing::debug!("{KNOWN_FILE}: skipping an entry that does not read"),
             }
-            if loaded > 0 {
-                tracing::info!("relay: remembering {loaded} host(s) to wake from {KNOWN_FILE}");
-            }
-            *lock(&self.saved) = records;
-        });
+        }
+        if remembered > 0 {
+            tracing::info!("relay: remembering {remembered} host(s) to wake from {KNOWN_FILE}");
+        }
+        *lock(&self.saved) = records;
+        *loaded = true;
+        true
     }
 
     /// Writes what the forwarder remembers, if it differs from what the file holds. Blocking.
     fn save_known(&self, ctx: &ReachContext) {
-        self.load_known(ctx);
+        if !self.load_known(ctx) {
+            return;
+        }
+        // The snapshot is taken under the lock, so that the later of two saves is the later state.
+        let mut saved = lock(&self.saved);
         let mut records: Vec<KnownRecord> = self.relay.known().iter().map(KnownRecord::of).collect();
         records.sort_by(|a, b| a.fingerprint.cmp(&b.fingerprint));
-        let mut saved = lock(&self.saved);
         if *saved == records {
             return;
         }
@@ -238,12 +264,28 @@ impl RelayState {
     }
 }
 
+/// Shuts the forwarder down when dropped, so that the hosts and clients it holds are let go however
+/// the serving task ends, an abort included.
+struct ShutdownOnDrop(Arc<RelayState>);
+
+impl Drop for ShutdownOnDrop {
+    fn drop(&mut self) {
+        self.0.relay.shutdown();
+    }
+}
+
+/// Text a peer sent, fit for a log line: control characters removed, cut short.
+fn clean(text: &str) -> String {
+    text.chars().filter(|c| !c.is_control()).take(MAX_LOGGED).collect()
+}
+
 // ---------------------------------------------------------------------------------------------
 // Serving
 // ---------------------------------------------------------------------------------------------
 
 /// The serving task. Started when the host relays for others (the switch, or `--relay-only`); it
-/// ends when `ctx.stop` fires, when everything the relay holds is disconnected.
+/// ends when `ctx.stop` fires, and everything the relay holds is then disconnected (also when the
+/// task is aborted instead).
 ///
 /// It loads what the forwarder remembers for waking hosts, and every half minute drops devices
 /// that are no longer allowed (removed from `authorized_clients.json`, which `velora-host revoke`
@@ -252,6 +294,7 @@ pub async fn serve(ctx: ReachContext) -> Result<()> {
     let state = ctx.ext::<RelayState>();
     let loading = (ctx.clone(), state.clone());
     let _ = tokio::task::spawn_blocking(move || loading.1.load_known(&loading.0)).await;
+    let relaying = ShutdownOnDrop(state.clone());
     tracing::info!("this computer relays for the user's other devices");
     while !ctx.stop.sleep(SAVE_EVERY).await {
         let tick = (ctx.clone(), state.clone());
@@ -261,7 +304,8 @@ pub async fn serve(ctx: ReachContext) -> Result<()> {
         })
         .await;
     }
-    state.relay.shutdown();
+    // What the forwarder remembers of the hosts it lets go is saved after that.
+    drop(relaying);
     let last = (ctx.clone(), state.clone());
     let _ = tokio::task::spawn_blocking(move || last.1.save_known(&last.0)).await;
     tracing::info!("this computer no longer relays");
@@ -290,11 +334,11 @@ fn reconcile(ctx: &ReachContext, state: &RelayState) {
 }
 
 /// The fingerprints (base64url) of the devices this host relays for: those paired with it, and the
-/// hosts its user paired with from here (see [`trusts`]). `None` when the paired list cannot be read.
+/// hosts its user paired with from here (see [`trusts`]). `None` when either list cannot be read.
 fn allowed(ctx: &ReachContext) -> Option<HashSet<String>> {
     let clients: Vec<AuthorizedClient> = ctx.state_dir.load(StateDir::AUTHORIZED_CLIENTS).ok()?;
     let mut allowed: HashSet<String> = clients.into_iter().map(|client| client.fingerprint).collect();
-    allowed.extend(client_side_hosts(ctx).into_iter().map(|host| host.fingerprint));
+    allowed.extend(client_side_hosts(ctx)?.into_iter().map(|host| host.fingerprint));
     Some(allowed)
 }
 
@@ -329,7 +373,8 @@ pub async fn handle_message(ctx: &ReachContext, from: &ClientConn, msg: ClientMs
             let (conn, control) = (from.conn.clone(), from.control.clone());
             tokio::spawn(async move {
                 if let Some(answer) = relay.handle(&conn, &msg).await {
-                    let _ = control.send(answer).await;
+                    // A device that does not read its answers is not waited for: its tasks would pile up.
+                    let _ = control.try_send(answer);
                 }
             });
         }
@@ -346,6 +391,8 @@ pub async fn handle_message(ctx: &ReachContext, from: &ClientConn, msg: ClientMs
 /// half a minute.
 pub fn on_revoked(ctx: &ReachContext, fingerprint: &Fingerprint) {
     let state = ctx.ext::<RelayState>();
+    // The file first: read later it would put the device back.
+    state.load_known(ctx);
     state.relay.remove(fingerprint);
     state.save_known(ctx);
 }
@@ -367,25 +414,32 @@ pub fn busy(ctx: &ReachContext) -> bool {
 /// password, since a link reaches no screen.
 pub fn trusts(ctx: &ReachContext, fingerprint: &Fingerprint) -> bool {
     let wanted = fingerprint.to_base64();
-    client_side_hosts(ctx).iter().any(|host| host.fingerprint == wanted)
+    client_side_hosts(ctx).is_some_and(|hosts| hosts.iter().any(|host| host.fingerprint == wanted))
 }
 
-/// The hosts the client side of this computer is paired with.
-fn client_side_hosts(ctx: &ReachContext) -> Vec<KnownHost> {
-    ctx.client_state_dir().map(|dir| read_hosts(&dir.join(StateDir::KNOWN_HOSTS))).unwrap_or_default()
+/// The hosts the client side of this computer is paired with: none if it has no list, `None` if it
+/// has one that cannot be read (callers that act on what is missing from a list must not act then).
+fn client_side_hosts(ctx: &ReachContext) -> Option<Vec<KnownHost>> {
+    match ctx.client_state_dir() {
+        Some(dir) => read_hosts(&dir.join(StateDir::KNOWN_HOSTS)),
+        None => Some(Vec::new()),
+    }
 }
 
-/// Reads a list of hosts; a missing or damaged file is an empty list.
-fn read_hosts(path: &Path) -> Vec<KnownHost> {
+/// Reads a list of hosts: empty when there is no file, `None` when there is one that cannot be read.
+fn read_hosts(path: &Path) -> Option<Vec<KnownHost>> {
     match std::fs::read(path) {
-        Ok(data) => serde_json::from_slice(&data).unwrap_or_else(|e| {
-            tracing::warn!("ignoring {}: {e}", path.display());
-            Vec::new()
-        }),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Ok(data) => match serde_json::from_slice(&data) {
+            Ok(hosts) => Some(hosts),
+            Err(e) => {
+                tracing::debug!("cannot read {}: {e}", path.display());
+                None
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(Vec::new()),
         Err(e) => {
             tracing::debug!("cannot read {}: {e}", path.display());
-            Vec::new()
+            None
         }
     }
 }
@@ -456,13 +510,17 @@ fn select(explicit: &[KnownHost], paired: &[KnownHost], own: &Fingerprint) -> Ve
     found
 }
 
-/// Reads the lists the candidates come from. Blocking.
-fn gather(ctx: &ReachContext) -> Vec<Candidate> {
-    let explicit: Vec<KnownHost> = ctx.state_dir.load(RELAYS_FILE).unwrap_or_else(|e| {
-        tracing::debug!("ignoring {RELAYS_FILE}: {e:#}");
-        Vec::new()
-    });
-    select(&explicit, &client_side_hosts(ctx), &ctx.fingerprint)
+/// Reads the lists the candidates come from. Blocking. `None` when one of them cannot be read (a
+/// file half written, say): the registrations that exist stay as they are until it can.
+fn gather(ctx: &ReachContext) -> Option<Vec<Candidate>> {
+    let explicit: Vec<KnownHost> = match ctx.state_dir.load(RELAYS_FILE) {
+        Ok(list) => list,
+        Err(e) => {
+            tracing::debug!("cannot read {RELAYS_FILE}: {e:#}");
+            return None;
+        }
+    };
+    Some(select(&explicit, &client_side_hosts(ctx)?, &ctx.fingerprint))
 }
 
 /// Whether the paired computers are worth asking for a relay: the host advertises no public address
@@ -504,10 +562,14 @@ async fn run_registration(ctx: ReachContext, started: Instant) -> Result<()> {
     let slots = Arc::new(Semaphore::new(MAX_REGISTRATIONS));
     let mut running: HashMap<Fingerprint, Running> = HashMap::new();
     let mut leaving: Vec<AbortOnDrop> = Vec::new();
+    // The computer's name goes in the hello; finding it may read a file.
+    let named = ctx.ext::<RelayState>();
+    let _ = tokio::task::spawn_blocking(move || named.name.get_or_init(crate::hostname).len()).await;
     loop {
         let scanning = ctx.clone();
         match tokio::task::spawn_blocking(move || gather(&scanning)).await {
-            Ok(wanted) => supervise_all(&ctx, &slots, started, &mut running, &mut leaving, wanted),
+            Ok(Some(wanted)) => supervise_all(&ctx, &slots, started, &mut running, &mut leaving, wanted),
+            Ok(None) => {}
             Err(e) => tracing::warn!("relay registration: could not read the lists of relays: {e}"),
         }
         if ctx.stop.sleep(RESCAN_EVERY).await {
@@ -588,12 +650,18 @@ async fn supervise(
             }
             continue;
         }
+        // A paired computer is not worth a handshake when this host's own cap would turn it away.
+        if !current.explicit && slots.available_permits() == 0 {
+            if cancel.sleep(FULL_WAIT).await {
+                return;
+            }
+            continue;
+        }
         let ended = tokio::select! {
             ended = attempt(&ctx, &current, &slots) => ended,
             () = cancel.wait() => return,
         };
         let (why, wait, registered) = match ended {
-            Ended::Cancelled => return,
             Ended::Lost { why, registered_for } => {
                 if registered_for.is_some_and(|lived| lived >= STABLE_AFTER) {
                     backoff.reset();
@@ -621,17 +689,10 @@ async fn supervise(
 
 /// How an attempt at registering ended.
 enum Ended {
-    Cancelled,
     /// It failed, or the registration was lost after `registered_for`.
-    Lost {
-        why: String,
-        registered_for: Option<Duration>,
-    },
+    Lost { why: String, registered_for: Option<Duration> },
     /// Leave the relay alone this long: it said no, or asked for something this host cannot give.
-    Wait {
-        why: String,
-        wait: Duration,
-    },
+    Wait { why: String, wait: Duration },
 }
 
 /// One try: dial the relay, open a link, register, and carry the tunnel until the connection ends.
@@ -647,7 +708,8 @@ async fn attempt(ctx: &ReachContext, candidate: &Candidate, slots: &Arc<Semaphor
     // A relay the user listed is being set up, and is asked again soon; the paired computers that
     // may relay are many, and the ones that say no are left alone for longer.
     let turned_away = if candidate.explicit { REFUSED_WAIT } else { NOT_A_RELAY_WAIT };
-    let mut link = match Link::open(&conn, &crate::hostname()).await {
+    let name = state.name.get().map_or("host", String::as_str);
+    let mut link = match Link::open(&conn, name).await {
         Ok(link) => link,
         Err(LinkError::Refused(reason)) => {
             return Ended::Wait { why: format!("it refused this host: {reason}"), wait: turned_away };
@@ -661,9 +723,17 @@ async fn attempt(ctx: &ReachContext, candidate: &Candidate, slots: &Arc<Semaphor
     if !link.reach.as_ref().is_some_and(|reach| reach.relays_for_others) {
         return Ended::Wait { why: "it does not relay for other devices".into(), wait: turned_away };
     }
-    let Ok(permit) = slots.clone().try_acquire_owned() else {
-        let why = "this host is registered with as many relays as it allows".to_string();
-        return Ended::Wait { why, wait: FULL_WAIT };
+    // The relays the user listed do not count against the cap: they asked for them.
+    let permit = if candidate.explicit {
+        None
+    } else {
+        match slots.clone().try_acquire_owned() {
+            Ok(permit) => Some(permit),
+            Err(_) => {
+                let why = "this host is registered with as many relays as it allows".to_string();
+                return Ended::Wait { why, wait: FULL_WAIT };
+            }
+        }
     };
     // Open before registering: clients are passed through as soon as the relay has said yes.
     let mut tunnel = match ctx.socket.open_tunnel(candidate.fingerprint.0, NonZeroU16::MIN) {
@@ -683,7 +753,7 @@ async fn attempt(ctx: &ReachContext, candidate: &Candidate, slots: &Arc<Semaphor
     let _listed = Listed::new(ctx, &state, entry);
     tracing::info!("registered with the relay '{}' ({}) at {via}", candidate.name, candidate.fingerprint);
 
-    let carried = carry(ctx, &conn, &mut link, &mut tunnel).await;
+    let carried = carry(ctx, &conn, &mut link, &mut tunnel, mac).await;
     drop(permit);
     ended_by(carried, registered.elapsed())
 }
@@ -704,7 +774,7 @@ fn ended_by(carried: Carried, registered_for: Duration) -> Ended {
     match carried {
         Carried::Closed(quinn::ConnectionError::ApplicationClosed(close)) => {
             let code = u64::from(close.error_code);
-            let reason = String::from_utf8_lossy(&close.reason).into_owned();
+            let reason = clean(&String::from_utf8_lossy(&close.reason));
             let said = |text: &str| if reason.is_empty() { text.to_string() } else { format!("{text} ({reason})") };
             if code == u64::from(CLOSE_REPLACED) {
                 let why = said("another registration of this host replaced this one");
@@ -722,43 +792,88 @@ fn ended_by(carried: Carried, registered_for: Duration) -> Ended {
     }
 }
 
+/// Which MAC address the relay has accepted, so that one that turns up after the registration (the
+/// host looks for it once it runs) or changes is told to the relay too, which lets it wake this host.
+#[derive(Debug)]
+struct MacTold {
+    /// What the relay accepted.
+    confirmed: Option<Mac>,
+    /// What was sent and not answered yet.
+    asked: Option<Mac>,
+}
+
+impl MacTold {
+    /// `sent` is what the registration carried, and the relay accepted.
+    fn new(sent: Option<Mac>) -> MacTold {
+        MacTold { confirmed: sent, asked: None }
+    }
+
+    /// The address to tell the relay now: one it did not accept yet, when no question is open.
+    fn to_tell(&self, current: Option<Mac>) -> Option<Mac> {
+        current.filter(|mac| self.asked.is_none() && Some(*mac) != self.confirmed)
+    }
+
+    fn asked(&mut self, mac: Mac) {
+        self.asked = Some(mac);
+    }
+
+    /// The relay answered the open question. A no leaves the address to be told again.
+    fn answered(&mut self, ok: bool) {
+        if let Some(mac) = self.asked.take().filter(|_| ok) {
+            self.confirmed = Some(mac);
+        }
+    }
+}
+
 /// Carries inner packets between the tunnel and the relay and listens on the control stream, until
-/// the connection ends. A MAC address that becomes known (or changes) after the registration is
-/// told to the relay, which lets it wake this host.
-async fn carry(ctx: &ReachContext, conn: &quinn::Connection, link: &mut Link, tunnel: &mut Tunnel) -> Carried {
+/// the connection ends. `sent` is the MAC address the registration carried.
+async fn carry(
+    ctx: &ReachContext,
+    conn: &quinn::Connection,
+    link: &mut Link,
+    tunnel: &mut Tunnel,
+    sent: Option<Mac>,
+) -> Carried {
     let mut changes = ctx.reach.subscribe();
-    let mut told = ctx.reach.read().mac;
+    let mut mac = MacTold::new(sent);
+    let mut retry = tokio::time::interval(MAC_RETRY);
+    retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let pumping = pump(conn, tunnel, Some(ctx));
     tokio::pin!(pumping);
-    loop {
+    let why = loop {
+        let current = ctx.reach.read().mac;
+        if let Some(wanted) = mac.to_tell(current) {
+            match link.send(&ClientMsg::RelayRegister { mac: Some(wanted) }).await {
+                Ok(()) => mac.asked(wanted),
+                Err(e) => break format!("{e:#}"),
+            }
+        }
         tokio::select! {
             ended = &mut pumping => return ended,
             message = link.inbox.recv() => match message {
-                Some(Ok(HostMsg::RelayStatus { ok: false, reason })) => {
-                    tracing::warn!("the relay did not take this host's last request: {reason}");
-                }
-                Some(Ok(HostMsg::PunchRequest { from, endpoint, nonce })) => {
-                    // The relay should use a stream for this; a control stream does as well.
-                    let (ctx, request) = (ctx.clone(), PunchRequest { from, endpoint, nonce });
-                    tokio::spawn(async move { respond(&ctx, request).await });
+                Some(Ok(HostMsg::RelayStatus { ok, reason })) => {
+                    mac.answered(ok);
+                    if !ok {
+                        tracing::warn!("the relay did not take this host's last request: {}", clean(&reason));
+                    }
                 }
                 Some(Ok(_)) => {}
-                Some(Err(why)) => return Carried::Broken(why),
-                None => return Carried::Broken("the relay ended the control stream".into()),
+                Some(Err(why)) => break why,
+                None => break "the relay ended the control stream".to_string(),
             },
             changed = changes.changed() => {
                 if changed.is_err() {
-                    return Carried::Broken("the host is shutting down".into());
-                }
-                let mac = ctx.reach.read().mac;
-                if mac.is_some() && mac != told {
-                    told = mac;
-                    if let Err(e) = link.send(&ClientMsg::RelayRegister { mac }).await {
-                        return Carried::Broken(format!("{e:#}"));
-                    }
+                    break "the host is shutting down".to_string();
                 }
             }
+            _ = retry.tick() => {}
         }
+    };
+    // A relay that ends the control stream is usually closing the connection, and the pump knows
+    // with what code (which says how long to stay away): give it a moment to say.
+    match timeout(CLOSE_GRACE, &mut pumping).await {
+        Ok(ended) => ended,
+        Err(_) => Carried::Broken(why),
     }
 }
 
@@ -956,39 +1071,44 @@ impl Link {
         let (messages, inbox) = mpsc::channel(INBOX_QUEUE);
         let reader = tokio::spawn(read_host_messages(recv, messages));
         let mut link = Link { send, inbox, reader, reach: None };
+        // The whole welcome has this long, however much the host says meanwhile.
+        let deadline = tokio::time::Instant::now() + LINK_TIMEOUT;
         loop {
-            match link.next(LINK_TIMEOUT).await? {
+            match link.next_until(deadline).await? {
                 HostMsg::Welcome { version, .. } if version == PROTOCOL_VERSION => break,
                 HostMsg::Welcome { version, .. } => {
                     return Err(anyhow!("the host speaks protocol {version}, not {PROTOCOL_VERSION}").into());
                 }
-                HostMsg::Rejected { reason } => return Err(LinkError::Refused(reason)),
+                HostMsg::Rejected { reason } => return Err(LinkError::Refused(clean(&reason))),
                 HostMsg::PasswordRequired { .. } => return Err(LinkError::PasswordRequired),
                 // This device offered no pairing secret.
                 HostMsg::Paired => {}
                 _ => return Err(anyhow!("the host sent something before its welcome").into()),
             }
         }
-        // A host from before standalone reach ignores the bit and sends none.
+        // A host from before standalone reach ignores the bit and sends none; one whose stream
+        // breaks instead has no connection worth keeping.
         let deadline = tokio::time::Instant::now() + REACH_WAIT;
-        while let Ok(message) = timeout_at(deadline, link.inbox.recv()).await {
-            match message {
-                Some(Ok(HostMsg::Reach { addresses, relays_for_others, .. })) => {
+        loop {
+            match timeout_at(deadline, link.inbox.recv()).await {
+                Ok(Some(Ok(HostMsg::Reach { addresses, relays_for_others, .. }))) => {
                     link.reach = Some(RelayReach { addresses, relays_for_others });
                     break;
                 }
-                Some(Ok(_)) => {}
-                Some(Err(_)) | None => break,
+                Ok(Some(Ok(_))) => {}
+                Ok(Some(Err(why))) => return Err(anyhow!("{}", clean(&why)).into()),
+                Ok(None) => return Err(anyhow!("the host closed the control stream").into()),
+                Err(_) => break,
             }
         }
         Ok(link)
     }
 
-    /// The next message from the host; an error when it takes longer than `wait` or the stream ends.
-    async fn next(&mut self, wait: Duration) -> Result<HostMsg> {
-        match timeout(wait, self.inbox.recv()).await {
+    /// The next message from the host; an error when it does not come by `deadline` or the stream ends.
+    async fn next_until(&mut self, deadline: tokio::time::Instant) -> Result<HostMsg> {
+        match timeout_at(deadline, self.inbox.recv()).await {
             Ok(Some(Ok(msg))) => Ok(msg),
-            Ok(Some(Err(why))) => bail!("{why}"),
+            Ok(Some(Err(why))) => bail!("{}", clean(&why)),
             Ok(None) => bail!("the host closed the control stream"),
             Err(_) => bail!("the host took too long to answer"),
         }
@@ -1003,10 +1123,16 @@ impl Link {
 
     /// Waits for the answer to a relay request: `Ok` when the relay did it, the reason when it did not.
     async fn status(&mut self) -> Result<(), String> {
+        self.status_within(LINK_TIMEOUT).await
+    }
+
+    /// [`Link::status`], with `wait` for the whole answer however much else the host says meanwhile.
+    async fn status_within(&mut self, wait: Duration) -> Result<(), String> {
+        let deadline = tokio::time::Instant::now() + wait;
         loop {
-            match self.next(LINK_TIMEOUT).await.map_err(|e| format!("{e:#}"))? {
+            match self.next_until(deadline).await.map_err(|e| format!("{e:#}"))? {
                 HostMsg::RelayStatus { ok: true, .. } => return Ok(()),
-                HostMsg::RelayStatus { ok: false, reason } => return Err(reason),
+                HostMsg::RelayStatus { ok: false, reason } => return Err(clean(&reason)),
                 _ => {}
             }
         }
@@ -1050,7 +1176,8 @@ async fn read_host_messages(mut recv: quinn::RecvStream, out: mpsc::Sender<Resul
 /// hole punching code.
 async fn pump(conn: &quinn::Connection, tunnel: &mut Tunnel, punch: Option<&ReachContext>) -> Carried {
     let (inbound, mut splitter, mut reassembler) = (tunnel.inbound(), Splitter::new(), Reassembler::new());
-    let streams = Arc::new(Semaphore::new(MAX_PUNCH_STREAMS));
+    // The readers of punch requests end with the pump, however it ends.
+    let mut readers = JoinSet::new();
     let mut sweep = tokio::time::interval(SWEEP_EVERY);
     sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut dropped = 0u64;
@@ -1079,13 +1206,12 @@ async fn pump(conn: &quinn::Connection, tunnel: &mut Tunnel, punch: Option<&Reac
                     Ok(recv) => recv,
                     Err(e) => return Carried::Closed(e),
                 };
-                // Streams nobody takes are dropped, which tells the relay to stop sending.
-                if let (Some(ctx), Ok(permit)) = (punch, streams.clone().try_acquire_owned()) {
+                // Streams nobody takes (too many at once, or no one to give them to) are dropped, which
+                // tells the relay to stop sending.
+                while readers.try_join_next().is_some() {}
+                if let (Some(ctx), true) = (punch, readers.len() < MAX_PUNCH_STREAMS) {
                     let ctx = ctx.clone();
-                    tokio::spawn(async move {
-                        read_punch(&ctx, recv).await;
-                        drop(permit);
-                    });
+                    readers.spawn(async move { read_punch(&ctx, recv).await });
                 }
             }
             _ = sweep.tick() => reassembler.expire(Instant::now()),
@@ -1158,11 +1284,12 @@ fn parse_punch(body: &[u8]) -> Option<PunchRequest> {
     }
 }
 
-/// Gives a punch request to the hole punching code (E5); what it fails with is only logged.
+/// Gives a punch request to the hole punching code (E5); what it fails with is only logged. A
+/// refusal is news: a paired device asked for something the host will not do.
 async fn respond(ctx: &ReachContext, request: PunchRequest) {
-    let from = request.from.clone();
+    let from = clean(&request.from);
     if let Err(e) = punch::respond(ctx, request).await {
-        tracing::debug!("punch request of {from}: {e:#}");
+        tracing::info!("punch request of {from} not taken: {e:#}");
     }
 }
 
@@ -1856,12 +1983,21 @@ mod tests {
         let Ended::Wait { why, .. } = attempt(&ctx, &candidate(&plain), &slots).await else { panic!("left alone") };
         assert!(why.contains("does not relay"), "{why}");
 
-        // Once the relay's user pairs it, the host registers, and is listed while the connection lasts.
+        // Once the relay's user pairs it, a paired computer is still turned away when this host is
+        // registered with as many relays as it allows.
         std::fs::write(
             relay_state.join(StateDir::AUTHORIZED_CLIENTS),
             serde_json::to_vec(&clients(&[ctx.fingerprint])).unwrap(),
         )
         .unwrap();
+        let derived = Candidate { explicit: false, ..candidate(&relay) };
+        let full = Arc::new(Semaphore::new(0));
+        let Ended::Wait { why, wait } = attempt(&ctx, &derived, &full).await else { panic!("turned away by the cap") };
+        assert!(why.contains("as many relays"), "{why}");
+        assert_eq!(wait, FULL_WAIT);
+
+        // A relay the user listed is not counted: the host registers, and is listed while the
+        // connection lasts.
         let attempting = {
             let (ctx, candidate, slots) = (ctx.clone(), candidate(&relay), slots.clone());
             AbortOnDrop(tokio::spawn(async move {
@@ -1874,13 +2010,23 @@ mod tests {
         assert!(listed[0].addresses.contains(&relay_addr.to_string()));
         let tunnel = tunnel_addr(&relay.fingerprint.0, NonZeroU16::MIN);
         assert_eq!(ctx.socket.tunnel_relay(tunnel), Some(relay.fingerprint.0), "clients come in at the tunnel");
-        assert_eq!(slots.available_permits(), MAX_REGISTRATIONS - 1);
+        assert_eq!(slots.available_permits(), MAX_REGISTRATIONS, "a listed relay takes no slot");
 
         // The registration ends: the relay is no longer listed and the tunnel is closed.
         drop(attempting);
         until("the registration to end", || ctx.reach.read().relays.is_empty()).await;
         assert_eq!(ctx.socket.tunnel_relay(tunnel), None);
-        assert_eq!(slots.available_permits(), MAX_REGISTRATIONS);
+
+        // A paired computer holds a slot for as long as it holds the registration.
+        let attempting = {
+            let (ctx, slots) = (ctx.clone(), slots.clone());
+            AbortOnDrop(tokio::spawn(async move {
+                let _ = attempt(&ctx, &derived, &slots).await;
+            }))
+        };
+        until("the slot to be taken", || slots.available_permits() == MAX_REGISTRATIONS - 1).await;
+        drop(attempting);
+        until("the slot to be given back", || slots.available_permits() == MAX_REGISTRATIONS).await;
     }
 
     #[tokio::test]
@@ -2028,5 +2174,213 @@ mod tests {
             forwarder.relay.registered().first().is_some_and(|host| host.mac == Some(MAC))
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn the_code_a_relay_closes_with_says_how_long_to_stay_away_every_time() {
+        let (relay_ctx, _relay_scratch) = testing::context("relay-codes");
+        relay_ctx.reach.update(|state| state.relay_only = true);
+        let (accepted_tx, mut accepted) = mpsc::unbounded_channel();
+        let _serving = AbortOnDrop(tokio::spawn(serve_links(relay_ctx.clone(), accepted_tx)));
+        let (ctx, _scratch) = testing::context("codes");
+        let candidate = Candidate {
+            fingerprint: relay_ctx.fingerprint,
+            name: "relay".into(),
+            addresses: vec![relay_ctx.socket.local_addr().to_string()],
+            explicit: true,
+        };
+        let slots = Arc::new(Semaphore::new(MAX_REGISTRATIONS));
+
+        // The connection and its control stream end together and are read by different tasks, so
+        // which of them tells the host first is chance: five rounds (the relay's allowance of new
+        // flows is six) make it very likely that both orders are tried.
+        for round in 0..5 {
+            let attempting = {
+                let (ctx, candidate, slots) = (ctx.clone(), candidate.clone(), slots.clone());
+                tokio::spawn(async move { attempt(&ctx, &candidate, &slots).await })
+            };
+            let conn = timeout(Duration::from_secs(10), accepted.recv()).await.expect("dialed").unwrap();
+            until("the registration", || !ctx.reach.read().relays.is_empty()).await;
+            conn.close(CLOSE_REPLACED.into(), b"another copy");
+            let ended = timeout(Duration::from_secs(10), attempting).await.expect("the attempt ends").unwrap();
+            let Ended::Wait { wait, .. } = ended else { panic!("round {round}: the host should stay away") };
+            assert_eq!(wait, REPLACED_WAIT);
+        }
+    }
+
+    #[tokio::test]
+    async fn answers_to_a_device_that_does_not_read_are_dropped_and_no_task_waits_for_it() {
+        let (ctx, _scratch) = testing::context("relay-flood");
+        let (_link, from, outbox) = device(&ctx, "phone").await;
+        // Far more requests than the queue of a control stream holds, and the device reads none of
+        // the answers.
+        for _ in 0..200 {
+            let wake = ClientMsg::Wake { fingerprint: Fingerprint([1; 32]).to_base64() };
+            handle_message(&ctx, &from, wake).await.unwrap();
+        }
+        // Each is answered from a task of its own, and none of them stays to wait: only `from` still
+        // holds a way to write to the device's queue.
+        until("the tasks to end", || outbox.sender_strong_count() == 1).await;
+    }
+
+    #[test]
+    fn a_mac_address_is_told_to_the_relay_until_it_accepts_it() {
+        let (a, b) = ([1; 6], [2; 6]);
+        let mut told = MacTold::new(None);
+        assert_eq!(told.to_tell(None), None, "there is nothing to tell");
+        assert_eq!(told.to_tell(Some(a)), Some(a), "one that turned up after the registration");
+        told.asked(a);
+        assert_eq!(told.to_tell(Some(a)), None, "one question at a time");
+        told.answered(false);
+        assert_eq!(told.to_tell(Some(a)), Some(a), "a no is asked again");
+        told.asked(a);
+        told.answered(true);
+        assert_eq!(told.to_tell(Some(a)), None);
+        assert_eq!(told.to_tell(Some(b)), Some(b), "and a change is told");
+        assert_eq!(MacTold::new(Some(a)).to_tell(Some(a)), None, "the registration carried it");
+    }
+
+    #[tokio::test]
+    async fn a_relay_that_talks_without_answering_does_not_hold_the_host_up() {
+        let (ctx, _scratch) = testing::context("relay-chatty");
+        let link = testing::connect(&ctx).await;
+        let server = link.server.clone();
+        let _talking = AbortOnDrop(tokio::spawn(async move {
+            let Ok((mut send, mut recv)) = server.accept_bi().await else { return };
+            let _ = wire::read_msg(&mut recv).await;
+            let welcome = HostMsg::Welcome {
+                version: PROTOCOL_VERSION,
+                host_name: "chatty".into(),
+                codec: Codec::H264,
+                width: 0,
+                height: 0,
+                features: Some(0),
+                addresses: Vec::new(),
+            };
+            let reach = HostMsg::Reach {
+                addresses: Vec::new(),
+                key: [0; 32],
+                secret: [0; 16],
+                relays: Vec::new(),
+                mac: None,
+                relays_for_others: true,
+            };
+            let _ = send.write_all(&welcome.encode()).await;
+            let _ = send.write_all(&reach.encode()).await;
+            // For ever, and never the answer that was asked for.
+            while send.write_all(&HostMsg::Paired.encode()).await.is_ok() {
+                sleep(Duration::from_millis(10)).await;
+            }
+        }));
+        let mut opened = Link::open(link.client(), "test device").await.map_err(|e| format!("{e:?}")).expect("a link");
+        let began = Instant::now();
+        let status = timeout(Duration::from_secs(5), opened.status_within(Duration::from_millis(300))).await;
+        let status = status.expect("the wait has a deadline of its own");
+        assert!(status.is_err(), "no answer came");
+        assert!(began.elapsed() < Duration::from_secs(2), "and the wait ended at its deadline: {:?}", began.elapsed());
+    }
+
+    #[tokio::test]
+    async fn removing_a_device_is_not_undone_by_a_file_read_afterwards() {
+        let (ctx, _scratch) = testing::context("relay-revoke-first");
+        let file = ctx.state_dir.path(KNOWN_FILE);
+        let records = [KnownRecord::of(&known(1)), KnownRecord::of(&known(2))];
+        std::fs::write(&file, serde_json::to_vec(&records).unwrap()).unwrap();
+        // The relay switch has been off, so the file was never read when the user removes a device.
+        on_revoked(&ctx, &Fingerprint([1; 32]));
+        let state = ctx.ext::<RelayState>();
+        let remembered: Vec<Fingerprint> = state.relay.known().iter().map(|known| known.fingerprint).collect();
+        assert_eq!(remembered, [Fingerprint([2; 32])]);
+        let saved: Vec<KnownRecord> = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        assert_eq!(saved, [KnownRecord::of(&known(2))]);
+    }
+
+    #[tokio::test]
+    async fn a_state_file_that_cannot_be_read_is_not_written_over() {
+        let (ctx, _scratch) = testing::context("relay-unreadable");
+        let file = ctx.state_dir.path(KNOWN_FILE);
+        // Not missing, not damaged: reading it fails (it is a directory).
+        std::fs::create_dir(&file).unwrap();
+        let state = RelayState::default();
+        assert!(!state.load_known(&ctx));
+        state.relay.remember(known(1));
+        state.save_known(&ctx);
+        std::fs::remove_dir(&file).unwrap();
+        std::fs::write(&file, serde_json::to_vec(&[KnownRecord::of(&known(9))]).unwrap()).unwrap();
+
+        // Readable at last: what it holds is loaded before anything is written, so nothing is lost.
+        state.save_known(&ctx);
+        let saved: Vec<KnownRecord> = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        let mut fingerprints: Vec<String> = saved.iter().map(|record| record.fingerprint.clone()).collect();
+        fingerprints.sort();
+        let mut both = vec![Fingerprint([1; 32]).to_base64(), Fingerprint([9; 32]).to_base64()];
+        both.sort();
+        assert_eq!(fingerprints, both);
+    }
+
+    #[test]
+    fn saves_from_several_threads_leave_the_file_with_everything_remembered() {
+        let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+        let (ctx, _scratch) = runtime.block_on(async { testing::context("relay-saves") });
+        let state = ctx.ext::<RelayState>();
+        std::thread::scope(|scope| {
+            for thread in 0..6u8 {
+                let (ctx, state) = (&ctx, &state);
+                scope.spawn(move || {
+                    for n in 0..10u8 {
+                        state.relay.remember(known(thread * 10 + n + 1));
+                        state.save_known(ctx);
+                    }
+                });
+            }
+        });
+        let saved: Vec<KnownRecord> =
+            serde_json::from_slice(&std::fs::read(ctx.state_dir.path(KNOWN_FILE)).unwrap()).unwrap();
+        assert_eq!(saved.len(), 60, "the last save held the latest state");
+    }
+
+    #[tokio::test]
+    async fn a_list_that_cannot_be_read_changes_nothing() {
+        let (ctx, _scratch) = testing::context("relay-lists");
+        assert_eq!(gather(&ctx).map(|found| found.len()), Some(0), "no lists, no relays");
+        assert!(allowed(&ctx).is_some());
+
+        // `relays.json` half written: the registrations that exist stay.
+        std::fs::write(ctx.state_dir.path(RELAYS_FILE), b"[{\"name\":").unwrap();
+        assert!(gather(&ctx).is_none());
+        std::fs::remove_file(ctx.state_dir.path(RELAYS_FILE)).unwrap();
+
+        // `known_hosts.json` of the client side that does not read: nobody is dropped for it either.
+        let client_dir = ctx.client_state_dir().unwrap();
+        std::fs::create_dir_all(&client_dir).unwrap();
+        let hosts = client_dir.join(StateDir::KNOWN_HOSTS);
+        std::fs::write(&hosts, b"damaged").unwrap();
+        assert!(gather(&ctx).is_none());
+        assert!(allowed(&ctx).is_none());
+        std::fs::write(&hosts, b"[]").unwrap();
+        assert!(gather(&ctx).is_some() && allowed(&ctx).is_some());
+    }
+
+    #[tokio::test]
+    async fn the_forwarder_is_shut_down_when_the_serving_task_is_aborted() {
+        let (ctx, _scratch) = testing::context("relay-abort");
+        let state = ctx.ext::<RelayState>();
+        let (host_link, host, mut outbox) = device(&ctx, "host").await;
+        handle_message(&ctx, &host, ClientMsg::RelayRegister { mac: None }).await.unwrap();
+        assert!(answer(&mut outbox).await.0);
+        let serving = tokio::spawn(serve(ctx.clone()));
+        // It has started relaying once it has read its file (and a moment more to take hold).
+        until("the serving task to read its file", || *lock(&state.loaded)).await;
+        sleep(Duration::from_millis(100)).await;
+        serving.abort();
+        assert_eq!(closed_with(host_link.client()).await, u64::from(CLOSE_SHUTDOWN));
+        assert!(state.relay.registered().is_empty());
+    }
+
+    #[test]
+    fn text_from_a_peer_is_cleaned_before_it_is_logged() {
+        assert_eq!(clean("two\nlines\u{7}\u{1b}[31m"), "twolines[31m");
+        assert_eq!(clean(&"x".repeat(1000)).len(), MAX_LOGGED);
+        assert_eq!(clean("plain"), "plain");
     }
 }
