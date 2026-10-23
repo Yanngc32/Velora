@@ -202,6 +202,10 @@ async fn handshake(params: &ConnectParams, ext: Option<HelloExt>) -> Result<Hand
             HostMsg::PasswordRequired { wrong } => return Err(PasswordRequired { wrong }.into()),
             // Only follows the welcome.
             HostMsg::Displays(_) => bail!("displays before the welcome"),
+            // reach: filled in by F1
+            HostMsg::Reach { .. } | HostMsg::RelayStatus { .. } | HostMsg::PunchRequest { .. } => {
+                bail!("unexpected message before the welcome")
+            }
         }
     }
 }
@@ -370,6 +374,7 @@ pub async fn connect(params: ConnectParams, output: VideoOutput) -> Result<Sessi
         addresses: true,
         displays: true,
         audio: velora_audio::SUPPORTED,
+        reach: false, // reach: filled in by F1
     };
     let hs = match handshake(&params, Some(ext)).await {
         // Hosts that predate hello extensions drop the connection: ask again as they expect.

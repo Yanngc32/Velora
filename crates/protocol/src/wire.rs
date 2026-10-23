@@ -10,8 +10,32 @@
 //!   [`FrameHeader`] followed by the H.264 Annex-B bitstream until end of stream.
 //! - **Files** (either side opens): one bidirectional stream per operation, see
 //!   [`crate::files`]. Only with hosts that announce [`FEATURE_FILES`].
+//!
+//! Control messages start with a one-byte tag, numbered separately for each direction. A new
+//! message takes the next free number and is sent only to a peer that said it understands it
+//! (a hello bit, or an earlier message that announced it): a host decodes a tag it does not
+//! know as [`ClientMsg::Unsupported`] and ignores it, a client fails on one.
+//!
+//! | tag | [`ClientMsg`]     | [`HostMsg`]        |
+//! |----:|-------------------|--------------------|
+//! |   1 | `Hello`           | `Welcome`          |
+//! |   2 | `Key`             | `Paired`           |
+//! |   3 | `MouseButton`     | `Rejected`         |
+//! |   4 | `Scroll`          | `PasswordRequired` |
+//! |   5 | `FrameAck`        | `Displays`         |
+//! |   6 | `RequestKeyframe` | `Reach`            |
+//! |   7 | `ReleaseAll`      | `RelayStatus`      |
+//! |   8 | `Text`            | `PunchRequest`     |
+//! |   9 | `OfferPairing`    |                    |
+//! |  10 | `SelectDisplay`   |                    |
+//! |  11 | `Reached`         |                    |
+//! |  12 | `RelayRegister`   |                    |
+//! |  13 | `RelayTo`         |                    |
+//! |  14 | `Wake`            |                    |
+//! |  15 | `PunchRequest`    |                    |
 
 use anyhow::{bail, ensure, Context, Result};
+use serde::{Deserialize, Serialize};
 
 pub const PROTOCOL_VERSION: u16 = 1;
 pub const ALPN: &[u8] = b"velora/1";
@@ -27,14 +51,25 @@ pub const PAIRING_SECRET_LEN: usize = 16;
 pub const MAX_NAME_LEN: usize = 256;
 /// Longest text carried by one [`ClientMsg::Text`]; longer input is split by [`split_text`].
 pub const MAX_TEXT_LEN: usize = 4096;
-/// Most addresses a welcome carries.
-pub const MAX_ADDRESSES: usize = 8;
+/// Most addresses a [`HostMsg::Reach`] lists, and most it lists for one relay.
+pub const MAX_ADDRESSES: usize = 16;
+/// Most addresses a welcome carries. Clients that predate [`HostMsg::Reach`] read this many and
+/// reject a welcome with more (they insist the message ends after the last one), so it stays
+/// at 8 while [`MAX_ADDRESSES`] grew: the rest of the host's addresses travel in `Reach`.
+pub const MAX_WELCOME_ADDRESSES: usize = 8;
+/// Most relays a [`HostMsg::Reach`] lists.
+pub const MAX_RELAYS: usize = 8;
 /// Longest pairing link in [`ClientMsg::OfferPairing`], in bytes.
 pub const MAX_LINK_LEN: usize = 1024;
 /// Longest access password, in bytes.
 pub const MAX_PASSWORD_LEN: usize = 256;
 /// Most displays a [`HostMsg::Displays`] lists.
 pub const MAX_DISPLAYS: usize = 16;
+/// Length of the Ed25519 public key a host publishes its DHT record under, in bytes.
+pub const REACH_KEY_LEN: usize = 32;
+/// Length of the secret that opens a host's DHT record, in bytes. The host gives one to each
+/// paired device, so that removing a device also cuts it off from the record.
+pub const DEVICE_SECRET_LEN: usize = 16;
 
 /// [`HostMsg::Welcome`] feature bit: the host serves file streams.
 pub const FEATURE_FILES: u32 = 1;
@@ -45,6 +80,13 @@ pub const FEATURE_AUDIO: u32 = 4;
 
 /// What a client that knows about extensions adds to its hello. Hosts that predate them reject
 /// such a hello, and only hellos with it are answered with `features` in the welcome.
+///
+/// On the wire these are the bits of one flags byte after the password field: 0 `files_only`,
+/// 1 `clipboard`, 2 `addresses`, 3 `displays`, 4 `audio`, 5 `reach`; bit 6 is free. Bit 7 is
+/// reserved for "another flags byte follows", so a later version can add flags without
+/// running out of bits. This version decodes such a hello and skips those bytes, which it has no
+/// use for yet, and never sets the bit; a host that predates the bit drops a hello that has
+/// them. Every host so far ignores bits it does not know, which is why a new bit is safe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct HelloExt {
     /// Only file transfers: no video or input, and the host's current session is left alone.
@@ -57,6 +99,54 @@ pub struct HelloExt {
     pub displays: bool,
     /// The client plays the host's sound (see [`AudioPacket`]).
     pub audio: bool,
+    /// The client understands standalone reach: it wants a [`HostMsg::Reach`] after the welcome.
+    /// Hosts that predate it ignore the bit and send none.
+    pub reach: bool,
+}
+
+/// Bit 7 of the hello's flags byte: another flags byte follows (see [`HelloExt`]).
+const HELLO_MORE_FLAGS: u8 = 0x80;
+
+/// How one of the host's addresses is reached, as [`HostMsg::Reach`] lists them. On the wire a
+/// kind is one byte: 0 `Lan`, 1 `Vpn`, 2 `Public`, 3 `V6`, 4 `Relay`, followed (for `Relay` only)
+/// by the relay's fingerprint as a string. Any other code is [`AddressKind::Other`], which
+/// carries the code unchanged. A kind added later must not carry anything after its code,
+/// since this version could not tell where it ends.
+///
+/// As JSON (the control channel, the known-hosts file) it is `"lan"`, `"vpn"`, `"public"`,
+/// `"v6"`, `{"relay":"<fingerprint>"}` or `{"other":<code>}`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AddressKind {
+    /// On the host's local network (code 0).
+    Lan,
+    /// On a VPN mesh like Tailscale or Netbird (code 1).
+    Vpn,
+    /// The router's public IPv4 address and the port it maps to the host (code 2).
+    Public,
+    /// A global IPv6 address of the host (code 3).
+    V6,
+    /// Through a relay: another paired PC that both ends can reach (code 4). Holds the relay's
+    /// fingerprint, base64url as `Fingerprint::to_base64` writes it; the address next to it is
+    /// the relay's own.
+    Relay(String),
+    /// A kind this version does not know, by its code (above 4: reading a code listed above
+    /// never makes this, and one made by hand from such a code would not round-trip).
+    Other(u8),
+}
+
+impl AddressKind {
+    /// The kind's byte on the wire.
+    pub fn code(&self) -> u8 {
+        match self {
+            Self::Lan => 0,
+            Self::Vpn => 1,
+            Self::Public => 2,
+            Self::V6 => 3,
+            Self::Relay(_) => 4,
+            Self::Other(code) => *code,
+        }
+    }
 }
 
 /// One of the host's displays, as [`HostMsg::Displays`] lists it.
@@ -188,6 +278,43 @@ pub enum ClientMsg {
     SelectDisplay {
         index: u8,
     },
+    /// Which of the host's addresses this connection was made to (the one that won the
+    /// client's race), as the client dialed it. The host logs it and shows it as "last reached".
+    /// Sent once, after the welcome, to hosts that sent a [`HostMsg::Reach`].
+    Reached {
+        address: String,
+    },
+    /// Asks the host (a relay) to keep this connection as its way in from outside: the sender
+    /// is a host that cannot be reached directly, so it dials out and clients are passed
+    /// through to it (see [`ClientMsg::RelayTo`]). `mac` is the MAC address of its network
+    /// adapter, which lets the relay wake it (see [`ClientMsg::Wake`]); `None` when it knows
+    /// none. Answered with [`HostMsg::RelayStatus`]. Sent only to a host whose `Reach` said
+    /// `relays_for_others`.
+    RelayRegister {
+        mac: Option<[u8; 6]>,
+    },
+    /// Asks the host (a relay) to pass this connection's datagrams to the registered host with
+    /// this fingerprint (base64url, as `Fingerprint::to_base64`), and the host's back. Answered
+    /// with [`HostMsg::RelayStatus`]. Sent only to a host whose `Reach` said `relays_for_others`.
+    RelayTo {
+        fingerprint: String,
+    },
+    /// Asks the host (a relay) to wake the registered host with this fingerprint by
+    /// Wake-on-LAN, using the MAC address it registered with. Answered with
+    /// [`HostMsg::RelayStatus`]. Sent only to a host whose `Reach` said `relays_for_others`.
+    Wake {
+        fingerprint: String,
+    },
+    /// Asks the host (a relay) to tell the registered host `to` (fingerprint, as in
+    /// [`ClientMsg::RelayTo`]) to open a hole in its NAT toward `endpoint`: the sender's public
+    /// `ip:port` as its NAT shows it. The relay passes it on as [`HostMsg::PunchRequest`].
+    /// `nonce` is a random number the sender picks per attempt, to tell attempts apart. Sent
+    /// only to a host whose `Reach` said `relays_for_others`.
+    PunchRequest {
+        to: String,
+        endpoint: String,
+        nonce: u64,
+    },
     /// A message from a newer client that this version does not know; ignored.
     Unsupported {
         tag: u8,
@@ -224,6 +351,39 @@ pub enum HostMsg {
     /// The host's displays, after the welcome and whenever the streamed one changes. Sent only
     /// to clients that ask ([`HelloExt::displays`]) and only when there is a choice.
     Displays(DisplayList),
+    /// How to reach the host from another network, once, after the welcome. Sent only to
+    /// clients that ask ([`HelloExt::reach`]); the welcome's `addresses` stay as they were.
+    Reach {
+        /// Every address the host can be reached at, with its kind, most useful first; a
+        /// superset of the welcome's. At most [`MAX_ADDRESSES`]; longer lists are cut.
+        addresses: Vec<(AddressKind, String)>,
+        /// The host's Ed25519 key: where it publishes its record in the DHT.
+        key: [u8; REACH_KEY_LEN],
+        /// The secret that opens that record for the device this message is sent to.
+        secret: [u8; DEVICE_SECRET_LEN],
+        /// The relays the host is registered with: each one's fingerprint (base64url, as
+        /// `Fingerprint::to_base64`) and the addresses it answers at. At most [`MAX_RELAYS`],
+        /// each with at most [`MAX_ADDRESSES`].
+        relays: Vec<(String, Vec<String>)>,
+        /// The MAC address of the host's network adapter, for Wake-on-LAN, when it knows one.
+        mac: Option<[u8; 6]>,
+        /// The host relays for its other paired devices: it accepts [`ClientMsg::RelayRegister`],
+        /// [`ClientMsg::RelayTo`], [`ClientMsg::Wake`] and [`ClientMsg::PunchRequest`].
+        relays_for_others: bool,
+    },
+    /// A relay's answer to [`ClientMsg::RelayRegister`], [`ClientMsg::RelayTo`] or
+    /// [`ClientMsg::Wake`]: done (`ok`), or why not, in words for a log or a message to the user.
+    RelayStatus {
+        ok: bool,
+        reason: String,
+    },
+    /// A relay passing on a client's [`ClientMsg::PunchRequest`] to the registered host it is
+    /// for: the client `from` (its fingerprint, base64url) is at `endpoint`, with this `nonce`.
+    PunchRequest {
+        from: String,
+        endpoint: String,
+        nonce: u64,
+    },
 }
 
 /// Unreliable absolute pointer update. `seq` lets the host drop reordered datagrams.
@@ -355,6 +515,21 @@ impl Writer {
         self.u16(s.len() as u16);
         self.bytes(s.as_bytes());
     }
+    fn mac(&mut self, mac: &Option<[u8; 6]>) {
+        match mac {
+            Some(mac) => {
+                self.u8(1);
+                self.bytes(mac);
+            }
+            None => self.u8(0),
+        }
+    }
+    fn kind(&mut self, kind: &AddressKind) {
+        self.u8(kind.code());
+        if let AddressKind::Relay(fingerprint) = kind {
+            self.str(fingerprint);
+        }
+    }
     pub(crate) fn finish(mut self) -> Vec<u8> {
         let len = (self.0.len() - 4) as u32;
         self.0[0..4].copy_from_slice(&len.to_le_bytes());
@@ -420,6 +595,40 @@ impl<'a> Reader<'a> {
         let len = self.u16()? as usize;
         String::from_utf8(self.take(len)?.to_vec()).context("invalid utf-8")
     }
+    fn array<const N: usize>(&mut self) -> Result<[u8; N]> {
+        Ok(self.take(N)?.try_into().unwrap())
+    }
+    fn mac(&mut self) -> Result<Option<[u8; 6]>> {
+        if self.bool()? {
+            Ok(Some(self.array()?))
+        } else {
+            Ok(None)
+        }
+    }
+    fn kind(&mut self) -> Result<AddressKind> {
+        Ok(match self.u8()? {
+            0 => AddressKind::Lan,
+            1 => AddressKind::Vpn,
+            2 => AddressKind::Public,
+            3 => AddressKind::V6,
+            4 => AddressKind::Relay(self.str()?),
+            code => AddressKind::Other(code),
+        })
+    }
+    /// A list that starts with its length in one byte. Items past `max` are read and dropped:
+    /// a longer list comes from a version that allows more, and the rest of the message is
+    /// still good.
+    fn list<T>(&mut self, max: usize, mut read: impl FnMut(&mut Self) -> Result<T>) -> Result<Vec<T>> {
+        let n = self.u8()? as usize;
+        let mut list = Vec::with_capacity(n.min(max));
+        for _ in 0..n {
+            let item = read(self)?;
+            if list.len() < max {
+                list.push(item);
+            }
+        }
+        Ok(list)
+    }
     pub(crate) fn end(&self) -> Result<()> {
         ensure!(self.0.is_empty(), "trailing bytes in message");
         Ok(())
@@ -450,11 +659,13 @@ impl ClientMsg {
                     (None, None) => {}
                 }
                 if let Some(ext) = ext {
+                    // Never sets HELLO_MORE_FLAGS: this version has no second flags byte to send.
                     w.u8(ext.files_only as u8
                         | (ext.clipboard as u8) << 1
                         | (ext.addresses as u8) << 2
                         | (ext.displays as u8) << 3
-                        | (ext.audio as u8) << 4);
+                        | (ext.audio as u8) << 4
+                        | (ext.reach as u8) << 5);
                 }
                 w.finish()
             }
@@ -500,6 +711,33 @@ impl ClientMsg {
                 w.u8(*index);
                 w.finish()
             }
+            Self::Reached { address } => {
+                let mut w = Writer::new(11);
+                w.str(address);
+                w.finish()
+            }
+            Self::RelayRegister { mac } => {
+                let mut w = Writer::new(12);
+                w.mac(mac);
+                w.finish()
+            }
+            Self::RelayTo { fingerprint } => {
+                let mut w = Writer::new(13);
+                w.str(fingerprint);
+                w.finish()
+            }
+            Self::Wake { fingerprint } => {
+                let mut w = Writer::new(14);
+                w.str(fingerprint);
+                w.finish()
+            }
+            Self::PunchRequest { to, endpoint, nonce } => {
+                let mut w = Writer::new(15);
+                w.str(to);
+                w.str(endpoint);
+                w.u64(*nonce);
+                w.finish()
+            }
             Self::Unsupported { tag } => Writer::new(*tag).finish(),
         }
     }
@@ -520,12 +758,20 @@ impl ClientMsg {
                     None
                 } else {
                     let flags = r.u8()?;
+                    // Each flags byte with its top bit set is followed by another, in which this
+                    // version knows no flag: skip them. A top bit with nothing after it is
+                    // fine too, as it always was.
+                    let mut more = flags & HELLO_MORE_FLAGS != 0;
+                    while more && !r.0.is_empty() {
+                        more = r.u8()? & HELLO_MORE_FLAGS != 0;
+                    }
                     Some(HelloExt {
                         files_only: flags & 1 != 0,
                         clipboard: flags & 2 != 0,
                         addresses: flags & 4 != 0,
                         displays: flags & 8 != 0,
                         audio: flags & 16 != 0,
+                        reach: flags & 32 != 0,
                     })
                 };
                 Self::Hello { version, name, pairing_secret, password, ext }
@@ -541,6 +787,11 @@ impl ClientMsg {
             8 => Self::Text { text: r.str()? },
             9 => Self::OfferPairing { link: r.str()? },
             10 => Self::SelectDisplay { index: r.u8()? },
+            11 => Self::Reached { address: r.str()? },
+            12 => Self::RelayRegister { mac: r.mac()? },
+            13 => Self::RelayTo { fingerprint: r.str()? },
+            14 => Self::Wake { fingerprint: r.str()? },
+            15 => Self::PunchRequest { to: r.str()?, endpoint: r.str()?, nonce: r.u64()? },
             // Forward compatibility: skip messages added by newer clients.
             tag => return Ok(Self::Unsupported { tag }),
         };
@@ -562,7 +813,7 @@ impl HostMsg {
                 if let Some(features) = features {
                     w.u32(*features);
                     if !addresses.is_empty() {
-                        let addresses: Vec<&String> = addresses.iter().take(MAX_ADDRESSES).collect();
+                        let addresses: Vec<&String> = addresses.iter().take(MAX_WELCOME_ADDRESSES).collect();
                         w.u8(addresses.len() as u8);
                         for address in addresses {
                             w.str(address);
@@ -595,6 +846,43 @@ impl HostMsg {
                 }
                 w.finish()
             }
+            Self::Reach { addresses, key, secret, relays, mac, relays_for_others } => {
+                let mut w = Writer::new(6);
+                let addresses = &addresses[..addresses.len().min(MAX_ADDRESSES)];
+                w.u8(addresses.len() as u8);
+                for (kind, address) in addresses {
+                    w.kind(kind);
+                    w.str(address);
+                }
+                w.bytes(key);
+                w.bytes(secret);
+                let relays = &relays[..relays.len().min(MAX_RELAYS)];
+                w.u8(relays.len() as u8);
+                for (fingerprint, addresses) in relays {
+                    w.str(fingerprint);
+                    let addresses = &addresses[..addresses.len().min(MAX_ADDRESSES)];
+                    w.u8(addresses.len() as u8);
+                    for address in addresses {
+                        w.str(address);
+                    }
+                }
+                w.mac(mac);
+                w.u8(*relays_for_others as u8);
+                w.finish()
+            }
+            Self::RelayStatus { ok, reason } => {
+                let mut w = Writer::new(7);
+                w.u8(*ok as u8);
+                w.str(reason);
+                w.finish()
+            }
+            Self::PunchRequest { from, endpoint, nonce } => {
+                let mut w = Writer::new(8);
+                w.str(from);
+                w.str(endpoint);
+                w.u64(*nonce);
+                w.finish()
+            }
         }
     }
 
@@ -608,12 +896,7 @@ impl HostMsg {
                 width: r.u16()?,
                 height: r.u16()?,
                 features: if r.0.is_empty() { None } else { Some(r.u32()?) },
-                addresses: if r.0.is_empty() {
-                    Vec::new()
-                } else {
-                    let n = r.u8()? as usize;
-                    (0..n.min(MAX_ADDRESSES)).map(|_| r.str()).collect::<Result<_>>()?
-                },
+                addresses: if r.0.is_empty() { Vec::new() } else { r.list(MAX_WELCOME_ADDRESSES, Reader::str)? },
             },
             2 => Self::Paired,
             3 => Self::Rejected { reason: r.str()? },
@@ -627,6 +910,16 @@ impl HostMsg {
                     .collect::<Result<_>>()?;
                 Self::Displays(DisplayList { current, list })
             }
+            6 => Self::Reach {
+                addresses: r.list(MAX_ADDRESSES, |r| Ok((r.kind()?, r.str()?)))?,
+                key: r.array()?,
+                secret: r.array()?,
+                relays: r.list(MAX_RELAYS, |r| Ok((r.str()?, r.list(MAX_ADDRESSES, Reader::str)?)))?,
+                mac: r.mac()?,
+                relays_for_others: r.bool()?,
+            },
+            7 => Self::RelayStatus { ok: r.bool()?, reason: r.str()? },
+            8 => Self::PunchRequest { from: r.str()?, endpoint: r.str()?, nonce: r.u64()? },
             t => bail!("unknown host message tag {t}"),
         };
         r.end()?;
@@ -708,6 +1001,7 @@ mod tests {
                     addresses: true,
                     displays: true,
                     audio: true,
+                    reach: true,
                 }),
             });
         }
@@ -825,5 +1119,429 @@ mod tests {
         let ClientMsg::Hello { name, .. } = ClientMsg::decode(&enc[4..]).unwrap() else { panic!() };
         assert_eq!(name.len(), MAX_NAME_LEN);
         assert!(name.chars().all(|c| c == 'é'));
+    }
+
+    // Standalone reach (docs/nat-traversal.md). The hex strings below are what versions before
+    // it wrote, taken from their encoder; nothing here may ever change.
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    fn unhex(text: &str) -> Vec<u8> {
+        (0..text.len()).step_by(2).map(|i| u8::from_str_radix(&text[i..i + 2], 16).unwrap()).collect()
+    }
+
+    const HELLO_PLAIN: &str = "0c00000001010006006c6170746f7000";
+    const HELLO_ALL_FIVE_FLAGS: &str = "0e00000001010006006c6170746f7000001f";
+    const HELLO_FILES_PASSWORD: &str = "1d0000000101000100610107070707070707070707070707070707010200707701";
+    const WELCOME_TWO_ADDRESSES: &str = concat!(
+        "3900000001010007006465736b746f7001800738040300000002",
+        "10003139322e3136382e312e393a37343230",
+        "0f003130302e36342e312e323a37343230",
+    );
+    /// The welcome of a host with ten addresses: the old encoder cut it to eight.
+    const WELCOME_TEN_ADDRESSES: &str = concat!(
+        "8e00000001010007006465736b746f7001800738040700000008",
+        "0d0031302e302e302e313a37343230",
+        "0d0031302e302e302e323a37343230",
+        "0d0031302e302e302e333a37343230",
+        "0d0031302e302e302e343a37343230",
+        "0d0031302e302e302e353a37343230",
+        "0d0031302e302e302e363a37343230",
+        "0d0031302e302e302e373a37343230",
+        "0d0031302e302e302e383a37343230",
+    );
+    const DISPLAYS: &str = "120000000501010800444953504c415931000aa00501";
+
+    fn old_hellos() -> [(&'static str, ClientMsg); 3] {
+        let hello = |name: &str, pairing_secret, password: Option<&str>, ext| ClientMsg::Hello {
+            version: 1,
+            name: name.into(),
+            pairing_secret,
+            password: password.map(Into::into),
+            ext,
+        };
+        let five =
+            HelloExt { files_only: true, clipboard: true, addresses: true, displays: true, audio: true, reach: false };
+        [
+            (HELLO_PLAIN, hello("laptop", None, None, None)),
+            (HELLO_ALL_FIVE_FLAGS, hello("laptop", None, None, Some(five))),
+            (
+                HELLO_FILES_PASSWORD,
+                hello(
+                    "a",
+                    Some([7; PAIRING_SECRET_LEN]),
+                    Some("pw"),
+                    Some(HelloExt { files_only: true, ..Default::default() }),
+                ),
+            ),
+        ]
+    }
+
+    fn old_welcomes() -> [(&'static str, HostMsg); 3] {
+        let welcome = |features, addresses: Vec<String>| HostMsg::Welcome {
+            version: 1,
+            host_name: "desktop".into(),
+            codec: Codec::H264,
+            width: 1920,
+            height: 1080,
+            features: Some(features),
+            addresses,
+        };
+        let ten: Vec<String> = (1..=10).map(|i| format!("10.0.0.{i}:7420")).collect();
+        [
+            (
+                WELCOME_TWO_ADDRESSES,
+                welcome(FEATURE_FILES | FEATURE_CLIPBOARD, vec!["192.168.1.9:7420".into(), "100.64.1.2:7420".into()]),
+            ),
+            // The ten go in; eight come out, as for the clients that cannot read more.
+            (WELCOME_TEN_ADDRESSES, welcome(FEATURE_FILES | FEATURE_CLIPBOARD | FEATURE_AUDIO, ten)),
+            (
+                DISPLAYS,
+                HostMsg::Displays(DisplayList {
+                    current: 1,
+                    list: vec![DisplayInfo { name: "DISPLAY1".into(), width: 2560, height: 1440, primary: true }],
+                }),
+            ),
+        ]
+    }
+
+    #[test]
+    fn what_older_versions_wrote_is_still_written_and_read() {
+        for (old, msg) in old_hellos() {
+            assert_eq!(hex(&msg.encode()), old);
+            assert_eq!(ClientMsg::decode(&unhex(old)[4..]).unwrap(), msg);
+        }
+        for (old, msg) in old_welcomes() {
+            assert_eq!(hex(&msg.encode()), old);
+        }
+        // Reading back what they wrote: the welcome with ten addresses holds the first eight.
+        let HostMsg::Welcome { addresses, .. } = HostMsg::decode(&unhex(WELCOME_TEN_ADDRESSES)[4..]).unwrap() else {
+            panic!()
+        };
+        assert_eq!(addresses, (1..=8).map(|i| format!("10.0.0.{i}:7420")).collect::<Vec<_>>());
+        assert_eq!(HostMsg::decode(&unhex(DISPLAYS)[4..]).unwrap(), old_welcomes()[2].1);
+    }
+
+    /// The flags byte of a hello ends the message, so it is the last byte of the encoding.
+    fn flags_of(ext: HelloExt) -> u8 {
+        let hello =
+            ClientMsg::Hello { version: 1, name: "a".into(), pairing_secret: None, password: None, ext: Some(ext) };
+        *hello.encode().last().unwrap()
+    }
+
+    #[test]
+    fn the_reach_bit_is_bit_5_and_older_bits_stay_where_they_were() {
+        assert_eq!(flags_of(HelloExt { files_only: true, ..Default::default() }), 1);
+        assert_eq!(flags_of(HelloExt { clipboard: true, ..Default::default() }), 2);
+        assert_eq!(flags_of(HelloExt { addresses: true, ..Default::default() }), 4);
+        assert_eq!(flags_of(HelloExt { displays: true, ..Default::default() }), 8);
+        assert_eq!(flags_of(HelloExt { audio: true, ..Default::default() }), 16);
+        assert_eq!(flags_of(HelloExt { reach: true, ..Default::default() }), 32);
+        // Hellos from clients without the bit read with it off, whatever else they set.
+        for flags in 0..32u8 {
+            let body = hello_with_flags(&[flags]);
+            let ClientMsg::Hello { ext: Some(ext), .. } = ClientMsg::decode(&body).unwrap() else { panic!() };
+            assert!(!ext.reach, "flags {flags:#x}");
+            assert_eq!(flags_of(ext), flags);
+        }
+    }
+
+    #[test]
+    fn hello_flags_roundtrip_and_never_set_the_reserved_bits() {
+        for bits in 0..64u8 {
+            let ext = HelloExt {
+                files_only: bits & 1 != 0,
+                clipboard: bits & 2 != 0,
+                addresses: bits & 4 != 0,
+                displays: bits & 8 != 0,
+                audio: bits & 16 != 0,
+                reach: bits & 32 != 0,
+            };
+            assert_eq!(flags_of(ext), bits);
+            roundtrip_client(ClientMsg::Hello {
+                version: 1,
+                name: "a".into(),
+                pairing_secret: None,
+                password: None,
+                ext: Some(ext),
+            });
+        }
+    }
+
+    /// A hello for a client "a" with no pairing secret and no password, then `flags`.
+    fn hello_with_flags(flags: &[u8]) -> Vec<u8> {
+        let mut body = vec![1, 1, 0, 1, 0, b'a', 0, 0];
+        body.extend_from_slice(flags);
+        body
+    }
+
+    #[test]
+    fn a_hello_with_bit_7_is_still_decoded() {
+        let reach_and_files = HelloExt { files_only: true, reach: true, ..Default::default() };
+        let more = HELLO_MORE_FLAGS;
+        for flags in [
+            // The bit alone, as this version has always read it.
+            &[more | 0x21][..],
+            // Another flags byte follows, and it ends the chain; or it goes on.
+            &[more | 0x21, 0x00],
+            &[more | 0x21, 0x7f],
+            &[more | 0x21, more | 0x01, 0x00],
+            &[more | 0x21, 0xff, 0xff, 0x01],
+        ] {
+            let decoded = ClientMsg::decode(&hello_with_flags(flags)).unwrap();
+            let ClientMsg::Hello { name, ext, .. } = decoded else { panic!() };
+            assert_eq!((name.as_str(), ext), ("a", Some(reach_and_files)), "{flags:x?}");
+        }
+        // The flags bytes are part of the hello: one more byte after the chain ends is not.
+        assert!(ClientMsg::decode(&hello_with_flags(&[more | 0x21, 0x00, 0x00])).is_err());
+    }
+
+    #[test]
+    fn tags_are_the_next_free_numbers() {
+        let tag = |encoded: Vec<u8>| encoded[4];
+        let client = [
+            (ClientMsg::Reached { address: "a".into() }, 11),
+            (ClientMsg::RelayRegister { mac: None }, 12),
+            (ClientMsg::RelayTo { fingerprint: "f".into() }, 13),
+            (ClientMsg::Wake { fingerprint: "f".into() }, 14),
+            (ClientMsg::PunchRequest { to: "f".into(), endpoint: "e".into(), nonce: 1 }, 15),
+        ];
+        for (msg, expected) in client {
+            assert_eq!(tag(msg.encode()), expected);
+        }
+        let host = [
+            (
+                HostMsg::Reach {
+                    addresses: Vec::new(),
+                    key: [0; REACH_KEY_LEN],
+                    secret: [0; DEVICE_SECRET_LEN],
+                    relays: Vec::new(),
+                    mac: None,
+                    relays_for_others: false,
+                },
+                6,
+            ),
+            (HostMsg::RelayStatus { ok: true, reason: String::new() }, 7),
+            (HostMsg::PunchRequest { from: "f".into(), endpoint: "e".into(), nonce: 1 }, 8),
+        ];
+        for (msg, expected) in host {
+            assert_eq!(tag(msg.encode()), expected);
+        }
+        // The ones before them did not move.
+        assert_eq!(tag(ClientMsg::SelectDisplay { index: 0 }.encode()), 10);
+        assert_eq!(tag(HostMsg::Displays(DisplayList::default()).encode()), 5);
+    }
+
+    fn mac() -> Option<[u8; 6]> {
+        Some([0x00, 0x1a, 0x2b, 0x3c, 0x4d, 0x5e])
+    }
+
+    fn reach(addresses: Vec<(AddressKind, String)>, relays: Vec<(String, Vec<String>)>) -> HostMsg {
+        HostMsg::Reach {
+            addresses,
+            key: [0xA5; REACH_KEY_LEN],
+            secret: [0x5A; DEVICE_SECRET_LEN],
+            relays,
+            mac: mac(),
+            relays_for_others: true,
+        }
+    }
+
+    #[test]
+    fn reach_messages_roundtrip() {
+        let relay = "BnsLmYQrD2vHZkJ5Bn8o0Hz4w8mYH7qN3m1kTn0yqlE".to_string();
+        roundtrip_host(reach(
+            vec![
+                (AddressKind::Lan, "192.168.1.9:7420".into()),
+                (AddressKind::Vpn, "100.101.102.103:7420".into()),
+                (AddressKind::Public, "203.0.113.7:51820".into()),
+                (AddressKind::V6, "[2804:14c:5b82:1234:abcd:ef01:2345:6789]:7420".into()),
+                (AddressKind::Relay(relay.clone()), "198.51.100.2:7420".into()),
+                (AddressKind::Other(200), "kind:from-the-future".into()),
+            ],
+            vec![(relay, vec!["198.51.100.2:7420".into(), "[2001:db8::2]:7420".into()]), ("other".into(), Vec::new())],
+        ));
+        roundtrip_host(HostMsg::Reach {
+            addresses: Vec::new(),
+            key: [0; REACH_KEY_LEN],
+            secret: [0xFF; DEVICE_SECRET_LEN],
+            relays: Vec::new(),
+            mac: None,
+            relays_for_others: false,
+        });
+        roundtrip_host(HostMsg::RelayStatus { ok: true, reason: String::new() });
+        roundtrip_host(HostMsg::RelayStatus { ok: false, reason: "that host is not registered here".into() });
+        roundtrip_host(HostMsg::PunchRequest {
+            from: "fingerprint".into(),
+            endpoint: "203.0.113.7:51820".into(),
+            nonce: u64::MAX,
+        });
+
+        roundtrip_client(ClientMsg::Reached { address: "203.0.113.7:51820".into() });
+        roundtrip_client(ClientMsg::RelayRegister { mac: mac() });
+        roundtrip_client(ClientMsg::RelayRegister { mac: None });
+        roundtrip_client(ClientMsg::RelayTo { fingerprint: "fingerprint".into() });
+        roundtrip_client(ClientMsg::Wake { fingerprint: "fingerprint".into() });
+        roundtrip_client(ClientMsg::PunchRequest {
+            to: "fingerprint".into(),
+            endpoint: "[2001:db8::7]:51820".into(),
+            nonce: 0x0123_4567_89ab_cdef,
+        });
+    }
+
+    #[test]
+    fn address_kind_codes_are_fixed() {
+        let kinds = [
+            (AddressKind::Lan, 0),
+            (AddressKind::Vpn, 1),
+            (AddressKind::Public, 2),
+            (AddressKind::V6, 3),
+            (AddressKind::Relay("fp".into()), 4),
+            (AddressKind::Other(5), 5),
+            (AddressKind::Other(255), 255),
+        ];
+        for (kind, code) in kinds {
+            assert_eq!(kind.code(), code);
+            // The code is the byte after the message's tag and the number of addresses.
+            let msg = reach(vec![(kind.clone(), "a".into())], Vec::new());
+            let encoded = msg.encode();
+            assert_eq!(encoded[6], code);
+            // Only a relay's code is followed by anything but the address.
+            assert_eq!(encoded[7..9], if code == 4 { [2, 0] } else { [1, 0] });
+            assert_eq!(HostMsg::decode(&encoded[4..]).unwrap(), msg);
+        }
+    }
+
+    #[test]
+    fn address_kinds_read_from_json_and_write_back() {
+        for (kind, json) in [
+            (AddressKind::Lan, r#""lan""#),
+            (AddressKind::Vpn, r#""vpn""#),
+            (AddressKind::Public, r#""public""#),
+            (AddressKind::V6, r#""v6""#),
+            (AddressKind::Relay("fp".into()), r#"{"relay":"fp"}"#),
+            (AddressKind::Other(9), r#"{"other":9}"#),
+        ] {
+            assert_eq!(serde_json::to_string(&kind).unwrap(), json);
+            assert_eq!(serde_json::from_str::<AddressKind>(json).unwrap(), kind);
+        }
+    }
+
+    #[test]
+    fn reach_lists_are_cut_to_their_limits() {
+        let many = |n: usize| (0..n).map(|i| format!("10.0.0.{i}:7420")).collect::<Vec<_>>();
+        let msg = reach(
+            many(MAX_ADDRESSES + 4).into_iter().map(|a| (AddressKind::Lan, a)).collect(),
+            (0..MAX_RELAYS + 4).map(|i| (format!("relay{i}"), many(MAX_ADDRESSES + 4))).collect(),
+        );
+        let HostMsg::Reach { addresses, relays, .. } = HostMsg::decode(&msg.encode()[4..]).unwrap() else { panic!() };
+        assert_eq!(addresses.len(), MAX_ADDRESSES);
+        assert_eq!(relays.len(), MAX_RELAYS);
+        assert!(relays.iter().all(|(_, addresses)| addresses.len() == MAX_ADDRESSES));
+        assert_eq!(relays[3].0, "relay3");
+    }
+
+    /// A list that a newer version allows to be longer is read and cut, not refused: the rest of
+    /// the message is still good.
+    #[test]
+    fn longer_lists_from_newer_versions_are_cut_not_refused() {
+        let mut w = Writer::new(6);
+        w.u8(MAX_ADDRESSES as u8 + 4);
+        for i in 0..MAX_ADDRESSES + 4 {
+            w.u8(0);
+            w.str(&format!("10.0.0.{i}:7420"));
+        }
+        w.bytes(&[1; REACH_KEY_LEN]);
+        w.bytes(&[2; DEVICE_SECRET_LEN]);
+        w.u8(0);
+        w.mac(&mac());
+        w.u8(1);
+        let HostMsg::Reach { addresses, key, secret, mac: m, relays_for_others, .. } =
+            HostMsg::decode(&w.finish()[4..]).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(addresses.len(), MAX_ADDRESSES);
+        assert_eq!((key, secret, m, relays_for_others), ([1; REACH_KEY_LEN], [2; DEVICE_SECRET_LEN], mac(), true));
+    }
+
+    #[test]
+    fn welcomes_keep_to_what_older_clients_read() {
+        // They read 8 addresses and refuse a welcome that goes on after them, so a host with more
+        // sends the rest in `Reach`: the welcome is cut at MAX_WELCOME_ADDRESSES, not MAX_ADDRESSES.
+        assert_eq!(MAX_WELCOME_ADDRESSES, 8);
+        // A welcome from a version that allowed more is read and cut.
+        let mut w = Writer::new(1);
+        w.u16(1);
+        w.str("desktop");
+        w.u8(Codec::H264 as u8);
+        w.u16(1920);
+        w.u16(1080);
+        w.u32(FEATURE_FILES);
+        w.u8(12);
+        for i in 0..12 {
+            w.str(&format!("10.0.0.{i}:7420"));
+        }
+        let HostMsg::Welcome { addresses, .. } = HostMsg::decode(&w.finish()[4..]).unwrap() else { panic!() };
+        assert_eq!(addresses.len(), MAX_WELCOME_ADDRESSES);
+    }
+
+    #[test]
+    fn new_messages_refuse_what_is_cut_short_or_garbled() {
+        let relay = ("relay".to_string(), vec!["198.51.100.2:7420".to_string()]);
+        let hosts = [
+            reach(vec![(AddressKind::Relay("r".into()), "a".into()), (AddressKind::Lan, "b".into())], vec![relay]),
+            HostMsg::RelayStatus { ok: false, reason: "no".into() },
+            HostMsg::PunchRequest { from: "f".into(), endpoint: "e".into(), nonce: 7 },
+        ];
+        for msg in hosts {
+            let body = &msg.encode()[4..];
+            for cut in 0..body.len() {
+                assert!(HostMsg::decode(&body[..cut]).is_err(), "{msg:?} cut at {cut}");
+            }
+        }
+        let clients = [
+            ClientMsg::Reached { address: "a".into() },
+            ClientMsg::RelayRegister { mac: mac() },
+            ClientMsg::RelayTo { fingerprint: "f".into() },
+            ClientMsg::Wake { fingerprint: "f".into() },
+            ClientMsg::PunchRequest { to: "f".into(), endpoint: "e".into(), nonce: 7 },
+        ];
+        for msg in clients {
+            let body = &msg.encode()[4..];
+            for cut in 1..body.len() {
+                assert!(ClientMsg::decode(&body[..cut]).is_err(), "{msg:?} cut at {cut}");
+            }
+            // Nothing may follow the end.
+            assert!(ClientMsg::decode(&[body, &[0]].concat()).is_err(), "{msg:?} with a trailing byte");
+        }
+        // Not a flag, not UTF-8, not a count the message can back up: errors, never a panic.
+        assert!(HostMsg::decode(&[7, 2, 0, 0]).is_err());
+        assert!(HostMsg::decode(&[7, 1, 1, 0, 0xff]).is_err());
+        assert!(HostMsg::decode(&[6, 255]).is_err());
+        assert!(ClientMsg::decode(&[12, 2]).is_err());
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        for tag in (11..=15).chain(6..=8) {
+            for _ in 0..500 {
+                let len = {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    (seed % 80) as usize
+                };
+                let body: Vec<u8> = std::iter::once(tag)
+                    .chain((0..len).map(|_| {
+                        seed ^= seed << 13;
+                        seed ^= seed >> 7;
+                        seed ^= seed << 17;
+                        seed as u8
+                    }))
+                    .collect();
+                let _ = ClientMsg::decode(&body);
+                let _ = HostMsg::decode(&body);
+            }
+        }
     }
 }

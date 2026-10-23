@@ -268,7 +268,8 @@ fn print_pairing(code: &PairingCode, addr: &str, also: &[String]) {
     println!("    {}", code.encode());
     println!();
     println!("On a phone, scan this with the Velora app:");
-    let link = velora_protocol::pairing::pairing_uri_with(addr, also, code);
+    // reach: the key and the device secret are filled in by E1
+    let link = velora_protocol::pairing::pairing_uri_with(addr, also, code, None, None);
     match qrcode::QrCode::new(link.as_bytes()) {
         // Light modules drawn as blocks: reads correctly on the usual dark terminal background.
         Ok(qr) => println!(

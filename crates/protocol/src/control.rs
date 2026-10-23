@@ -15,6 +15,8 @@ use std::{
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::wire::AddressKind;
+
 /// Requests and replies are tiny; anything larger is not from a well-behaved peer.
 pub const MAX_LINE: usize = 64 * 1024;
 
@@ -55,6 +57,13 @@ pub enum Request {
     SetStayAwake {
         on: bool,
     },
+    /// Sets the switches of standalone reach (see [`Status::reach`]). All three are given
+    /// together: the launcher always knows the current ones.
+    SetReach {
+        standalone: bool,
+        relay_for_others: bool,
+        dht: bool,
+    },
 }
 
 pub type Reply = std::result::Result<Status, String>;
@@ -91,6 +100,51 @@ pub struct Status {
     /// kept on during a session. `None` from hosts that can't do it or predate it.
     #[serde(default)]
     pub stay_awake: Option<bool>,
+    /// How this host is reached from other networks without a mesh VPN. `None` from hosts that
+    /// predate standalone reach: the launcher shows nothing for it and sends no
+    /// [`Request::SetReach`].
+    #[serde(default)]
+    pub reach: Option<ReachStatus>,
+}
+
+/// What the host does to be reachable from other networks, for This PC to show
+/// (`docs/nat-traversal.md`). Fields missing from a status read as off or empty.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ReachStatus {
+    /// Standalone reach is on: the host asks the router to map its port, and tells devices its
+    /// public and IPv6 addresses.
+    pub standalone: bool,
+    /// Other paired devices may connect through this computer to reach their own host.
+    pub relay_for_others: bool,
+    /// The host publishes its addresses in the BitTorrent Mainline DHT for its paired devices.
+    pub dht: bool,
+    /// The router's port mapping, when there is one.
+    pub mapping: Option<MappingStatus>,
+    /// Public IPv4 addresses (`ip:port`) the host advertises.
+    pub public: Vec<String>,
+    /// Global IPv6 addresses (`[ip]:port`) the host advertises.
+    pub v6: Vec<String>,
+    /// The address (and its kind) the device that connected last reached the host at.
+    pub last_reached: Option<(AddressKind, String)>,
+    /// The relays the host is registered with, by the names it knows them under.
+    pub registered_with: Vec<String>,
+}
+
+/// A port mapping the router granted the host (NAT-PMP or UPnP).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MappingStatus {
+    /// How the router was asked: `"natpmp"` or `"upnp"`.
+    pub protocol: String,
+    /// The `ip:port` the mapping makes the host answer at from outside: the router's external
+    /// address and the port it assigned, which is not always the host's own.
+    pub external: String,
+    /// The external address is public. `false` means the ISP shares it between customers or a
+    /// second router sits in front: the mapping reaches only that far and is not advertised.
+    pub public: bool,
+    /// Seconds until the router drops the mapping unless it is renewed, which the host does.
+    pub lease_secs: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -236,6 +290,83 @@ mod tests {
             "service":false,"devices":[],"pairing":null}"#;
         let status: Status = serde_json::from_str(json).unwrap();
         assert_eq!(status.stay_awake, None);
+        assert_eq!(status.reach, None);
         assert!(status.also.is_empty() && status.requests.is_empty() && !status.password_set);
+    }
+
+    /// The last status before standalone reach, as the host wrote it: everything but `reach`.
+    #[test]
+    fn status_before_standalone_reach() {
+        let json = r#"{"name":"PC","version":"0.4.0","fingerprint":"AB12","address":"192.168.1.9:7420","also":[],
+            "service":false,"password_set":false,"devices":[],"pairing":null,"offers":[],"requests":[],
+            "stay_awake":true}"#;
+        let status: Status = serde_json::from_str(json).unwrap();
+        assert_eq!((status.stay_awake, status.reach), (Some(true), None));
+    }
+
+    #[test]
+    fn set_reach_wire_format() {
+        let set = Request::SetReach { standalone: true, relay_for_others: false, dht: true };
+        let json = serde_json::to_string(&set).unwrap();
+        assert_eq!(json, r#"{"op":"set_reach","standalone":true,"relay_for_others":false,"dht":true}"#);
+        assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), set);
+    }
+
+    fn reach_status() -> ReachStatus {
+        ReachStatus {
+            standalone: true,
+            relay_for_others: false,
+            dht: true,
+            mapping: Some(MappingStatus {
+                protocol: "upnp".into(),
+                external: "203.0.113.7:51820".into(),
+                public: true,
+                lease_secs: 3600,
+            }),
+            public: vec!["203.0.113.7:51820".into()],
+            v6: vec!["[2804:14c:5b82:1234:abcd:ef01:2345:6789]:7420".into()],
+            last_reached: Some((AddressKind::Public, "203.0.113.7:51820".into())),
+            registered_with: vec!["STUDIO-PC".into()],
+        }
+    }
+
+    #[test]
+    fn status_with_reach_roundtrips() {
+        let status = Status {
+            name: "PC".into(),
+            version: "0.5.0".into(),
+            fingerprint: "AB12".into(),
+            address: Some("192.168.1.9:7420".into()),
+            also: Vec::new(),
+            service: false,
+            password_set: false,
+            devices: Vec::new(),
+            pairing: None,
+            offers: Vec::new(),
+            requests: Vec::new(),
+            stay_awake: None,
+            reach: Some(reach_status()),
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(json.contains(r#""last_reached":["public","203.0.113.7:51820"]"#), "{json}");
+        assert!(json.contains(
+            r#""mapping":{"protocol":"upnp","external":"203.0.113.7:51820","public":true,"lease_secs":3600}"#
+        ));
+        assert_eq!(serde_json::from_str::<Status>(&json).unwrap(), status);
+        // A relay as the last address reached carries its fingerprint.
+        let relayed = ReachStatus {
+            last_reached: Some((AddressKind::Relay("fp".into()), "198.51.100.2:7420".into())),
+            ..reach_status()
+        };
+        let json = serde_json::to_string(&relayed).unwrap();
+        assert_eq!(serde_json::from_str::<ReachStatus>(&json).unwrap(), relayed);
+    }
+
+    #[test]
+    fn fields_missing_from_a_reach_status_read_as_off() {
+        let status: ReachStatus = serde_json::from_str(r#"{"standalone":true}"#).unwrap();
+        assert_eq!(status, ReachStatus { standalone: true, ..Default::default() });
+        let status: ReachStatus = serde_json::from_str(r#"{"mapping":{"protocol":"natpmp"}}"#).unwrap();
+        assert_eq!(status.mapping, Some(MappingStatus { protocol: "natpmp".into(), ..Default::default() }));
     }
 }

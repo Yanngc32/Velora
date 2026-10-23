@@ -28,7 +28,14 @@ fn remember(state: &StateDir, name: &str, address: &str, also: &[String], finger
     let fp = fingerprint.to_base64();
     hosts.retain(|h| h.fingerprint != fp && h.name != name);
     let also = also.iter().filter(|a| *a != address).cloned().collect();
-    hosts.push(KnownHost { name: name.to_string(), address: address.to_string(), fingerprint: fp, also });
+    // reach: the other fields are filled in by F1
+    hosts.push(KnownHost {
+        name: name.to_string(),
+        address: address.to_string(),
+        fingerprint: fp,
+        also,
+        ..Default::default()
+    });
     state.save(StateDir::KNOWN_HOSTS, &hosts)
 }
 
