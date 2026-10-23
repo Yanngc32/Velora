@@ -280,6 +280,9 @@ impl ReachState {
             v6: self.addresses_of(&AddressKind::V6),
             last_reached: self.last_reached.clone(),
             registered_with: self.relays.iter().map(|relay| relay.name.clone()).collect(),
+            // These two are read from the files the host keeps: `Shared::status` fills them in.
+            relays: Vec::new(),
+            relay_hosts: Vec::new(),
         }
     }
 }
