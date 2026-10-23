@@ -4,12 +4,12 @@
 //! one for its lifetime and publishes through it; a client opens one when it connects, resolves, and lets it go.
 //! Everything here is built on what `docs/dht-spike.md` measured on the live DHT with `mainline` 8.0.1:
 //!
-//! - A start is cheap (the first nodes arrive after 0.1 s), but the node is not *finished* for 3 s, and `bootstrapped()`
-//!   and the observed address only exist after that. Nothing here waits for them: a lookup starts from the bootstrap
-//!   list, and a cold start (no saved nodes) first waits, for at most 1.5 s, until the table holds a few nodes, because
-//!   a lookup that starts from the four default names alone sometimes hears from none of them.
-//! - The first value of a lookup arrives after 0.1 to 1.4 s and the lookup ends after 3 s, so [`Node::resolve`] stops at
-//!   the first value (plus a short window for a newer one) instead of waiting for the end.
+//! - A start is cheap (the first nodes arrive after 0.1 s), but the node is not *finished* for 3 s, and
+//!   `bootstrapped()` and the observed address only exist after that. Nothing here waits for them: a lookup starts from
+//!   the bootstrap list, and a cold start (no saved nodes) first waits, for at most 1.5 s, until the table holds a few
+//!   nodes, because a lookup that starts from the four default names alone sometimes hears from none of them.
+//! - The first value of a lookup arrives after 0.1 to 1.4 s and the lookup ends after 3 s, so [`Node::resolve`] stops
+//!   at the first value (plus a short window for a newer one) instead of waiting for the end.
 //! - The routing table rots in 15 minutes without lookups, and the default bootstrap names are resolved once, when the
 //!   node is built. So the nodes of the table are saved right after a lookup or a publish, never over a table that is
 //!   nearly empty, and a node that comes up with nothing to start from, or whose table stays empty, is built again.
@@ -1061,7 +1061,7 @@ impl Inner {
         unix_now().max(last.map_or(i64::MIN, |last| last.saturating_add(1)))
     }
 
-    /// Notes that `seq` is spent for this record (or seen stored). With the blob, it also notes which blob went under it.
+    /// Notes that `seq` is spent for this record (or seen stored), and, given the blob, which blob went under it.
     fn record_seq(&self, key: [u8; 32], salt: &[u8], seq: i64, blob: Option<[u8; 32]>) {
         let mut state = self.lock();
         let entry = state.seqs.entry((key, salt.to_vec())).or_insert(SeqEntry { seq, at: 0 });
@@ -1242,7 +1242,7 @@ impl Lookup {
 
 struct Finished {
     reach: Reach,
-    /// How many nodes answered "nothing newer than what you have", which they say only to a lookup that asked for newer.
+    /// How many nodes answered "nothing newer than what you have", said only to a lookup that asked for newer.
     no_more_recent: u32,
 }
 
@@ -1949,8 +1949,8 @@ mod tests {
 
         let err = host.publish(&signer, SALT, b"kept by three", ahead).await.unwrap_err();
         assert!(matches!(err, Error::Refused { acknowledged } if (1..=3).contains(&acknowledged)), "{err:?}");
-        // Its seq is spent all the same: some nodes have it, and another blob under it would be ignored there. A process
-        // that ends now must remember that.
+        // Its seq is spent all the same: some nodes have it, and another blob under it would be ignored there. A
+        // process that ends now must remember that.
         assert_eq!(host.next_seq(&signer, SALT), ahead + 1);
         let saved = fs::read_to_string(dir.file("cache.txt")).unwrap();
         assert!(saved.contains(&format!("seq {} {} {ahead} ", to_hex(&signer.public_key()), to_hex(SALT))), "{saved}");
@@ -2147,7 +2147,7 @@ mod tests {
         config.port = Some(taken.local_addr().unwrap().port());
         let node = Node::open_with(config).await;
         let err = node.resolve(&key(26).public_key(), SALT).await.unwrap_err();
-        // `Dht::new` panics when its thread fails to start before the first message reaches it, which is `Stopped` here.
+        // `Dht::new` panics when its thread fails to start before the first message reaches it: `Stopped` here.
         assert!(matches!(err, Error::Socket(_) | Error::Stopped), "{err:?}");
     }
 
@@ -2282,7 +2282,7 @@ mod tests {
         for (name, bytes) in [
             ("empty", Vec::new()),
             ("binary", vec![0xff, 0xfe, 0x00, 0x01]),
-            ("other format", br#"{"nodes": ["1.2.3.4:5"]}"#.to_vec()),
+            ("other format", br#"{"nodes": ["192.0.2.4:5"]}"#.to_vec()),
             ("big", vec![b'x'; MAX_CACHE_BYTES as usize + 10]),
         ] {
             fs::write(dir.file(name), bytes).unwrap();
@@ -2642,7 +2642,7 @@ mod tests {
 
         let err = node.publish(&signer, SALT, b"second", 1000).await.unwrap_err();
         assert!(matches!(err, Error::SeqTooLow { seq: 1000, seen: 1000 }), "{err:?}");
-        // The same blob again is no conflict, and neither is a higher seq: both go on to the network, which is not there.
+        // The same blob again is no conflict, and neither is a higher seq: both go on to a network that is not there.
         let err = node.publish(&signer, SALT, b"first", 1000).await.unwrap_err();
         assert!(matches!(err, Error::NoNetwork), "{err:?}");
         let err = node.publish(&signer, SALT, b"second", 1001).await.unwrap_err();

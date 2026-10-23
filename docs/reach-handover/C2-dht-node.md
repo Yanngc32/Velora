@@ -4,7 +4,7 @@ Branch `claude/reach-c2-dht-node-f27e6c` (from 35081ec). Files: `crates/dht/src/
 dependency the coordinator allowed: `futures-lite = { version = "2", default-features = false }` in
 `crates/dht/Cargo.toml` (mainline's `get_mutable` stream implements only that crate's `Stream` and has no method of
 its own) with the matching line in `Cargo.lock` (only the name in the `velora-dht` entry). fmt, clippy `-D warnings` and
-`cargo test -p velora-dht` green on Windows (104 tests, 1 `#[ignore]` against the public DHT); Linux not compiled here.
+`cargo test -p velora-dht` green on Windows (104 tests, and 1 `#[ignore]`d one against the public DHT); Linux not compiled here.
 `node.rs` carries `#![cfg_attr(not(test), deny(clippy::unwrap_used, expect_used, indexing_slicing, panic))]` like `seal.rs`.
 Two independent reads of the module (fresh agents, read-only, the first given no conclusions) found ten defects and then
 nine more; each was checked against `mainline`'s source and fixed or documented, and each fix has a test that fails when
@@ -138,11 +138,16 @@ were refused as `SeqTooLow` by the read, and a client read the newer record afte
 
 ## Not tested
 
-Another network, a phone hotspot, a table days old, and long uptimes; Linux and Android builds; the default-names path with
-a real DNS failure (covered through the `DefaultNodes::With` closure only); the retry of a lookup that heard from too few
-(never seen in six starts on the public DHT, so only the decision is unit-tested); a stale holder of an older record on the
-public DHT; a NAT that rewrites the port. The tests run on `mainline::Testnet`, and on Windows about one loopback datagram
-in a hundred is lost there (plain `mainline` too: one put in 150 reached one server of three), and the PC they ran on stalls
-now and then. So they use a quorum of 1 and a `settle` that lasts to the end of the lookup, and a publish that must succeed or a
-record that must be found is asked again up to six times before a test fails (`stored`, `found` in the test module); what a test
-is about (a refusal, a conflict, an empty answer) is asked once. Without that, 1 full run in 40 failed at default parallelism.
+Another network, a phone hotspot, a table days old, and long uptimes; Linux and Android builds; the default-names path
+with a real DNS failure (covered through the `DefaultNodes::With` closure only); the retry of a lookup that heard from too
+few (never seen in six starts on the public DHT, so only the decision is unit-tested); a stale holder of an older record
+on the public DHT; a NAT that rewrites the port. The tests run on `mainline::Testnet`, and on Windows about one loopback
+datagram in a hundred is lost there (plain `mainline` too: one put in 150 reached one server of three), and the PC they
+ran on stalls now and then. So they use a quorum of 1 and a `settle` that lasts to the end of the lookup, and a publish
+that must succeed or a record that must be found is asked again up to six times before a test fails (`stored`, `found` in
+the test module); what a test is about (a refusal, a conflict, an empty answer) is asked once. The two that need the read
+before a put to see what an earlier put stored (`a_seq_that_cannot_win_is_refused_before_it_is_sent`,
+`publish_with_seals_again_above_what_is_stored`) use five nodes and a quorum of three (`majority` in the test module), so
+that the nodes the put reached and the nodes the lookup hears from have one in common. Without all that, 1 full run in 40
+failed at default parallelism; with it, 50 runs in a row had no failure (the build before the `majority` change failed
+once in 50, in the first of those two tests).
