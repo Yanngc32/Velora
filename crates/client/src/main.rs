@@ -139,7 +139,9 @@ fn run() -> Result<()> {
                     tracing::warn!("cannot turn sharing on: {e:#}");
                 }
             }
-            if !settings.open_at_login {
+            // On Windows the launcher then waits in the tray, to announce devices asking to
+            // send files; elsewhere only when asked to open.
+            if !settings.open_at_login && !(cfg!(windows) && settings.share_at_login) {
                 return Ok(());
             }
         }

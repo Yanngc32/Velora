@@ -194,6 +194,16 @@ its own window.
 access password. **Settings → Start with Windows** opens the app and/or turns sharing on at
 sign-in.
 
+On Windows, Velora also has an icon next to the clock. It shows whether this PC is shared and
+who is connected, opens the app, and its menu turns sharing on and off or quits. Closing the
+window leaves Velora there (**Settings → Keep running next to the clock when closed**), where
+it announces devices asking to send files. Started at sign-in, it opens straight to the icon.
+
+While sharing is on, the host keeps the computer from going to sleep, so it stays reachable
+even when it sits locked for hours (**This PC → Keep this PC awake**, on by default). The
+screen may still turn off, but stays on during a session. On Windows, `powercfg /requests`
+lists both under Velora. A closed laptop lid still puts it to sleep.
+
 Client shortcuts: <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>F</kbd> toggles
 fullscreen, <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>Q</kbd> quits.
 

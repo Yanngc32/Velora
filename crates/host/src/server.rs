@@ -102,6 +102,7 @@ pub struct Shared {
     active: Mutex<Option<Active>>,
     files: Mutex<Vec<FilesConn>>,
     shutdown: tokio::sync::Notify,
+    awake: crate::awake::Awake,
 }
 
 /// Runs until the endpoint fails or the launcher stops the host, or until an update was
@@ -119,7 +120,9 @@ pub async fn run(options: HostOptions, state: StateDir, pair: bool, auto_update:
         identity.fingerprint()
     );
 
+    let awake = crate::awake::Awake::start(&state);
     let shared = Arc::new(Shared {
+        awake,
         options,
         state,
         password: crate::password::Gate::default(),
@@ -290,6 +293,8 @@ async fn handle_connection(incoming: quinn::Incoming, shared: Arc<Shared>) -> Re
 
     let clipboard = ext.is_some_and(|e| e.clipboard).then(|| share_clipboard(&conn)).flatten();
     let peer = Peer { shared: shared.clone(), name: name.clone(), fingerprint, clipboard };
+    // The screen stays on while the device watches it.
+    let _screen = shared.awake.screen_on();
     let result = run_session(&conn, send, recv, &shared, features, addresses, peer).await;
 
     shared.input.send(InputCmd::ReleaseAll);
@@ -378,10 +383,15 @@ impl Shared {
         }
         // Sending files changes nothing about access, and reads them as the user at the console.
         // Dismissing an offer only forgets it: access to this computer stays as it was. Answering
-        // a device's files is the user's call: it can reach their screen already.
+        // a device's files is the user's call: it can reach their screen already. Staying awake
+        // decides only whether the computer sleeps.
         let harmless = matches!(
             request,
-            Request::Status | Request::SendFiles { .. } | Request::DismissOffer { .. } | Request::AnswerFiles { .. }
+            Request::Status
+                | Request::SendFiles { .. }
+                | Request::DismissOffer { .. }
+                | Request::AnswerFiles { .. }
+                | Request::SetStayAwake { .. }
         );
         if self.options.service && !privileged && !harmless {
             return Err("only an administrator can change this computer's access".into());
@@ -407,6 +417,7 @@ impl Shared {
                 Ok(())
             }
             Request::SendFiles { paths } => self.send_files(paths),
+            Request::SetStayAwake { on } => self.awake.set(&self.state, on),
         };
         result.and_then(|()| self.status()).map_err(|e| format!("{e:#}"))
     }
@@ -494,6 +505,7 @@ impl Shared {
                     folder: r.folder.clone(),
                 })
                 .collect(),
+            stay_awake: self.awake.setting(&self.state),
         })
     }
 

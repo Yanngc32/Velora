@@ -1,5 +1,6 @@
 #[cfg(windows)]
 mod agent;
+mod awake;
 mod capture;
 mod control;
 mod encode;

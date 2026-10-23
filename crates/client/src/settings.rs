@@ -17,6 +17,8 @@ pub struct Settings {
     pub share_at_login: bool,
     /// Share the clipboard (text and images) with the computer of a session.
     pub share_clipboard: bool,
+    /// Closing the launcher leaves it in the tray (Windows), to keep announcing file requests.
+    pub close_to_tray: bool,
 }
 
 impl Default for Settings {
@@ -27,6 +29,7 @@ impl Default for Settings {
             open_at_login: false,
             share_at_login: false,
             share_clipboard: true,
+            close_to_tray: true,
         }
     }
 }
