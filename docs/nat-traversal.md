@@ -119,8 +119,10 @@ What the host does at start and every 30 minutes:
    handles v4-mapped addresses on such a socket. The client already binds a v6 socket for a
    v6 address.
 2. Asks the gateway to map UDP 7420 to itself: NAT-PMP first (`natpmp` 0.5), then UPnP IGD
-   (`igd-next` 0.18, `AddAnyPortMapping` where IGDv2 is there, else `AddPortMapping` and, on
-   conflict 718, the next port). PCP later: the only crate (`pcp-client` 0.1.0) is unproven
+   (`igd-next` 0.18: `AddPortMapping` for the wanted port, and on conflict 718
+   `AddAnyPortMapping` where IGDv2 is there, else the next port; asking for any port first
+   would pick a random one and change the advertised port at every restart). PCP later: the
+   only crate (`pcp-client` 0.1.0) is unproven
    and PCP is rare on home routers. The reply carries the external port actually assigned
    (two hosts behind one router get 7420 and 7421) and the router's external IP.
 3. Decides whether that external IP is public. Private (RFC 1918) or shared (100.64/10,
@@ -149,9 +151,8 @@ gives a public IPv4; and v6-to-v6 where the home router's v6 firewall allows it.
 Does not cover: CGNAT without usable v6, routers with UPnP off (company networks), an IP that
 changes while the client is away (the client learns addresses only when it connects).
 
-Cost: 3-4 days. One PR in the host plus `MAX_ADDRESSES` raised (old clients truncate to 8,
-which is safe) and a kind per address in the new `HostMsg::Reach` (§8). Ships in the next
-release.
+Cost: 3-4 days. One PR in the host plus a kind per address in the new `HostMsg::Reach` (§8);
+the welcome keeps its 8 addresses (§8). Ships in the next release.
 
 ### Phase 2: finding the host when its address changed, without a server
 
@@ -169,7 +170,8 @@ key    = Ed25519 public key of the device (new; stored next to the identity)
 salt   = "velora/1"
 seq    = unix time at publish (monotonic across restarts without a counter file)
 value  = { fingerprint, addresses: [kind:ip:port...], nat: open|cone|symmetric, relays: [...],
-           mac } encrypted as below. BEP 44 allows 1000 bytes; this is ~300 with 8 addresses.
+           mac } encrypted as below. BEP 44 allows 1000 bytes of bencoded value: 996 of ours.
+           This is ~300 with 8 addresses.
 ```
 
 Encryption, so a revoked device stops being able to read it: the record carries one copy of a
@@ -180,7 +182,9 @@ means leaving its wrapped key out at the next publish. AEAD: ChaCha20-Poly1305 f
 already a dependency.
 
 The client learns the host's public key and its device secret from the pairing link (two new
-parameters; the link grows by ~70 characters with a 16-byte secret, the QR stays scannable)
+parameters, 78 characters with their names; with LAN, VPN and public addresses the link is
+about 245 characters and eight no longer fit in 300, so it carries what a first connection
+needs and the rest arrives in `HostMsg::Reach`)
 or, for devices paired before this version, from `HostMsg::Reach` on their next connection.
 On connect, the client fetches the record (about a second warm, a few seconds cold) and
 adds its addresses to the race. The host republishes every 30 minutes (nodes keep items for
@@ -339,7 +343,9 @@ sleeping PC's ARP entry, and most routers refuse to forward to the broadcast add
   `PunchRequest` where sent over a relay): old hosts decode them as `Unsupported` and ignore
   them, so the client only sends them to hosts whose `Reach` announced the capability, and
   times out otherwise.
-- `MAX_ADDRESSES` goes from 8 to 16; old clients truncate the list, which is harmless.
+- `MAX_ADDRESSES` goes from 8 to 16 for `Reach` only. The welcome keeps 8
+  (`MAX_WELCOME_ADDRESSES`): clients before this version read exactly 8 and reject a longer
+  message, so more would break them.
 - Nothing in the DHT or on a relay is trusted: the client still pins the host's certificate
   and the host still checks the client's. A fake record can only point a client at a wrong
   address, where the TLS handshake fails.
@@ -436,6 +442,34 @@ All of it stays in the local logs; the user reads it under This PC and in `host.
     table keeps later starts off them.
 14. `mainline` 8.0.1 is pinned (`=8.0.1`). It signs with `ed25519-dalek 3`, which is final by
     now: the pre-release concern of the first reading is gone (found while scaffolding).
-15. `MAX_ADDRESSES = 8` would overflow with public and v6 addresses: raised to 16, which old
-    clients truncate harmlessly.
+15. `MAX_ADDRESSES = 8` would overflow with public and v6 addresses: raised to 16 for `Reach`
+    (not for the welcome: see §14).
 16. Estimates went up where the design got more concrete: about five weeks in all.
+
+## 14. What the first implementation wave found
+
+Waves 0 and 1 (the scaffold, the protocol, router mapping, addresses, Wake-on-LAN, the record
+and its sealing, relay framing, the DHT spike) were built and measured on 2026-10-23. Their
+hand-over notes are in `docs/reach-handover/`. What they changed:
+
+1. **The welcome keeps 8 addresses.** `MAX_ADDRESSES` is 16 for `HostMsg::Reach` only
+   (`MAX_WELCOME_ADDRESSES = 8`): a client from before reads exactly 8 and rejects trailing
+   bytes. §8 and §13.15 said the opposite and are corrected above.
+2. **The pairing link carries what a first connection needs.** `key=` and `secret=` cost 78
+   characters, so LAN + VPN + public is about 245 characters and eight addresses about 360.
+3. **BEP 44 in practice** (the spike, on the live DHT): a value of 997 bytes or more is
+   refused, so the sealed record is at most 996 bytes; a salt is at most 64 bytes; an equal
+   `seq` is silently ignored (use the larger of the clock and the last `seq` plus one) and a
+   lower one is refused; every other put failure comes back as a timeout, so sizes are checked
+   before publishing; a put that reports fewer than about 8 nodes storing it can be unfindable.
+4. **`mainline` 8.0.1** deprecates its blocking methods (use `Dht::as_async()`),
+   `extra_bootstrap` drops the default nodes (pass them explicitly), DNS for the bootstrap
+   names is resolved once at start, and on Windows it logs a WARN about 17 times a second
+   while idle (the tracing filter needs `mainline=error`).
+5. **UPnP asks for the wanted port first** (`AddPortMapping`): `AddAnyPortMapping` only
+   suggests a random port, which would change the advertised one at every restart.
+6. **The author's line is CGNAT in front of a cone NAT that keeps the source port.** The
+   router answers neither NAT-PMP nor UPnP, private hops follow it, and every DHT node and
+   STUN server sees the PC at one public address with the source port unchanged. Phase 1
+   cannot map a port there; the DHT record, hole punching (the NAT is endpoint-independent)
+   and the relay are what is left, which is the case the later phases are for.

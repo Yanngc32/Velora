@@ -1,7 +1,17 @@
 # Standalone reach: implementation tickets
 
-Companion to [nat-traversal.md](nat-traversal.md) (revision 2). Status: proposal. Nothing is
-implemented.
+Companion to [nat-traversal.md](nat-traversal.md) (revision 2). Status: in progress.
+
+| Wave | Tickets | State |
+|---|---|---|
+| 0 | W0 | done, 2026-10-23 |
+| 1 | T0 S0 B1 B2 B3 C1 D1 | built and merged into `standalone-reach`, 2026-10-23 (S0: lifetime numbers pending) |
+| 2 | E1 F1 G1 C2 C3 D2 | not started |
+| 3 | E2-E6 F2-F5 G2 G3 | not started |
+| 4 | I1-I4 H1 H2 | not started |
+
+What the finished tickets handed over is in `docs/reach-handover/`; §14 of the plan lists what
+wave 1 changed.
 
 ## 0. Rules that make the tickets conflict-free
 
@@ -107,9 +117,10 @@ Owns `wire.rs`, `pairing.rs`, `control.rs`, `identity.rs`.
 - `ClientMsg::Reached { address }`, `RelayRegister { mac }`, `RelayTo { fingerprint }`,
   `Wake { fingerprint }`, `PunchRequest { to: fingerprint, endpoint, nonce }`. Old hosts
   decode them as `Unsupported` and ignore them (already true).
-- `MAX_ADDRESSES` 8 → 16.
+- `MAX_ADDRESSES` 8 → 16 for `Reach`; the welcome keeps 8 (`MAX_WELCOME_ADDRESSES`).
 - `pairing.rs`: `key=` and `secret=` emitted by `pairing_uri_with` and parsed; link length
-  test (must stay under 300 characters with 8 addresses).
+  test (`key=` and `secret=` cost 78 characters: LAN + VPN + public stays under 300, eight
+  addresses do not, so the link carries only what a first connection needs).
 - `identity.rs`: `KnownHost` gains `kinds`, `key`, `secret`, `relays`, `mac`, all
   `#[serde(default)]`.
 - `control.rs`: `Status.reach: Option<ReachStatus { standalone, relay_for_others, dht,
@@ -134,8 +145,9 @@ Owns `docs/dht-spike.md`.
 velora-nat · wave 1 · 2 d · after W0 · parallel with T0, B2, B3, C1, D1.
 Owns `src/mapping.rs`.
 - `map_udp(local_port, wanted_external, lease) -> Mapping { protocol, external_ip,
-  external_port, lease }`: NAT-PMP first, then UPnP IGD (`AddAnyPortMapping` on IGDv2, else
-  `AddPortMapping` and the next port on conflict 718); `renew`, `remove`; gateway discovery
+  external_port, lease }`: NAT-PMP first, then UPnP IGD (`AddPortMapping` for the wanted port;
+  on conflict 718 `AddAnyPortMapping` on IGDv2, else the next port); `renew`, `remove`; gateway
+  discovery
   (default route on Windows and Linux).
 - Done when: unit tests with a mocked gateway for the conflict and renewal paths; a manual
   run on this network logs a mapping and removes it; both OSes compile.
@@ -168,8 +180,8 @@ Owns `src/record.rs`, `src/seal.rs`, `src/keys.rs`.
   `postcard` encoding.
 - `seal.rs`: `seal(record, &[(device_id, secret)]) -> Vec<u8>` with a random content key
   wrapped per device (ChaCha20-Poly1305 from `ring`), falling back to one shared secret when
-  the devices don't fit; `open(bytes, device_id, secret)`; the 1000-byte BEP 44 limit
-  enforced with a clear error.
+  the devices don't fit; `open(bytes, device_id, secret)`; the BEP 44 limit (996 bytes: the
+  bencoded string counts its `NNN:` prefix) enforced with a clear error.
 - Done when: tests cover round trip, a revoked device failing to open, the size limit, and
   the fallback.
 
@@ -225,6 +237,8 @@ Owns `src/server.rs`, `src/main.rs`, `src/control.rs`, `src/reach/mod.rs`,
   `HostMsg::Reach` after the welcome to clients with the bit; dispatch the new client
   messages to `reach::handle_client_msg`; call `on_paired` after a pairing; `--relay-only`
   (no capture, no sessions, relay serving only) parsed in `main.rs`.
+- `main.rs`: the tracing filter gets the directive `mainline=error` (the DHT library logs a
+  WARN about 17 times a second on Windows while idle: 1.4 million lines a day in `host.log`).
 - `control.rs`: `Request::SetReach` → `ReachState`; `Status.reach` filled from it.
 - Done when: all existing tests pass; a test proves that a client without the bit gets no
   `Reach`; the socket multiplexer has unit tests for the three sources.
@@ -353,13 +367,15 @@ Owns `gui/reach.rs` body.
 Launcher · wave 3 · 1 d · after F1 · parallel with everything in wave 3.
 Owns `crates/client/src/main.rs`.
 - `velora wake <host>`; `velora connect` prints which address kind won; `velora-host reach`
-  status is covered by `Status`, so no host CLI change.
+  status is covered by `Status`, so no host CLI change. The tracing filter gets the directive
+  `mainline=error`, as in E1.
 - Done when: both commands work against a real host.
 
 ### I1 — Field test: phase 1 on real routers
 wave 4 · 1 d · after E2, F1, G1.
-- Three routers (this one, one with NAT-PMP only, one with UPnP off), the client on 4G/5G:
-  record which address kind reached, log lines, and the CGNAT detection on a CGNAT line.
+- Three routers (one that does NAT-PMP, one that does UPnP, and this one, which answers
+  neither and sits behind CGNAT), the client on 4G/5G: record which address kind reached,
+  log lines, and the CGNAT detection on this line.
 
 ### I2 — Field test: DHT across networks
 wave 4 · 1 d · after E3, F2.
