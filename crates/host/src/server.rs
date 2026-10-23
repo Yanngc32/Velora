@@ -21,7 +21,7 @@ use tokio::sync::{mpsc, oneshot};
 use velora_protocol::{
     control::{self, Reply, Request},
     files as wire_files,
-    identity::{AuthorizedClient, StateDir},
+    identity::{AuthorizedClient, Identity, StateDir},
     pairing::{pairing_uri_with, parse_pairing_uri, PairingCode},
     tls::{self, Fingerprint},
     wire::{
@@ -52,6 +52,10 @@ const UPDATE_IDLE_POLL: Duration = Duration::from_secs(30);
 const PAIRING_TTL: Duration = Duration::from_secs(10 * 60);
 /// Longest pairing link, in characters, that still makes a QR code a phone reads without trouble.
 const MAX_LINK_LEN: usize = 300;
+/// The largest packet, in bytes, a connection that arrives through a relay tunnel may grow to. Its
+/// packets travel as datagrams of the connection to the relay, which hold about 1400 bytes less
+/// the 3 of the relay framing: a packet up to this is one datagram, a longer one is two.
+const TUNNEL_MTU: u16 = 1350;
 
 pub struct HostOptions {
     pub bind: SocketAddr,
@@ -133,8 +137,22 @@ pub struct Shared {
     active: Mutex<Option<Active>>,
     files: Mutex<Vec<FilesConn>>,
     links: Mutex<Vec<LinkConn>>,
+    /// What connections that arrive through a relay tunnel are accepted with: see [`tunnel_config`].
+    tunnel_config: Arc<quinn::ServerConfig>,
     shutdown: tokio::sync::Notify,
     awake: crate::awake::Awake,
+}
+
+/// The server config for connections that arrive through a relay tunnel: the host's own, with path
+/// MTU discovery stopping at [`TUNNEL_MTU`] where the endpoint's would go on to 1452. Ordinary
+/// connections keep the endpoint's config, and so do the retries.
+fn tunnel_config(identity: &Identity) -> Result<Arc<quinn::ServerConfig>> {
+    let mut config = tls::server_config(identity)?;
+    let transport = Arc::get_mut(&mut config.transport).context("the transport config is shared")?;
+    let mut discovery = quinn::MtuDiscoveryConfig::default();
+    discovery.upper_bound(TUNNEL_MTU);
+    transport.mtu_discovery_config(Some(discovery));
+    Ok(Arc::new(config))
 }
 
 /// Binds the socket, opens the endpoint on it and builds the host around both. Needs a Tokio
@@ -160,6 +178,7 @@ fn open(mut options: HostOptions, state: StateDir) -> Result<(Arc<Shared>, quinn
         identity.fingerprint()
     );
 
+    let tunnel_config = tunnel_config(&identity)?;
     let state = Arc::new(state);
     let fingerprint = identity.fingerprint();
     let reach = reach::Reach::new(ReachState {
@@ -186,6 +205,7 @@ fn open(mut options: HostOptions, state: StateDir) -> Result<(Arc<Shared>, quinn
         active: Mutex::new(None),
         files: Mutex::new(Vec::new()),
         links: Mutex::new(Vec::new()),
+        tunnel_config,
         shutdown: tokio::sync::Notify::new(),
     });
     // The first welcome must not go out with no address in it.
@@ -357,7 +377,13 @@ async fn update_loop(shared: &Shared) {
 }
 
 async fn handle_connection(incoming: quinn::Incoming, shared: Arc<Shared>) -> Result<()> {
-    let conn = tokio::time::timeout(HANDSHAKE_TIMEOUT, incoming).await.context("handshake timeout")??;
+    // What arrives through a relay tunnel is held to packets that fit one datagram of the relay's.
+    let connecting = if reach::socket::is_tunnel_addr(incoming.remote_address()) {
+        incoming.accept_with(shared.tunnel_config.clone())?
+    } else {
+        incoming.accept()?
+    };
+    let conn = tokio::time::timeout(HANDSHAKE_TIMEOUT, connecting).await.context("handshake timeout")??;
     let fingerprint = tls::peer_fingerprint(&conn)?;
 
     let (mut send, mut recv) =
@@ -2180,6 +2206,43 @@ mod tests {
         assert_eq!(host.reach().read().last_reached, Some((relay_kind, "198.51.100.77:7420".to_string())));
         assert!(reach::socket::is_tunnel_addr(tunnel_peer));
         assert!(host.shared.reach.context().socket.stats().tunnel_in > 0);
+    }
+
+    #[tokio::test]
+    async fn a_connection_through_a_relay_tunnel_keeps_its_packets_to_one_relay_datagram() {
+        let host = host("tunnel-mtu", true).await;
+        let identity = Identity::generate().unwrap();
+        host.pair(&identity, "laptop");
+        let (relay_address, _peer, _pump) = relay_for(&host, [4; 32]).await;
+        let mut direct = host.connect(&identity, Some(link_hello())).await;
+        assert!(matches!(direct.next().await, HostMsg::Welcome { .. }));
+        let mut relayed = host.connect_to(relay_address, &identity, Some(link_hello())).await;
+        assert!(matches!(relayed.next().await, HostMsg::Welcome { .. }));
+
+        // The host finds out by itself, after the handshake, how big its packets can be. An ordinary
+        // connection goes on to quinn's own limit; the one through a tunnel stops where the datagrams
+        // of the relay hold its packets.
+        let mtu = |through_tunnel: bool| {
+            let links = host.shared.links.lock().unwrap();
+            let link = links
+                .iter()
+                .find(|link| reach::socket::is_tunnel_addr(link.conn.remote_address()) == through_tunnel)?;
+            Some(link.conn.stats().path.current_mtu)
+        };
+        // Wait until neither has moved for half a second, so that what is measured is where each ended.
+        let (mut last, mut steady) = ((0, 0), 0);
+        for _ in 0..500 {
+            let now = (mtu(false).unwrap_or(0), mtu(true).unwrap_or(0));
+            steady = if now == last { steady + 1 } else { 0 };
+            last = now;
+            if steady >= 25 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let (direct_mtu, relayed_mtu) = last;
+        assert!(direct_mtu > TUNNEL_MTU, "an ordinary connection grows past it: {direct_mtu}");
+        assert!(relayed_mtu > 1200 && relayed_mtu <= TUNNEL_MTU, "and one through a tunnel stops there: {relayed_mtu}");
     }
 
     #[test]
