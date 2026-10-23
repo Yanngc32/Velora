@@ -2209,6 +2209,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_control_stream_that_breaks_with_the_connection_does_not_hide_why_it_closed() {
+        let (ctx, _scratch) = testing::context("relay-carry");
+        // At the end of a registration the control stream has broken and the connection is closed
+        // with a code, both ready when `carry` looks. Which it looks at first is chance, so repeat it.
+        for round in 0..20u8 {
+            let pair = testing::connect(&ctx).await;
+            let (send, _recv) = pair.client().open_bi().await.unwrap();
+            let (messages, inbox) = mpsc::channel(INBOX_QUEUE);
+            messages.send(Err("connection lost".into())).await.unwrap();
+            let mut link = Link { send, inbox, reader: tokio::spawn(async {}), reach: None };
+            let mut tunnel = ctx.socket.open_tunnel([round + 1; 32], NonZeroU16::MIN).unwrap();
+            pair.server.close(CLOSE_REPLACED.into(), b"another copy");
+            let _ = pair.client().closed().await;
+            let carried = carry(&ctx, pair.client(), &mut link, &mut tunnel, None).await;
+            let Ended::Wait { wait, .. } = ended_by(carried, Duration::from_secs(1)) else {
+                panic!("round {round}: the close code was lost")
+            };
+            assert_eq!(wait, REPLACED_WAIT);
+        }
+    }
+
+    #[tokio::test]
     async fn answers_to_a_device_that_does_not_read_are_dropped_and_no_task_waits_for_it() {
         let (ctx, _scratch) = testing::context("relay-flood");
         let (_link, from, outbox) = device(&ctx, "phone").await;
