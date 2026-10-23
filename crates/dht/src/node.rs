@@ -63,7 +63,7 @@ pub const MAX_VALUE_LEN: usize = 1000 - 4;
 pub const MAX_SALT_LEN: usize = 64;
 
 /// How many nodes count as "enough": table entries before a cold lookup, answers that make a lookup healthy, nodes that
-/// must acknowledge a put. A network smaller than this (a test network) lowers it to its own size, and
+/// must acknowledge a put. A network of our own that is smaller than this (a test network) lowers it to its size, and
 /// [`Config::quorum`] sets it.
 const QUORUM: usize = 8;
 
@@ -94,6 +94,9 @@ const SAVE_EVERY: Duration = Duration::from_secs(300);
 
 /// A cache bigger than this is not ours.
 const MAX_CACHE_BYTES: u64 = 64 * 1024;
+
+/// The longest request timeout a node is given.
+const MAX_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// How many `seq` numbers are kept in the cache file (the newest).
 const MAX_SEQS: usize = 64;
@@ -165,8 +168,8 @@ pub struct Config {
     /// Replace a node that has not been used for this long, before using it. `None`: never.
     pub recycle_after: Option<Duration>,
     /// How many nodes count as enough: in the table before a cold lookup, answering a lookup for it to be trusted,
-    /// acknowledging a put. `None`: eight, or the size of the start list when it is smaller. The tests lower it: a
-    /// network of three nodes would otherwise fail a put whenever one datagram is lost.
+    /// acknowledging a put. `None`: eight; with `default_nodes` of your own, the size of the start list when that is
+    /// smaller. The tests lower it: a network of three nodes would otherwise fail a put whenever one datagram is lost.
     pub quorum: Option<usize>,
 }
 
@@ -308,14 +311,14 @@ impl Node {
     pub async fn open_with(config: Config) -> Node {
         let node = Node { inner: Arc::new(Inner::new(config)) };
         if let Some(path) = node.inner.config.cache_path.clone() {
-            let cache = tokio::task::spawn_blocking(move || CacheFile::load(&path)).await.unwrap_or_default();
-            node.inner.adopt(cache);
+            let loaded = tokio::task::spawn_blocking(move || CacheFile::load(&path)).await.unwrap_or_default();
+            node.inner.adopt(loaded);
         }
         // Built now, so that it is warming up while the caller does other things; a failure is the first call's to
         // report.
         let started = node
             .run(|inner, used| async move {
-                let handle = inner.handle().await?;
+                let handle = inner.handle(None).await?;
                 used.store(handle.generation, Ordering::Relaxed);
                 Ok(())
             })
@@ -414,9 +417,14 @@ impl Node {
     pub async fn observed_address(&self) -> Option<SocketAddrV4> {
         let handle = self.inner.lock().running.as_ref().map(|r| r.handle.clone());
         let seen = match handle {
-            Some(handle) => {
-                self.run(move |_, _| async move { Ok(handle.dht.info().await.public_address()) }).await.ok().flatten()
-            }
+            Some(handle) => self
+                .run(move |_, used| async move {
+                    used.store(handle.generation, Ordering::Relaxed);
+                    Ok(handle.dht.info().await.public_address())
+                })
+                .await
+                .ok()
+                .flatten(),
             None => None,
         };
         let mut state = self.inner.lock();
@@ -430,28 +438,17 @@ impl Node {
     /// already do it at the right time, right after a lookup, when the table is full; a table of fewer nodes than a
     /// quorum never replaces a saved one. `Ok(false)`: nothing to write (no cache path, or nothing changed).
     pub async fn save_cache(&self) -> Result<bool, Error> {
-        self.run(|inner, _| async move { inner.save(true).await }).await
+        self.run(|inner, used| async move { inner.save(true, None, &used).await }).await
     }
 
-    /// Runs `op` on a task of its own. `mainline` panics when its thread is gone, and it is a library handling
-    /// whatever arrives from the internet; on the task that is a [`tokio::task::JoinError`] we can turn into an
-    /// error and recover from, not a panic in the caller. `used` is the generation of the node `op` was using, so
-    /// that only that one is forgotten.
+    /// Runs `op` on a task of its own, so that a panic in `mainline` is an error and not a panic in the caller.
     async fn run<T, F, Fut>(&self, op: F) -> Result<T, Error>
     where
         F: FnOnce(Arc<Inner>, Arc<AtomicU64>) -> Fut,
         Fut: Future<Output = Result<T, Error>> + Send + 'static,
         T: Send + 'static,
     {
-        let used = Arc::new(AtomicU64::new(0));
-        match tokio::spawn(op(self.inner.clone(), used.clone())).await {
-            Ok(result) => result,
-            Err(e) => {
-                warn!(error = %e, "a DHT call ended without a result: the node is built again on the next call");
-                self.inner.forget(used.load(Ordering::Relaxed));
-                Err(Error::Stopped)
-            }
-        }
+        self.inner.run(op).await
     }
 }
 
@@ -462,7 +459,7 @@ struct Inner {
     build: tokio::sync::Mutex<()>,
     /// One publish at a time: `mainline` refuses a put while another one for the same key is in flight.
     publishing: tokio::sync::Mutex<()>,
-    /// One write of the cache at a time: two would share the temporary file.
+    /// One write of the cache at a time per node.
     saving: tokio::sync::Mutex<()>,
     generation: AtomicU64,
     save_scheduled: AtomicBool,
@@ -473,12 +470,20 @@ struct State {
     running: Option<Running>,
     /// The nodes of the cache, spread over the table they came from.
     saved: Vec<SocketAddrV4>,
-    /// The last answer of the default names; used when they do not resolve.
-    defaults: Vec<SocketAddrV4>,
+    /// What each default name resolved to the last time it did.
+    defaults: HashMap<String, Vec<SocketAddrV4>>,
     seqs: HashMap<SeqKey, SeqEntry>,
-    seqs_dirty: bool,
+    /// Counts the changes to `seqs` that are ours to keep; the file is up to date when `seqs_saved` has caught up.
+    seqs_version: u64,
+    seqs_saved: u64,
+    /// The blob this process last put under a key's `seq`: another blob under the same `seq` would be ignored by the
+    /// nodes that kept the first, and the lookup before a put may not have heard from them.
+    spent: HashMap<SeqKey, (i64, [u8; 32])>,
     /// What the cache file holds, as far as this process knows.
     written: Option<Vec<u8>>,
+    /// The cache file is there but could not be read (a sharing violation, say): nothing is written over it from a table
+    /// too small to be worth more than it holds.
+    cache_unreadable: bool,
     last_save: Option<Instant>,
     observed: Option<SocketAddrV4>,
 }
@@ -536,9 +541,32 @@ impl Inner {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn adopt(&self, cache: CacheFile) {
+    /// Runs `op` on a task of its own. `mainline` panics when its thread is gone, and it is a library handling whatever
+    /// arrives from the internet; on the task that is a [`tokio::task::JoinError`] we can turn into an error and
+    /// recover from, not a panic in the caller. `used` is the generation of the node `op` was using, so that only that
+    /// one is forgotten.
+    async fn run<T, F, Fut>(self: &Arc<Self>, op: F) -> Result<T, Error>
+    where
+        F: FnOnce(Arc<Inner>, Arc<AtomicU64>) -> Fut,
+        Fut: Future<Output = Result<T, Error>> + Send + 'static,
+        T: Send + 'static,
+    {
+        let used = Arc::new(AtomicU64::new(0));
+        match tokio::spawn(op(self.clone(), used.clone())).await {
+            Ok(result) => result,
+            Err(e) => {
+                warn!(error = %e, "a DHT call ended without a result: the node is built again on the next call");
+                self.forget(used.load(Ordering::Relaxed));
+                Err(Error::Stopped)
+            }
+        }
+    }
+
+    fn adopt(&self, loaded: Loaded) {
+        let Loaded { cache, readable } = loaded;
         let limit = unix_now().saturating_add(MAX_SEQ_AHEAD);
         let mut state = self.lock();
+        state.cache_unreadable = !readable;
         // What the file holds, so that a save that would write the same thing does not.
         state.written = Some(cache.render());
         state.saved = spread(&cache.nodes, MAX_SAVED_NODES);
@@ -549,10 +577,29 @@ impl Inner {
         }
     }
 
+    // === How many is enough ===
+
+    /// How many nodes count as enough for a start list of `list_len` nodes. The public network is large however few of
+    /// its names answered; only a network of our own is as small as its list.
+    fn quorum_for(&self, list_len: usize) -> usize {
+        match (self.config.quorum, &self.config.default_nodes) {
+            (Some(quorum), _) => quorum,
+            (None, DefaultNodes::Public) => QUORUM,
+            (None, DefaultNodes::With(_)) => list_len.clamp(1, QUORUM),
+        }
+        .max(1)
+    }
+
+    /// How many saved nodes make a start warm: a table's worth.
+    fn warm_at(&self) -> usize {
+        self.config.quorum.unwrap_or(QUORUM).max(1)
+    }
+
     // === The node ===
 
-    /// The running node, or a new one when there is none, or it has been left alone for too long.
-    async fn handle(self: &Arc<Self>) -> Result<Handle, Error> {
+    /// The running node, or a new one when there is none, or it has been left alone for too long. `until` is the
+    /// deadline of the call that needs it, which the wait for the default names does not outlast.
+    async fn handle(self: &Arc<Self>, until: Option<Instant>) -> Result<Handle, Error> {
         if let Some(handle) = self.fresh_handle() {
             return Ok(handle);
         }
@@ -560,8 +607,19 @@ impl Inner {
         if let Some(handle) = self.fresh_handle() {
             return Ok(handle);
         }
-        let (list, warm) = self.bootstrap_list().await;
-        self.build_from(list, warm).await
+        let (list, warm) = self.bootstrap_list(until).await;
+        match self.build_from(list, warm).await {
+            Ok(handle) => Ok(handle),
+            // Left alone too long, but still there: better than none when a new one cannot be made (a fixed port that
+            // the old one still holds, or no list this time).
+            Err(e) => match self.stale_handle() {
+                Some(handle) => {
+                    debug!(error = %e, "keeping the idle node: a new one could not be made");
+                    Ok(handle)
+                }
+                None => Err(e),
+            },
+        }
     }
 
     fn fresh_handle(&self) -> Option<Handle> {
@@ -575,13 +633,22 @@ impl Inner {
         Some(running.handle.clone())
     }
 
+    /// The running node, however long it has been idle.
+    fn stale_handle(&self) -> Option<Handle> {
+        self.lock().running.as_ref().map(|running| running.handle.clone())
+    }
+
     /// The saved nodes, then the default ones. Saved ones first: they answer in 25 ms, and a start that only had the
     /// four names sometimes hears from none of them.
-    async fn bootstrap_list(&self) -> (Vec<SocketAddrV4>, bool) {
+    async fn bootstrap_list(&self, until: Option<Instant>) -> (Vec<SocketAddrV4>, bool) {
         let saved = spread(&self.lock().saved, MAX_SAVED_NODES);
-        let warm = saved.len() >= self.config.quorum.unwrap_or(QUORUM);
+        let warm = saved.len() >= self.warm_at();
         let defaults = match &self.config.default_nodes {
-            DefaultNodes::Public => self.public_defaults(if warm { DNS_WAIT_WARM } else { DNS_WAIT_COLD }).await,
+            DefaultNodes::Public => {
+                let cap = if warm { DNS_WAIT_WARM } else { DNS_WAIT_COLD };
+                let wait = until.map_or(cap, |until| cap.min(until.saturating_duration_since(Instant::now())));
+                self.resolve_defaults(&DEFAULT_BOOTSTRAP_NODES, wait, system_resolver).await
+            }
             DefaultNodes::With(nodes) => nodes(),
         };
         let mut list = saved;
@@ -593,30 +660,42 @@ impl Inner {
         (list, warm)
     }
 
-    /// `mainline` resolves the names once, inside its blocking `build()`, with no limit on the wait and silently
-    /// without the ones that fail. Done here instead, with a limit, and with the last good answer as the fallback.
-    async fn public_defaults(&self, wait: Duration) -> Vec<SocketAddrV4> {
-        let resolving = tokio::task::spawn_blocking(|| {
-            DEFAULT_BOOTSTRAP_NODES
-                .iter()
-                .filter_map(|name| name.to_socket_addrs().ok())
-                .flatten()
-                .filter_map(|address| match address {
-                    SocketAddr::V4(address) => Some(address),
-                    SocketAddr::V6(_) => None,
-                })
-                .collect::<Vec<_>>()
-        });
-        match timeout(wait, resolving).await {
-            Ok(Ok(found)) if !found.is_empty() => {
-                self.lock().defaults = found.clone();
-                found
-            }
-            _ => {
-                debug!("the default bootstrap names did not resolve in time");
-                self.lock().defaults.clone()
+    /// `mainline` resolves the names one after the other inside its blocking `build()`, with no limit on the wait, and
+    /// silently without the ones that fail. Here each name has a thread of its own and the wait has a limit: the names
+    /// that answered in time are used, so a slow one does not cost the others, and a name that did not keeps the last
+    /// answer it gave.
+    async fn resolve_defaults<R>(&self, names: &[&str], wait: Duration, resolver: R) -> Vec<SocketAddrV4>
+    where
+        R: Fn(&str) -> Vec<SocketAddrV4> + Send + Sync + 'static,
+    {
+        let resolver = Arc::new(resolver);
+        let tasks: Vec<_> = names
+            .iter()
+            .map(|name| {
+                let (name, resolver) = ((*name).to_owned(), resolver.clone());
+                (name.clone(), tokio::task::spawn_blocking(move || resolver(&name)))
+            })
+            .collect();
+        let limit = after(wait);
+        let mut addresses = Vec::new();
+        for (name, task) in tasks {
+            let fresh = match timeout_at(limit, task).await {
+                Ok(Ok(found)) if !found.is_empty() => Some(found),
+                _ => None,
+            };
+            let mut state = self.lock();
+            match fresh {
+                Some(found) => {
+                    addresses.extend(found.iter().copied());
+                    state.defaults.insert(name, found);
+                }
+                None => {
+                    debug!(name, "a default bootstrap name did not resolve in time");
+                    addresses.extend(state.defaults.get(&name).into_iter().flatten().copied());
+                }
             }
         }
+        addresses
     }
 
     /// Builds a node. An empty list is an error and not a node: `mainline` never refills it (it would be a node
@@ -626,8 +705,10 @@ impl Inner {
             debug!("no node to start the DHT from");
             return Err(Error::NoNetwork);
         }
-        let (bind_address, port, request_timeout) =
-            (self.config.bind_address, self.config.port, self.config.request_timeout);
+        let (bind_address, port) = (self.config.bind_address, self.config.port);
+        // `mainline` expires requests by subtracting the timeout from the clock, which panics for one longer than the
+        // machine has been up.
+        let request_timeout = self.config.request_timeout.map(|timeout| timeout.min(MAX_REQUEST_TIMEOUT));
         let nodes = list.clone();
         let dht = tokio::task::spawn_blocking(move || {
             let mut builder = Dht::builder();
@@ -648,7 +729,7 @@ impl Inner {
         .map_err(Error::Socket)?;
         let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
         debug!(generation, nodes = list.len(), warm, "started a DHT node");
-        let quorum = self.config.quorum.unwrap_or_else(|| list.len().clamp(1, QUORUM)).max(1);
+        let quorum = self.quorum_for(list.len());
         let handle = Handle { dht: dht.as_async(), generation, quorum, warm };
         self.lock().running = Some(Running { handle: handle.clone(), list, fresh_since: SystemTime::now() });
         Ok(handle)
@@ -693,7 +774,7 @@ impl Inner {
 
     /// If the node's table is empty, builds it again when the list it would be built from now is not the one it was
     /// built from (DNS answered since, the cache changed). The same list would only do the same, and the node already
-    /// retries by itself every second.
+    /// retries by itself every second. If it cannot be built, this one stays.
     async fn refresh_if_empty(
         self: &Arc<Self>,
         handle: Handle,
@@ -703,13 +784,14 @@ impl Inner {
         if !handle.dht.to_bootstrap().await.is_empty() {
             return Ok(handle);
         }
-        let (list, warm) = self.bootstrap_list().await;
+        let (list, warm) = self.bootstrap_list(Some(until)).await;
         let fresh = {
             let _building = self.build.lock().await;
             {
                 let state = self.lock();
                 match state.running.as_ref() {
                     Some(running) if running.handle.generation != handle.generation => {
+                        used.store(running.handle.generation, Ordering::Relaxed);
                         return Ok(running.handle.clone());
                     }
                     Some(running) if same_nodes(&running.list, &list) => return Ok(handle),
@@ -720,7 +802,13 @@ impl Inner {
                 return Ok(handle);
             }
             info!(nodes = list.len(), "no DHT node answered: starting the node again");
-            self.build_from(list, warm).await?
+            match self.build_from(list, warm).await {
+                Ok(fresh) => fresh,
+                Err(e) => {
+                    debug!(error = %e, "keeping the node: a new one could not be made");
+                    return Ok(handle);
+                }
+            }
         };
         used.store(fresh.generation, Ordering::Relaxed);
         if !fresh.warm {
@@ -740,34 +828,40 @@ impl Inner {
     ) -> Result<Option<Resolved>, Error> {
         let deadline = after(options.deadline.unwrap_or(self.config.resolve_deadline));
         let salt = salt_of(&salt);
-        let mut handle = self.handle().await?;
+        let mut handle = self.handle(Some(deadline)).await?;
         used.store(handle.generation, Ordering::Relaxed);
         handle = self.ensure_ready(handle, deadline, used).await?;
         let mut attempt = 0;
         loop {
+            if Instant::now() >= deadline {
+                return self.out_of_time(&handle).await;
+            }
             let mut lookup = Lookup::start(&handle.dht, &key, salt, options.newer_than);
-            let got = collect(&mut lookup, deadline, Some(self.config.settle)).await;
+            let got = collect(&mut lookup, deadline, Some(self.config.settle), options.newer_than).await;
             if let Some(item) = got.best {
                 self.touch(handle.generation);
-                self.schedule_save();
+                self.schedule_save(handle.clone());
                 return Ok(Some(Resolved { value: item.value().to_vec(), seq: item.seq() }));
             }
             if !got.ended {
-                // Out of time with the lookup still running. Nodes in the table mean the network is there.
-                return if handle.dht.to_bootstrap().await.is_empty() { Err(Error::NoNetwork) } else { Ok(None) };
+                return self.out_of_time(&handle).await;
             }
-            let reach = lookup.reach(&handle).await;
-            match verdict(reach, attempt, deadline.saturating_duration_since(Instant::now())) {
+            let finished = lookup.finish(&handle).await;
+            // `mainline` joins a lookup to one that is running for the same record and keeps the first one's question.
+            // If that was a poll, which the nodes answered with "nothing newer", this lookup heard no record at all.
+            let joined_poll = options.newer_than.is_none() && finished.no_more_recent > 0;
+            let time_left = deadline.saturating_duration_since(Instant::now());
+            match verdict(finished.reach, attempt, time_left, joined_poll) {
                 Verdict::NoRecord => {
                     self.touch(handle.generation);
-                    self.schedule_save();
+                    self.schedule_save(handle.clone());
                     return Ok(None);
                 }
                 Verdict::NoNetwork => return Err(Error::NoNetwork),
                 Verdict::Retry => {
                     // The first lookup of a cold node sometimes asks four names and hears from none; the same
                     // lookup a moment later, from the same node, found the record every time.
-                    debug!(?reach, "nothing found and few nodes answered: looking again");
+                    debug!(reach = ?finished.reach, joined_poll, "nothing found: looking again");
                     handle = self.refresh_if_empty(handle, deadline, used).await?;
                     attempt += 1;
                 }
@@ -775,14 +869,51 @@ impl Inner {
         }
     }
 
+    /// Out of time with the lookup still running. Nodes in the table mean the network is there.
+    async fn out_of_time(&self, handle: &Handle) -> Result<Option<Resolved>, Error> {
+        if handle.dht.to_bootstrap().await.is_empty() {
+            Err(Error::NoNetwork)
+        } else {
+            Ok(None)
+        }
+    }
+
     // === publish ===
 
+    /// [`Inner::publish_attempts`], and the `seq` it spent saved even when it failed: a process that ends after a
+    /// failed publish must not use that `seq` for another blob.
     async fn publish_op(self: &Arc<Self>, used: &AtomicU64, publication: Publication) -> Result<Published, Error> {
+        let result = self.publish_attempts(used, publication).await;
+        let unsaved = {
+            let state = self.lock();
+            state.seqs_version != state.seqs_saved
+        };
+        if result.is_err() && unsaved {
+            if let Err(e) = self.save(true, None, used).await {
+                debug!(error = %e, "could not save the DHT cache");
+            }
+        }
+        result
+    }
+
+    async fn publish_attempts(
+        self: &Arc<Self>,
+        used: &AtomicU64,
+        publication: Publication,
+    ) -> Result<Published, Error> {
         let Publication { public, salt: salt_bytes, item, deadline } = publication;
         let seq = item.seq();
         let salt = salt_of(&salt_bytes);
-        let _one_at_a_time = self.publishing.lock().await;
-        let mut handle = self.handle().await?;
+        let digest = digest_of(item.value());
+        let _one_at_a_time = match timeout_at(deadline, self.publishing.lock()).await {
+            Ok(guard) => guard,
+            Err(_) => return Err(Error::TimedOut),
+        };
+        // Another blob under a `seq` this node already put one under: the nodes that kept the first would ignore it.
+        if self.contradicts_spent(&public, &salt_bytes, seq, &digest) {
+            return Err(Error::SeqTooLow { seq, seen: seq });
+        }
+        let mut handle = self.handle(Some(deadline)).await?;
         used.store(handle.generation, Ordering::Relaxed);
         handle = self.ensure_ready(handle, deadline, used).await?;
         let mut attempt = 0;
@@ -792,12 +923,12 @@ impl Inner {
             // nodes, with their tokens, that the put goes to.
             let stored = self.read_before_publish(&mut handle, used, &public, salt, deadline).await?;
             if let Some(stored) = stored.filter(|s| s.seq() > seq || (s.seq() == seq && s.value() != item.value())) {
-                self.record_seq(public, &salt_bytes, stored.seq());
+                self.record_seq(public, &salt_bytes, stored.seq(), None);
                 return Err(Error::SeqTooLow { seq, seen: stored.seq() });
             }
             // From here this `seq` is spent, even if the put fails: a node may have kept it, and another blob under
             // the same `seq` would be ignored there.
-            self.record_seq(public, &salt_bytes, seq);
+            self.record_seq(public, &salt_bytes, seq, Some(digest));
             let put = match timeout_at(deadline, handle.dht.put_mutable(item.clone(), None)).await {
                 Ok(put) => put,
                 Err(_) => return Err(Error::TimedOut),
@@ -807,7 +938,7 @@ impl Inner {
                     let stored_at = outcome.stored_at as usize;
                     if stored_at >= handle.quorum {
                         self.touch(handle.generation);
-                        if let Err(e) = self.save(true).await {
+                        if let Err(e) = self.save(true, Some(handle.clone()), used).await {
                             warn!(error = %e, "could not save the DHT cache");
                         }
                         return Ok(Published { seq, stored_at });
@@ -825,7 +956,7 @@ impl Inner {
                         Some(stored) => stored.seq().max(seq),
                         None => seq,
                     };
-                    self.record_seq(public, &salt_bytes, seen);
+                    self.record_seq(public, &salt_bytes, seen, None);
                     return Err(Error::SeqTooLow { seq, seen });
                 }
                 Err(PutMutableError::Query(PutQueryError::NoClosestNodes)) => return Err(Error::NoNetwork),
@@ -851,20 +982,25 @@ impl Inner {
     ) -> Result<Option<MutableItem>, Error> {
         let mut attempt = 0;
         loop {
+            if Instant::now() >= deadline {
+                return Err(Error::TimedOut);
+            }
             let mut lookup = Lookup::start(&handle.dht, key, salt, None);
-            let got = collect(&mut lookup, deadline, None).await;
+            let got = collect(&mut lookup, deadline, None, None).await;
             if !got.ended {
                 return Err(Error::TimedOut);
             }
             if got.best.is_some() {
                 return Ok(got.best);
             }
-            let reach = lookup.reach(handle).await;
-            match verdict(reach, attempt, deadline.saturating_duration_since(Instant::now())) {
+            let finished = lookup.finish(handle).await;
+            let joined_poll = finished.no_more_recent > 0;
+            let time_left = deadline.saturating_duration_since(Instant::now());
+            match verdict(finished.reach, attempt, time_left, joined_poll) {
                 Verdict::NoRecord => return Ok(None),
                 Verdict::NoNetwork => return Err(Error::NoNetwork),
                 Verdict::Retry => {
-                    debug!(?reach, "nothing stored and few nodes answered: looking again before the put");
+                    debug!(reach = ?finished.reach, joined_poll, "nothing stored: looking again before the put");
                     *handle = self.refresh_if_empty(handle.clone(), deadline, used).await?;
                     attempt += 1;
                 }
@@ -880,7 +1016,7 @@ impl Inner {
         deadline: Instant,
     ) -> Option<MutableItem> {
         let mut lookup = Lookup::start(&handle.dht, key, salt, None);
-        collect(&mut lookup, deadline, None).await.best
+        collect(&mut lookup, deadline, None, None).await.best
     }
 
     // === seq numbers ===
@@ -890,24 +1026,38 @@ impl Inner {
         unix_now().max(last.map_or(i64::MIN, |last| last.saturating_add(1)))
     }
 
-    fn record_seq(&self, key: [u8; 32], salt: &[u8], seq: i64) {
+    /// Notes that `seq` is spent for this record (or seen stored). With the blob, it also notes which blob went under it.
+    fn record_seq(&self, key: [u8; 32], salt: &[u8], seq: i64, blob: Option<[u8; 32]>) {
         let mut state = self.lock();
         let entry = state.seqs.entry((key, salt.to_vec())).or_insert(SeqEntry { seq, at: 0 });
         entry.seq = entry.seq.max(seq);
         entry.at = unix_now();
-        state.seqs_dirty = true;
+        state.seqs_version += 1;
+        if let Some(digest) = blob {
+            let spent = state.spent.entry((key, salt.to_vec())).or_insert((seq, digest));
+            if seq >= spent.0 {
+                *spent = (seq, digest);
+            }
+        }
         if state.seqs.len() > MAX_SEQS {
             let oldest = state.seqs.iter().min_by_key(|(_, entry)| entry.at).map(|(key, _)| key.clone());
             if let Some(oldest) = oldest {
                 state.seqs.remove(&oldest);
+                state.spent.remove(&oldest);
             }
         }
     }
 
+    /// Whether this node already put another blob under this `seq`.
+    fn contradicts_spent(&self, key: &[u8; 32], salt: &[u8], seq: i64, digest: &[u8; 32]) -> bool {
+        let state = self.lock();
+        state.spent.get(&(*key, salt.to_vec())).is_some_and(|(spent, other)| *spent == seq && other != digest)
+    }
+
     // === the cache ===
 
-    /// A lookup is over, or soon is: its table is as full as it gets once the lookup has ended.
-    fn schedule_save(self: &Arc<Self>) {
+    /// A lookup is over, or soon is: the table of the node that ran it is as full as it gets once the lookup has ended.
+    fn schedule_save(self: &Arc<Self>, handle: Handle) {
         if self.config.cache_path.is_none() || self.save_scheduled.swap(true, Ordering::AcqRel) {
             return;
         }
@@ -915,50 +1065,75 @@ impl Inner {
         tokio::spawn(async move {
             sleep(SAVE_DELAY).await;
             inner.save_scheduled.store(false, Ordering::Release);
-            if let Err(e) = inner.save(false).await {
+            let saved = inner.run(move |inner, used| async move { inner.save(false, Some(handle), &used).await }).await;
+            if let Err(e) = saved {
                 warn!(error = %e, "could not save the DHT cache");
             }
         });
     }
 
-    /// Writes the table of the running node and the `seq` numbers. A table smaller than a quorum is not written over
-    /// a better one (a node that has just started, or has been idle, has almost nothing in it); the old nodes stay
-    /// and only the `seq` numbers are updated. `force` writes even if the file was written lately.
-    async fn save(self: &Arc<Self>, force: bool) -> Result<bool, Error> {
+    /// Writes the table of the node `from` (the running one when `None`) and the `seq` numbers. A table smaller than a
+    /// quorum is not written over a better one (a node that has just started, or has been idle, has almost nothing in
+    /// it); the old nodes stay and only the `seq` numbers are updated. `force` writes even if the file was written
+    /// lately. The file is read first, for the `seq` numbers other nodes put there since: the highest of each is kept.
+    async fn save(self: &Arc<Self>, force: bool, from: Option<Handle>, used: &AtomicU64) -> Result<bool, Error> {
         let Some(path) = self.config.cache_path.clone() else {
             return Ok(false);
         };
         let _saving = self.saving.lock().await;
-        let handle = self.lock().running.as_ref().map(|r| r.handle.clone());
+        let handle = from.or_else(|| self.stale_handle());
+        if let Some(handle) = &handle {
+            used.store(handle.generation, Ordering::Relaxed);
+        }
         let (table, quorum) = match &handle {
             Some(handle) => {
                 let table = handle.dht.to_bootstrap().await;
                 (table.iter().filter_map(|node| node.parse::<SocketAddrV4>().ok()).collect::<Vec<_>>(), handle.quorum)
             }
-            None => (Vec::new(), self.config.quorum.unwrap_or(QUORUM)),
+            None => (Vec::new(), self.warm_at()),
         };
-        let (bytes, nodes) = {
-            let state = self.lock();
-            let nodes = if table.len() >= quorum { spread(&table, MAX_SAVED_NODES) } else { state.saved.clone() };
+        let on_disk = {
+            let path = path.clone();
+            tokio::task::spawn_blocking(move || CacheFile::load(&path)).await.map_err(|_| Error::Stopped)?
+        };
+        let limit = unix_now().saturating_add(MAX_SEQ_AHEAD);
+        let (bytes, nodes, version) = {
+            let mut state = self.lock();
+            let good = table.len() >= quorum;
+            if state.cache_unreadable && !on_disk.readable && !good {
+                return Ok(false);
+            }
+            for (key, entry) in on_disk.cache.seqs {
+                if entry.seq <= limit {
+                    let ours = state.seqs.entry(key).or_insert(entry);
+                    if entry.seq > ours.seq {
+                        *ours = entry;
+                    }
+                }
+            }
+            let nodes = if good { spread(&table, MAX_SAVED_NODES) } else { state.saved.clone() };
             let bytes = CacheFile { nodes: nodes.clone(), seqs: state.seqs.clone() }.render();
             if state.written.as_deref() == Some(bytes.as_slice()) {
                 return Ok(false);
             }
             let lately = state.last_save.is_some_and(|saved| saved.elapsed() < SAVE_EVERY);
-            if !force && !state.seqs_dirty && lately {
+            if !force && state.seqs_version == state.seqs_saved && lately {
                 return Ok(false);
             }
-            (bytes, nodes)
+            (bytes, nodes, state.seqs_version)
         };
         let to_write = bytes.clone();
-        tokio::task::spawn_blocking(move || write_atomically(&path, &to_write))
+        let written = tokio::task::spawn_blocking(move || write_atomically(&path, &to_write))
             .await
-            .map_err(|_| Error::Stopped)?
-            .map_err(Error::Cache)?;
+            .map_err(|_| Error::Stopped)?;
         let mut state = self.lock();
-        state.written = Some(bytes);
         state.last_save = Some(Instant::now());
-        state.seqs_dirty = false;
+        if let Err(e) = written {
+            return Err(Error::Cache(e));
+        }
+        state.written = Some(bytes);
+        state.seqs_saved = version;
+        state.cache_unreadable = false;
         state.saved = nodes;
         Ok(true)
     }
@@ -970,6 +1145,8 @@ impl Inner {
 struct Lookup {
     items: mpsc::UnboundedReceiver<MutableItem>,
     outcome: oneshot::Receiver<GetMutableOutcome>,
+    /// The task that feeds the two above; dropped, it just runs to its end.
+    _task: tokio::task::JoinHandle<()>,
 }
 
 impl Lookup {
@@ -977,9 +1154,11 @@ impl Lookup {
         let GetMutableDetailed { items, outcome } = dht.get_mutable_detailed(key, salt, newer_than);
         let (item_tx, item_rx) = mpsc::unbounded_channel();
         let (outcome_tx, outcome_rx) = oneshot::channel();
-        // On a task of its own: the lookup goes on after the caller has what it came for (dropping the stream does
-        // not cancel it), and waiting for its outcome panics if the node dies meanwhile.
-        tokio::spawn(async move {
+        // The task keeps the node alive until the lookup ends: the lookup goes on after the caller has what it came for
+        // (dropping the stream does not cancel it), and if the node's last handle went first its thread would stop, and
+        // waiting for the outcome of a lookup it dropped panics inside `mainline`.
+        let keepalive = dht.clone();
+        let task = tokio::spawn(async move {
             let mut items = items;
             while let Some(item) = items.next().await {
                 if item_tx.send(item).is_err() {
@@ -987,9 +1166,12 @@ impl Lookup {
                 }
             }
             drop(item_tx);
-            let _ = outcome_tx.send(outcome.recv().await);
+            if !outcome_tx.is_closed() {
+                let _ = outcome_tx.send(outcome.recv().await);
+            }
+            drop(keepalive);
         });
-        Self { items: item_rx, outcome: outcome_rx }
+        Self { items: item_rx, outcome: outcome_rx, _task: task }
     }
 
     async fn next(&mut self) -> Option<MutableItem> {
@@ -997,12 +1179,23 @@ impl Lookup {
     }
 
     /// How much of the network a lookup that has ended heard from.
-    async fn reach(self, handle: &Handle) -> Reach {
+    async fn finish(self, handle: &Handle) -> Finished {
         match timeout(Duration::from_secs(1), self.outcome).await {
-            Ok(Ok(outcome)) => Reach::of(&outcome, handle.quorum),
-            _ => Reach::of_table(handle.dht.to_bootstrap().await.len(), handle.quorum),
+            Ok(Ok(outcome)) => {
+                Finished { reach: Reach::of(&outcome, handle.quorum), no_more_recent: outcome.no_more_recent }
+            }
+            _ => Finished {
+                reach: Reach::of_table(handle.dht.to_bootstrap().await.len(), handle.quorum),
+                no_more_recent: 0,
+            },
         }
     }
+}
+
+struct Finished {
+    reach: Reach,
+    /// How many nodes answered "nothing newer than what you have", which they say only to a lookup that asked for newer.
+    no_more_recent: u32,
 }
 
 /// What a lookup gave until it ended, or the deadline came, or (with `settle`) the window after its first record
@@ -1014,12 +1207,22 @@ struct Collected {
     ended: bool,
 }
 
-async fn collect(lookup: &mut Lookup, deadline: Instant, settle: Option<Duration>) -> Collected {
+/// Collects the records of a lookup. A record that is not newer than `newer_than` does not count: a lookup that joined
+/// one running for the same record is sent that one's records, whatever it asked.
+async fn collect(
+    lookup: &mut Lookup,
+    deadline: Instant,
+    settle: Option<Duration>,
+    newer_than: Option<i64>,
+) -> Collected {
     let mut best: Option<MutableItem> = None;
     let mut until = deadline;
     loop {
         match timeout_at(until, lookup.next()).await {
             Ok(Some(item)) => {
+                if newer_than.is_some_and(|newer_than| item.seq() <= newer_than) {
+                    continue;
+                }
                 if let (None, Some(settle)) = (&best, settle) {
                     until = until.min(after(settle));
                 }
@@ -1073,14 +1276,15 @@ enum Verdict {
 }
 
 /// What a lookup that found nothing means. One more try on the same node, if there is time for it, unless the lookup
-/// heard from a healthy number of nodes: then nothing is stored.
-fn verdict(reach: Reach, attempt: u32, time_left: Duration) -> Verdict {
+/// heard from a healthy number of nodes: then nothing is stored. A lookup that only joined a poll for newer records
+/// (`joined_poll`) heard nothing about the record itself, however many nodes answered.
+fn verdict(reach: Reach, attempt: u32, time_left: Duration, joined_poll: bool) -> Verdict {
     let can_retry = attempt == 0 && time_left >= MIN_RETRY;
     match reach {
-        Reach::Healthy => Verdict::NoRecord,
+        Reach::Healthy if !(joined_poll && can_retry) => Verdict::NoRecord,
         _ if can_retry => Verdict::Retry,
         Reach::Dead => Verdict::NoNetwork,
-        Reach::Thin => Verdict::NoRecord,
+        Reach::Thin | Reach::Healthy => Verdict::NoRecord,
     }
 }
 
@@ -1123,11 +1327,25 @@ const MAX_CACHED_NODES: usize = 64;
 /// ```
 ///
 /// Lines it does not know are skipped, so a later version can add some; a file with another first line, or one that
-/// cannot be read, is an empty cache.
+/// is not text, is an empty cache.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct CacheFile {
     nodes: Vec<SocketAddrV4>,
     seqs: HashMap<SeqKey, SeqEntry>,
+}
+
+/// A cache file as it was found.
+struct Loaded {
+    cache: CacheFile,
+    /// `false` when the file is there but could not be read (a sharing violation, say), which is not the same as
+    /// missing or foreign: what is in it may be worth more than what is about to replace it.
+    readable: bool,
+}
+
+impl Default for Loaded {
+    fn default() -> Self {
+        Self { cache: CacheFile::default(), readable: true }
+    }
 }
 
 impl CacheFile {
@@ -1176,19 +1394,22 @@ impl CacheFile {
         cache
     }
 
-    fn load(path: &Path) -> Self {
+    fn load(path: &Path) -> Loaded {
         let mut text = String::new();
         let read = fs::File::open(path).and_then(|file| file.take(MAX_CACHE_BYTES + 1).read_to_string(&mut text));
         match read {
-            Ok(len) if len as u64 <= MAX_CACHE_BYTES => Self::parse(&text),
+            Ok(len) if len as u64 <= MAX_CACHE_BYTES => Loaded { cache: Self::parse(&text), readable: true },
             Ok(_) => {
                 warn!(path = %path.display(), "the DHT cache is too big to be ours: ignored");
-                Self::default()
+                Loaded::default()
             }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Self::default(),
+            // Not text: not ours.
+            Err(e) if e.kind() == io::ErrorKind::NotFound || e.kind() == io::ErrorKind::InvalidData => {
+                Loaded::default()
+            }
             Err(e) => {
                 warn!(path = %path.display(), error = %e, "cannot read the DHT cache: ignored");
-                Self::default()
+                Loaded { cache: Self::default(), readable: false }
             }
         }
     }
@@ -1205,12 +1426,14 @@ fn parse_seq(words: &mut std::str::SplitWhitespace<'_>) -> Option<(SeqKey, SeqEn
     Some(((key, salt), SeqEntry { seq, at }))
 }
 
-/// Through a temporary file and a rename, so that a crash never leaves half a cache behind.
+/// Through a temporary file and a rename, so that a crash never leaves half a cache behind. The temporary file is
+/// this call's own: two nodes of one process, or two processes, writing the same cache do not share it.
 fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
     if let Some(dir) = path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
         fs::create_dir_all(dir)?;
     }
-    let tmp = path.with_extension("tmp");
+    let tmp = path.with_extension(format!("tmp{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
     let written = fs::File::create(&tmp)
         .and_then(|mut file| file.write_all(bytes).and_then(|()| file.sync_all()))
         .and_then(|()| fs::rename(&tmp, path));
@@ -1237,6 +1460,24 @@ fn check_salt(salt: &[u8]) -> Result<(), Error> {
 fn after(span: Duration) -> Instant {
     let now = Instant::now();
     now.checked_add(span).unwrap_or_else(|| now + Duration::from_secs(24 * 60 * 60))
+}
+
+fn digest_of(blob: &[u8]) -> [u8; 32] {
+    ring::digest::digest(&ring::digest::SHA256, blob).as_ref().try_into().unwrap_or([0; 32])
+}
+
+/// The addresses a name resolves to, as the system says; IPv4 only, since the DHT is.
+fn system_resolver(name: &str) -> Vec<SocketAddrV4> {
+    name.to_socket_addrs()
+        .map(|addresses| {
+            addresses
+                .filter_map(|address| match address {
+                    SocketAddr::V4(address) => Some(address),
+                    SocketAddr::V6(_) => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn unix_now() -> i64 {
@@ -1625,16 +1866,24 @@ mod tests {
     async fn too_few_acknowledgements_is_refused_after_a_second_try() {
         // Eight nodes are needed and only three of them are there.
         let net = testnet(3);
+        let dir = Scratch::new();
         let mut config = config(&net, Mode::Host);
         config.quorum = Some(8);
+        config.cache_path = Some(dir.file("cache.txt"));
         let host = Node::open_with(config).await;
         let signer = key(12);
         let ahead = unix_now() + 100;
 
         let err = host.publish(&signer, SALT, b"kept by three", ahead).await.unwrap_err();
         assert!(matches!(err, Error::Refused { acknowledged } if (1..=3).contains(&acknowledged)), "{err:?}");
-        // Its seq is spent all the same: some nodes have it, and another blob under it would be ignored there.
+        // Its seq is spent all the same: some nodes have it, and another blob under it would be ignored there. A process
+        // that ends now must remember that.
         assert_eq!(host.next_seq(&signer, SALT), ahead + 1);
+        let saved = fs::read_to_string(dir.file("cache.txt")).unwrap();
+        assert!(saved.contains(&format!("seq {} {} {ahead} ", to_hex(&signer.public_key()), to_hex(SALT))), "{saved}");
+        // And what was put under it cannot be replaced by another blob, even by a node that cannot ask.
+        let err = host.publish(&signer, SALT, b"another blob", ahead).await.unwrap_err();
+        assert!(matches!(err, Error::SeqTooLow { .. }), "{err:?}");
     }
 
     // === no network, and coming back from it ===
@@ -1825,7 +2074,8 @@ mod tests {
         config.port = Some(taken.local_addr().unwrap().port());
         let node = Node::open_with(config).await;
         let err = node.resolve(&key(26).public_key(), SALT).await.unwrap_err();
-        assert!(matches!(err, Error::Socket(_)), "{err:?}");
+        // `Dht::new` panics when its thread fails to start before the first message reaches it, which is `Stopped` here.
+        assert!(matches!(err, Error::Socket(_) | Error::Stopped), "{err:?}");
     }
 
     #[tokio::test]
@@ -1911,7 +2161,7 @@ mod tests {
         assert_eq!(fs::read(dir.file("cache.txt")).unwrap(), cache.render());
 
         // A new seq is written, with the old nodes.
-        node.inner.record_seq([9; 32], b"s", 6);
+        node.inner.record_seq([9; 32], b"s", 6, None);
         assert!(node.save_cache().await.unwrap());
         let after = CacheFile::parse(&fs::read_to_string(dir.file("cache.txt")).unwrap());
         assert_eq!(after.nodes, cache.nodes);
@@ -2041,7 +2291,7 @@ mod tests {
     fn fabricated() -> (mpsc::UnboundedSender<MutableItem>, Lookup) {
         let (tx, items) = mpsc::unbounded_channel();
         let (_, outcome) = oneshot::channel();
-        (tx, Lookup { items, outcome })
+        (tx, Lookup { items, outcome, _task: tokio::spawn(async {}) })
     }
 
     #[tokio::test]
@@ -2051,7 +2301,7 @@ mod tests {
             tx.send(item(seq)).unwrap();
         }
         drop(tx);
-        let got = collect(&mut lookup, after(Duration::from_secs(5)), Some(Duration::from_secs(1))).await;
+        let got = collect(&mut lookup, after(Duration::from_secs(5)), Some(Duration::from_secs(1)), None).await;
         assert_eq!(got.best.map(|i| i.seq()), Some(9));
         assert!(got.ended);
     }
@@ -2065,7 +2315,7 @@ mod tests {
             let _ = tx.send(item(99));
         });
         let started = Instant::now();
-        let got = collect(&mut lookup, after(Duration::from_secs(5)), Some(Duration::from_millis(100))).await;
+        let got = collect(&mut lookup, after(Duration::from_secs(5)), Some(Duration::from_millis(100)), None).await;
         assert_eq!(got.best.map(|i| i.seq()), Some(5));
         assert!(!got.ended);
         assert!(started.elapsed() < Duration::from_millis(500), "{:?}", started.elapsed());
@@ -2081,7 +2331,7 @@ mod tests {
             tx.send(item(8)).unwrap();
             sleep(Duration::from_millis(100)).await;
         });
-        let got = collect(&mut lookup, after(Duration::from_secs(5)), None).await;
+        let got = collect(&mut lookup, after(Duration::from_secs(5)), None, None).await;
         later.await.unwrap();
         assert_eq!(got.best.map(|i| i.seq()), Some(8));
         assert!(got.ended);
@@ -2091,11 +2341,11 @@ mod tests {
     async fn a_lookup_that_ends_empty_or_runs_out_of_time_says_which() {
         let (tx, mut lookup) = fabricated();
         drop(tx);
-        let got = collect(&mut lookup, after(Duration::from_secs(5)), None).await;
+        let got = collect(&mut lookup, after(Duration::from_secs(5)), None, None).await;
         assert!(got.best.is_none() && got.ended);
 
         let (_tx, mut lookup) = fabricated();
-        let got = collect(&mut lookup, after(Duration::from_millis(100)), None).await;
+        let got = collect(&mut lookup, after(Duration::from_millis(100)), None, None).await;
         assert!(got.best.is_none() && !got.ended);
     }
 
@@ -2112,13 +2362,17 @@ mod tests {
         assert_eq!(Reach::of_table(8, 8), Reach::Healthy);
 
         let (plenty, little) = (Duration::from_secs(4), Duration::from_millis(200));
-        assert_eq!(verdict(Reach::Healthy, 0, plenty), Verdict::NoRecord);
-        assert_eq!(verdict(Reach::Thin, 0, plenty), Verdict::Retry);
-        assert_eq!(verdict(Reach::Dead, 0, plenty), Verdict::Retry);
-        assert_eq!(verdict(Reach::Thin, 1, plenty), Verdict::NoRecord, "only one more try");
-        assert_eq!(verdict(Reach::Dead, 1, plenty), Verdict::NoNetwork);
-        assert_eq!(verdict(Reach::Dead, 0, little), Verdict::NoNetwork, "no time for another");
-        assert_eq!(verdict(Reach::Thin, 0, little), Verdict::NoRecord);
+        assert_eq!(verdict(Reach::Healthy, 0, plenty, false), Verdict::NoRecord);
+        assert_eq!(verdict(Reach::Thin, 0, plenty, false), Verdict::Retry);
+        assert_eq!(verdict(Reach::Dead, 0, plenty, false), Verdict::Retry);
+        assert_eq!(verdict(Reach::Thin, 1, plenty, false), Verdict::NoRecord, "only one more try");
+        assert_eq!(verdict(Reach::Dead, 1, plenty, false), Verdict::NoNetwork);
+        assert_eq!(verdict(Reach::Dead, 0, little, false), Verdict::NoNetwork, "no time for another");
+        assert_eq!(verdict(Reach::Thin, 0, little, false), Verdict::NoRecord);
+        // A lookup that joined a poll heard "nothing newer" and nothing about the record: once more, if there is time.
+        assert_eq!(verdict(Reach::Healthy, 0, plenty, true), Verdict::Retry);
+        assert_eq!(verdict(Reach::Healthy, 1, plenty, true), Verdict::NoRecord);
+        assert_eq!(verdict(Reach::Healthy, 0, little, true), Verdict::NoRecord);
     }
 
     #[test]
@@ -2155,6 +2409,254 @@ mod tests {
         assert!(answers_a_ping(ServerSettings::default()).await);
         // And with the filter the nodes are given, it does not.
         assert!(!answers_a_ping(Silent::settings()).await);
+    }
+
+    // === what `mainline` does with lookups, names and settings ===
+
+    #[tokio::test]
+    async fn a_lookup_that_joins_a_running_one_still_gets_what_it_asked_for() {
+        let net = testnet(3);
+        let mut host_config = config(&net, Mode::Host);
+        host_config.settle = Duration::from_millis(200);
+        let host = Node::open_with(host_config).await;
+        let signer = key(27);
+        let public = signer.public_key();
+        let seq = host.next_seq(&signer, SALT);
+        stored(&host, &signer, SALT, b"the record", seq, 2).await;
+
+        // A resolve returns at the record while its lookup goes on. `mainline` joins the next lookup of the same record
+        // to it, sends it what the first found, and keeps the first one's question.
+        let first = ResolveOptions { newer_than: Some(seq - 1), deadline: None };
+        assert_eq!(found_with(&host, &public, SALT, &first, |_| true).await.seq, seq);
+        let poll = ResolveOptions { newer_than: Some(seq), deadline: None };
+        assert_eq!(host.resolve_with(&public, SALT, &poll).await.unwrap(), None, "nothing newer than the one it has");
+    }
+
+    #[tokio::test]
+    async fn a_resolve_that_joins_a_poll_looks_again() {
+        let net = testnet(3);
+        let host = Node::open_with(config(&net, Mode::Host)).await;
+        let signer = key(28);
+        let public = signer.public_key();
+        let seq = host.next_seq(&signer, SALT);
+        stored(&host, &signer, SALT, b"there", seq, 2).await;
+
+        // A poll for something newer than the record: every node answers "nothing newer", and the lookup runs a while.
+        let poller = host.clone();
+        let poll = tokio::spawn(async move {
+            poller.resolve_with(&public, SALT, &ResolveOptions { newer_than: Some(seq), deadline: None }).await
+        });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        // A resolve of the same record joins that lookup. Every node it hears from says "nothing newer", and that is
+        // not "there is no record".
+        let resolved = host.resolve(&public, SALT).await.unwrap().expect("the record");
+        assert_eq!(resolved.seq, seq);
+        assert_eq!(poll.await.unwrap().unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn an_idle_node_that_cannot_be_built_again_is_kept() {
+        let net = testnet(3);
+        let port = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap().local_addr().unwrap().port();
+        let mut host_config = config(&net, Mode::Host);
+        host_config.port = Some(port);
+        host_config.recycle_after = Some(Duration::from_millis(5));
+        let host = Node::open_with(host_config).await;
+        assert_eq!(generation(&host), 1);
+
+        for _ in 0..2 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            // The node that is there holds the fixed port, so a new one cannot be made: this one does the job.
+            assert_eq!(host.resolve(&key(29).public_key(), SALT).await.unwrap(), None);
+        }
+        assert_eq!(generation(&host), 1);
+    }
+
+    #[tokio::test]
+    async fn a_lookup_outlives_the_handle_it_was_started_from_without_a_panic() {
+        let net = testnet(3);
+        let dht =
+            Dht::builder().bootstrap(&net.bootstrap).bind_address(Ipv4Addr::LOCALHOST).build().unwrap().as_async();
+        let lookup = Lookup::start(&dht, &key(30).public_key(), Some(SALT), None);
+        // The caller is done with the node: without the task keeping it alive, its thread stops with the lookup in
+        // flight and the wait for the outcome panics inside `mainline`.
+        drop(dht);
+        let Lookup { items, outcome, _task } = lookup;
+        _task.await.expect("the task of the lookup ends quietly");
+        drop(items);
+        assert!(outcome.await.is_ok(), "the outcome of the lookup arrived");
+    }
+
+    #[tokio::test]
+    async fn a_slow_default_name_costs_the_others_nothing() {
+        let inner = Inner::new(Config::new(Mode::Client));
+        let (fast, slow) = (
+            SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 1), 6881),
+            SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 2), 6881),
+        );
+        let names = ["fast.example", "slow.example", "gone.example"];
+
+        let started = std::time::Instant::now();
+        let first = inner
+            .resolve_defaults(&names, Duration::from_millis(300), move |name: &str| match name {
+                "fast.example" => vec![fast],
+                "slow.example" => {
+                    std::thread::sleep(Duration::from_millis(1500));
+                    vec![slow]
+                }
+                _ => Vec::new(),
+            })
+            .await;
+        assert_eq!(first, vec![fast], "the one that answered in time");
+        assert!(started.elapsed() < Duration::from_secs(1), "{:?}", started.elapsed());
+
+        // Next time the slow one answers and the fast one does not: it keeps the address it had.
+        let second = inner
+            .resolve_defaults(&names, Duration::from_millis(300), move |name: &str| match name {
+                "slow.example" => vec![slow],
+                _ => Vec::new(),
+            })
+            .await;
+        assert_eq!(second, vec![fast, slow]);
+    }
+
+    #[tokio::test]
+    async fn a_publish_that_waits_for_the_one_before_it_gives_up_at_its_deadline() {
+        let net = testnet(3);
+        let mut host_config = config(&net, Mode::Host);
+        host_config.publish_deadline = Duration::from_millis(500);
+        let host = Node::open_with(host_config).await;
+        let _the_one_before = host.inner.publishing.lock().await;
+
+        let started = std::time::Instant::now();
+        let signer = key(31);
+        let waiting = tokio::time::timeout(Duration::from_secs(10), host.publish(&signer, SALT, b"waiting", 1000));
+        let err = waiting.await.expect("the publish gives up by itself").unwrap_err();
+        assert!(matches!(err, Error::TimedOut), "{err:?}");
+        assert!(started.elapsed() < Duration::from_secs(3), "{:?}", started.elapsed());
+    }
+
+    #[tokio::test]
+    async fn another_blob_under_a_spent_seq_is_refused_without_asking_the_network() {
+        let mut offline = Config::new(Mode::Host);
+        offline.default_nodes = DefaultNodes::fixed(Vec::new());
+        let node = Node::open_with(offline).await;
+        let signer = key(32);
+        node.inner.record_seq(signer.public_key(), SALT, 1000, Some(digest_of(b"first")));
+
+        let err = node.publish(&signer, SALT, b"second", 1000).await.unwrap_err();
+        assert!(matches!(err, Error::SeqTooLow { seq: 1000, seen: 1000 }), "{err:?}");
+        // The same blob again is no conflict, and neither is a higher seq: both go on to the network, which is not there.
+        let err = node.publish(&signer, SALT, b"first", 1000).await.unwrap_err();
+        assert!(matches!(err, Error::NoNetwork), "{err:?}");
+        let err = node.publish(&signer, SALT, b"second", 1001).await.unwrap_err();
+        assert!(matches!(err, Error::NoNetwork), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn two_nodes_on_one_cache_keep_each_others_seq_numbers() {
+        let dir = Scratch::new();
+        let make = || {
+            let mut config = Config::new(Mode::Client);
+            config.default_nodes = DefaultNodes::fixed(Vec::new());
+            config.cache_path = Some(dir.file("shared.txt"));
+            config
+        };
+        let (a, b) = (Node::open_with(make()).await, Node::open_with(make()).await);
+
+        a.inner.record_seq([1; 32], b"s", 100, None);
+        assert!(a.save_cache().await.unwrap());
+        b.inner.record_seq([2; 32], b"s", 200, None);
+        b.inner.record_seq([1; 32], b"s", 50, None);
+        assert!(b.save_cache().await.unwrap());
+
+        let text = fs::read_to_string(dir.file("shared.txt")).unwrap();
+        let cache = CacheFile::parse(&text).seqs;
+        assert_eq!(cache.get(&([1; 32], b"s".to_vec())).map(|e| e.seq), Some(100), "the higher one stays: {text}");
+        assert_eq!(cache.get(&([2; 32], b"s".to_vec())).map(|e| e.seq), Some(200), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_cache_that_cannot_be_read_is_not_written_over_from_a_small_table() {
+        let dir = Scratch::new();
+        // A directory where the file should be: reading it fails on every system, and it is not an empty file.
+        fs::create_dir(dir.file("cache.txt")).unwrap();
+        let mut config = Config::new(Mode::Host);
+        config.default_nodes = DefaultNodes::fixed(Vec::new());
+        config.cache_path = Some(dir.file("cache.txt"));
+        let node = Node::open_with(config).await;
+        node.inner.record_seq([3; 32], b"s", 7, None);
+        assert!(!node.save_cache().await.unwrap(), "nothing to put over what could not be read");
+    }
+
+    #[test]
+    fn a_cache_file_is_missing_foreign_or_unreadable() {
+        let dir = Scratch::new();
+        assert!(CacheFile::load(&dir.file("missing.txt")).readable);
+        fs::write(dir.file("binary"), [0xff, 0xfe, 0x00]).unwrap();
+        let foreign = CacheFile::load(&dir.file("binary"));
+        assert!(foreign.readable && foreign.cache == CacheFile::default());
+        fs::create_dir(dir.file("dir")).unwrap();
+        assert!(!CacheFile::load(&dir.file("dir")).readable);
+    }
+
+    #[test]
+    fn the_temporary_file_of_a_cache_write_is_the_calls_own() {
+        let dir = Scratch::new();
+        let path = dir.file("cache.txt");
+        write_atomically(&path, b"one").unwrap();
+        write_atomically(&path, b"two").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"two");
+        let left: Vec<_> = fs::read_dir(&dir.0).unwrap().map(|entry| entry.unwrap().file_name()).collect();
+        assert_eq!(left, vec![std::ffi::OsString::from("cache.txt")], "no temporary file is left behind");
+    }
+
+    #[test]
+    fn how_many_is_enough_depends_on_the_network_and_not_on_the_names_that_answered() {
+        let public = Inner::new(Config::new(Mode::Host));
+        assert_eq!(public.quorum_for(2), 8, "two names answered, the network is still the public one");
+        assert_eq!(public.quorum_for(30), 8);
+        let mut own = Config::new(Mode::Host);
+        own.default_nodes = DefaultNodes::fixed(Vec::new());
+        let own = Inner::new(own);
+        assert_eq!(own.quorum_for(3), 3, "a network of our own is as big as its list");
+        assert_eq!(own.quorum_for(30), 8);
+        assert_eq!(own.quorum_for(0), 1);
+        let mut set = Config::new(Mode::Host);
+        set.quorum = Some(0);
+        let set = Inner::new(set);
+        assert_eq!((set.quorum_for(20), set.warm_at()), (1, 1), "never zero");
+    }
+
+    #[tokio::test]
+    async fn settings_that_would_break_mainline_are_held_back() {
+        let net = testnet(3);
+        let mut silly = config(&net, Mode::Client);
+        silly.request_timeout = Some(Duration::MAX);
+        silly.quorum = Some(0);
+        silly.resolve_deadline = Duration::from_secs(2);
+        let node = Node::open_with(silly).await;
+
+        // A timeout longer than the uptime makes `mainline` panic on its thread, which would be `Stopped` here.
+        assert_eq!(node.resolve(&key(33).public_key(), SALT).await.unwrap(), None);
+        assert_eq!(node.inner.stale_handle().map(|handle| handle.quorum), Some(1));
+    }
+
+    #[tokio::test]
+    async fn records_not_newer_than_the_poll_do_not_count() {
+        let (tx, mut lookup) = fabricated();
+        for seq in [5, 9, 7] {
+            tx.send(item(seq)).unwrap();
+        }
+        drop(tx);
+        let got = collect(&mut lookup, after(Duration::from_secs(5)), None, Some(7)).await;
+        assert_eq!(got.best.map(|i| i.seq()), Some(9));
+
+        let (tx, mut lookup) = fabricated();
+        tx.send(item(7)).unwrap();
+        drop(tx);
+        let got = collect(&mut lookup, after(Duration::from_secs(5)), None, Some(7)).await;
+        assert!(got.best.is_none() && got.ended);
     }
 
     // === the real DHT ===

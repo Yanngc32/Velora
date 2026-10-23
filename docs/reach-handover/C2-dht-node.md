@@ -4,8 +4,12 @@ Branch `claude/reach-c2-dht-node-f27e6c` (from 35081ec). Files: `crates/dht/src/
 dependency the coordinator allowed: `futures-lite = { version = "2", default-features = false }` in
 `crates/dht/Cargo.toml` (mainline's `get_mutable` stream implements only that crate's `Stream` and has no method of
 its own) with the matching line in `Cargo.lock` (only the name in the `velora-dht` entry). fmt, clippy `-D warnings` and
-`cargo test -p velora-dht` green on Windows (84 tests, 1 `#[ignore]` against the public DHT); Linux not compiled here.
+`cargo test -p velora-dht` green on Windows (98 tests, 1 `#[ignore]` against the public DHT); Linux not compiled here.
 `node.rs` carries `#![cfg_attr(not(test), deny(clippy::unwrap_used, expect_used, indexing_slicing, panic))]` like `seal.rs`.
+An independent read of the module (a fresh agent, read-only, no conclusions given) found ten defects; each was checked
+against `mainline`'s source and fixed, with a test that fails when the defect is put back (the lookups that `mainline`
+joins, the quorum on the public network, a fixed port, panics in detached tasks, DNS names resolved all or nothing,
+deadlines, the cache file, a second blob under a spent `seq`).
 
 ## API
 
@@ -35,27 +39,37 @@ enum Error { NoNetwork, TooBig { len }, SaltTooBig { len }, Refused { acknowledg
 ## What it does
 
 - **Start.** The bootstrap list is up to 16 saved nodes (spread over the table, not the first 16) and then the default
-  names, resolved here with a limit (300 ms with saved nodes, 2 s without; the last good answer is the fallback). Never
+  names, resolved here, each on a thread of its own, with a limit (300 ms with saved nodes, 2 s without, never past the
+  call's deadline): the names that answer in time are used, one that does not keeps the last answer it gave. Never
   `extra_bootstrap`. A list that ends up empty is `NoNetwork` and builds nothing (mainline never refills it), so a node
   that started with no network is built on the next call. No saved nodes: the first call waits up to 1.5 s for 8 nodes in
   the table (a lookup from the four names alone sometimes hears from none). Saved nodes: nothing is waited for.
 - **Resolve.** First record from the `get_mutable` stream, plus any with a higher `seq` within `settle`; the lookup keeps
   going in the background. A lookup that found nothing and heard from fewer than a quorum is repeated once on the same
   node if a second is left; nothing and nobody answering is `NoNetwork`; out of time with nodes in the table is `Ok(None)`.
+  `mainline` joins a lookup to one that is already running for the same record and keeps the first one's question, so
+  a record that is not newer than `newer_than` is dropped here, and a lookup that heard only a poll's "nothing newer" is
+  repeated once instead of being taken for "no record".
 - **Publish.** Reads first (a whole lookup, which also leaves the nodes and tokens the put goes to): a stored record with a
-  higher `seq`, or the same one and another value, is `SeqTooLow` before anything is sent. Then the put; fewer than a
-  quorum of acknowledgements means a second round (new lookup, new put), then `Refused`. The `seq` counts as spent from the
-  put on, even if it fails. One publish at a time per node.
+  higher `seq`, or the same one and another value, is `SeqTooLow` before anything is sent, and so is another blob under a
+  `seq` this node already put one under (checked first, without asking). Then the put; fewer than a quorum of
+  acknowledgements means a second round (new lookup, new put), then `Refused`. The `seq` counts as spent from the put on,
+  even if it fails, and is saved to the cache even then. One publish at a time per node; waiting for the one before ends
+  at the call's deadline.
 - **Cache.** Text file (`velora-dht-cache 1`, `node ip:port` lines, `seq <key> <salt> <seq> <time>` lines), written
-  atomically right after a publish and 3 s after a resolve (when its lookup has ended; at most every 5 minutes), never
-  from a table smaller than a quorum (the old nodes stay, only the `seq` lines change). A file that is not ours, too big or
-  unreadable is an empty cache; a saved `seq` more than 7 days ahead of the clock is dropped.
+  atomically (a temporary file of its own per write) right after a publish and 3 s after a resolve (when its lookup has
+  ended; at most every 5 minutes), never from a table smaller than a quorum (the old nodes stay, only the `seq` lines
+  change). The file is read first at every save and the highest `seq` of each key kept, so two nodes on one file keep
+  each other's. A file that is not ours or too big is an empty cache; one that is there but cannot be read (a sharing
+  violation) is not written over from a small table; a saved `seq` more than 7 days ahead of the clock is dropped.
 - **Host mode** replaces a node left alone for 10 minutes before the next use (its table rotted in 15; a night asleep counts,
-  the clock is the wall clock). `Client` never does.
+  the clock is the wall clock). `Client` never does. If a new node cannot be made (a fixed `port` that the old one still
+  holds), the idle one is kept. Without a fixed port the new node takes 6881 or any free port, so the DHT port changes.
 - **Never serves.** `mainline` cannot be told to stay a client (it becomes a server after 15 minutes if it thinks it is
   reachable), so every node gets a request filter that answers nobody (tested with a node forced into server mode).
-- **Panics.** Every call runs on its own task: `mainline` panics when its thread is gone, and that becomes
-  `Error::Stopped` and a node built again on the next call.
+- **Panics.** Every call, and the cache save a resolve schedules, runs on its own task: `mainline` panics when its thread
+  is gone, and that becomes `Error::Stopped` and a node built again on the next call. The task that carries a lookup
+  keeps its node alive until the lookup ends, so dropping the `Node` mid-lookup does not make `mainline` panic.
 
 ## Measured on the public DHT (the `#[ignore]` test, run twice by hand, 23 Oct 2026, one home line)
 
@@ -81,8 +95,9 @@ were refused as `SeqTooLow` by the read, and a client read the newer record afte
 2. **`SeqTooLow` is returned, not mended inside.** The brief said to publish `seen + 1` on `NotMostRecent`. `seal` binds the
    `seq` in the AAD of the blob, so a blob cannot be sent under another `seq`: only the caller can seal again.
    `publish_with` does that (up to twice); E3 should use it.
-3. **One quorum number:** `min(8, size of the start list)`, for the table before a cold lookup, the answers that make a
-   lookup trustworthy and the acknowledgements a put needs (S0's "8"). `Config::quorum` overrides it; the tests use 1.
+3. **One quorum number:** 8 on the public network (S0's "8"), for the table before a cold lookup, the answers that make a
+   lookup trustworthy and the acknowledgements a put needs; with `default_nodes` of your own, the size of the start list
+   when that is smaller. `Config::quorum` overrides it (never below 1); the tests use 1.
 4. `resolve` returns a struct, not a tuple; `Ok(None)` also covers "out of time with nodes in the table".
 5. `Mode` only changes `recycle_after`. Both modes serve nobody (decision above), which makes `client_mode` enforced and
    not best effort. If a host should ever serve the DHT, change `Silent`.
