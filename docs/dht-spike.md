@@ -15,7 +15,7 @@ Times are medians with the range in brackets. Where a cell says "pending", §11 
 | 2 | What do `public_address()` and `firewalled()` report? Is the observed port the bound one? | `public_address()` is the carrier's public IPv4 and **the port the node bound**: this line (a home router behind CGNAT) keeps the source port, for every port tried, and the mapping is endpoint-independent (§3.2). Behind a second NAT (WSL2) the port is rewritten (6881 became 64773) but stays endpoint-independent. `firewalled()` stays `true` and the node stays a client. |
 | 3 | `put_mutable` / `get_mutable_most_recent`: latency, success rate, 1000 and 1001 bytes, republishing, seq | **Resolve**: first value after 0.54 s warm start (0.10-0.77), 1.17 s cold (0.68-1.68); the stream ends at 2.6-3.9 s; 12 of 46 cold resolves started seconds apart came back empty (the same lookup repeated on the node always worked), 0 of 20 from a saved table. **Publish**: 2.1 s for the host's real pattern (same key, higher seq) up to 5.8 s for a new key from a cold node; 20 of 20 `Ok`. **Limit: 996 bytes**, not 1000: 997-1001 were refused by every node, and the library reports it as `Timeout`. Higher seq replaces the value; lower seq is `NotMostRecent`; **an equal seq is acknowledged and ignored** (§4). |
 | 4 | Resolve from a second node | Second process on this PC: found. A static Linux build behind WSL2's extra NAT layer: found. Both 2 of 3 tries (the third was an empty cold start). Another network: **pending: needs another network** (§5). |
-| 5 | How long does a published item live? | Still found at every one of 8 checks, the last 60 minutes after a single publish (7 of 36 asked nodes for a node that had been running since before the publish, 16 of 134 for a new one). The rows for 120, 180 minutes are **pending** while the watcher runs (§6). |
+| 5 | How long does a published item live? | **At least 4.5 hours.** Both readers found the exact value at every one of 20 checks, the last 270 minutes after a single publish (8 of 30 asked nodes for the node that had run since before the publish, 14 of 143 for a new one); the watcher was stopped then, with the item still there. The plan assumed about two hours, so the 30-minute republish has a wide margin (§6). |
 | 6 | Is `mainline::Testnet` usable for C2's integration tests? | Yes: `Testnet::builder(n)` plus two `Dht` on 127.0.0.1; put from one, get from the other. Set `request_timeout(300 ms)`: 0.4 s per operation instead of 2.1 s (§7). |
 | 7 | Cost of a running client node | Idle: 0.085% of one core (609 ms of CPU in 12 minutes), 9 MB, 20 wakeups a second, about 50 datagrams a minute while the table is full. A lookup from a fresh node is about 500 datagrams in 3 s, a repeat from a running node about 110, a publish from a fresh node about 1,000 (§8). |
 | 8 | Anything surprising? | Yes, 13 items (§9). The ones that change the plan: a **log flood on Windows** (17 warnings a second per idle node), the **996-byte limit**, **equal seq ignored**, `extra_bootstrap` **drops the default nodes**, the blocking API is **deprecated**, the routing table **rots in 15-20 minutes**, DNS is resolved **once**. |
@@ -34,7 +34,7 @@ router and not through a VPN.
 **The program.** `velora-spike`, throwaway, outside the repository (§12): Rust on `mainline = "=8.0.1"` with the async API,
 one mode per question. It counts the datagrams the library sends and receives by listening to its TRACE events
 (`mainline::rpc::socket`), reads the BEP 42 `ip` field of the replies the same way, and uses a new Ed25519 key and random
-bytes for every run: nothing but random test records was published, and nothing was left running except the lifetime watcher.
+bytes for every run: nothing but random test records was published, and nothing was left running except the lifetime watcher, which was stopped after 4.5 hours.
 
 **Terms.**
 
@@ -84,7 +84,7 @@ thread. Polled every 50 ms (cold: 6 runs of 30 s; each warm variant: 4 runs of 1
   nodes that are probably inside the ISP's own network, which fits a line behind CGNAT: the carrier does not translate what
   stays inside it. The majority vote ignores them; B2, which reads the same field from
   its own pings, has to vote and to drop non-public answers too.
-- `firewalled()` stayed `true` and `server_mode()` stayed `false` in every run, including a node that ran for over an hour. The
+- `firewalled()` stayed `true` and `server_mode()` stayed `false` in every run, including the reader of the lifetime run, which ran for 4.5 hours. The
   library clears the flag only when a ping it sends to its own public address comes back, and that never happened here: the
   carrier NAT or the router does not loop the packet back (no hairpin), or Windows Firewall drops it (no inbound rule exists for the
   program).
@@ -98,7 +98,8 @@ after 5 and 10 minutes (each check is a lookup that refreshes the nodes it touch
 and its traffic fell from about 25 datagrams a minute to about 1. The cause is in the library: a node counts as stale 15
 minutes after the last *query response* from it, the maintenance ping every 5 minutes does not refresh it (its reply matches
 no query, so `handle_response` does not re-add the node), and `to_bootstrap()` leaves stale nodes out. Lookups keep working
-with a nearly empty table because every query starts from the bootstrap list while the table is smaller than that list.
+with a nearly empty table because every query starts from the bootstrap list while the table is smaller than that list. For the
+next four hours the reader held between 0 and 27 nodes at each check.
 
 Consequence for the saved cache: take it right after a lookup or a publish, not at shutdown, and never replace a good cache
 with a small one.
@@ -174,6 +175,7 @@ on the same node, which asks the same 8 addresses again, found the item every ti
 | Publish, `put/cold` | 6 s | 20 | 2 (not found again; the lowest `stored_at` was 1) |
 | Publish, `sizecmp`, sizes 100, 600, 996 bytes in turn | 8 s | 15 | 6 |
 | Publish, `sizecmp`, sizes 996, 600, 100 bytes in turn (partly alongside another test) | 8 s | 15 | 2 |
+| Resolve, `coldretry` slowed down | 60 s | 8 | 2 of 8 |
 | From a saved table: resolves / publishes | 6-8 s | 20 / 22 | 0 / 0 |
 
 The bad starts came in runs with starts 5-8 s apart; the 8 starts of the lifetime watcher, 5-15 minutes apart, and the first six
@@ -250,10 +252,10 @@ the interesting case, since mobile carriers usually put several customers behind
 ## 6. How long an item lives
 
 The plan assumes about two hours ("nodes keep items for about two hours") and republishes every 30 minutes. One item of 300
-bytes was published once (stored at 71 nodes), the publisher was dropped, and nothing has republished it. A node that has been
-running since before the publish (*persistent*) and a brand-new cold node (*fresh*) look for it at growing ages; a miss is
-repeated 30 s later, so a throttled cold start is not read as an expiry. "Nodes" is how many answered with the item, out of
-how many were asked.
+bytes was published once (stored at 71 nodes), the publisher was dropped, and nothing republished it. Two nodes looked for it at
+growing ages: one that had been running since before the publish (*persistent*) and a brand-new cold one (*fresh*). A miss would
+have been repeated 30 s later; none was ever needed. "Nodes" is how many answered with the item, out of how many were asked. The
+watcher was stopped after the 270-minute check, with the item still there.
 
 | Age | Persistent reader | Fresh cold node | Attempts |
 |---|---|---|---|
@@ -265,8 +267,33 @@ how many were asked.
 | 30 min (checked at 30.1) | found (9 of 35 nodes) | found (17 of 145 nodes) | 1 |
 | 45 min (checked at 45.1) | found (7 of 36 nodes) | found (15 of 94 nodes) | 1 |
 | 60 min (checked at 60.1) | found (7 of 36 nodes) | found (16 of 134 nodes) | 1 |
-| 120 min | pending: the watcher is still running | pending | |
-| 180 min | pending: the watcher is still running | pending | |
+| 75 min (checked at 75.1) | found (7 of 38 nodes) | found (17 of 137 nodes) | 1 |
+| 90 min (checked at 90.1) | found (7 of 40 nodes) | found (7 of 87 nodes) | 1 |
+| 105 min (checked at 105.1) | found (7 of 37 nodes) | found (12 of 96 nodes) | 1 |
+| 120 min (checked at 120.1) | found (7 of 41 nodes) | found (16 of 84 nodes) | 1 |
+| 135 min (checked at 135.1) | found (7 of 36 nodes) | found (15 of 131 nodes) | 1 |
+| 150 min (checked at 150.1) | found (7 of 38 nodes) | found (15 of 116 nodes) | 1 |
+| 165 min (checked at 165.1) | found (7 of 34 nodes) | found (17 of 155 nodes) | 1 |
+| 180 min (checked at 180.1) | found (7 of 31 nodes) | found (14 of 172 nodes) | 1 |
+| 195 min (checked at 195.1) | found (7 of 32 nodes) | found (15 of 101 nodes) | 1 |
+| 210 min (checked at 210.1) | found (8 of 35 nodes) | found (18 of 128 nodes) | 1 |
+| 240 min (checked at 240.1) | found (8 of 30 nodes) | found (16 of 108 nodes) | 1 |
+| 270 min (checked at 270.1) | found (8 of 30 nodes) | found (14 of 143 nodes) | 1 |
+
+**What it means for the design.**
+
+- **An item published once survives at least 4.5 hours.** Both readers found the exact value at all 20 checks, from 1 to 270
+  minutes. The plan assumed about two hours, so the **30-minute republish has a wide margin**: eight rounds in a row could be lost
+  (a host asleep, a network down) and the record would still be there when the host comes back. The periodic republish is not what
+  keeps the record alive; what has to happen at once is the publish after an address change. Its interval is a free choice: an
+  hour would still sit well inside the measured lifetime (four rounds could be lost) at half the traffic (about 1,000 datagrams a
+  publish from a fresh node, §8).
+- **The number of nodes holding the item did not run down.** The fresh node found it at 7 to 20 of the 84-172 nodes it asked at
+  every age (20 at 1 minute, 14 at 270), and the persistent reader, which keeps asking about the same 35 nodes, found it at 7 or 8
+  of them at every check from 45 minutes on. There is no sign of an approaching cliff in the window measured.
+- **What this does not show**: when the item would have expired, since the run was stopped with it still there, and whether
+  other days and other keys behave the same: the lifetime belongs to the nodes that hold the item and their software, and this is one
+  item on one afternoon.
 
 ## 7. Testing without the internet: `Testnet`
 
@@ -298,11 +325,11 @@ A client node on this PC (`firewalled` stayed `true`, so it never became a serve
 | | Measured |
 |---|---|
 | CPU, idle | **609 ms in 12 minutes: 0.85 ms a second, 0.085% of one core** (118 nodes in the table, no log subscriber) |
-| CPU, idle, with a subscriber that formats the 17 warnings a second of §9.2 | 73-96 ms a minute, 0.12-0.16% of a core, before any I/O to a log file |
+| CPU, idle, with a subscriber that formats the 17 warnings a second of §9.2 | 92 ms a minute averaged over 4.4 hours (73-96 in every window), 0.15% of a core, before any I/O to a log file |
 | Memory | 9 MB working set |
 | Threads, wakeups | one thread per `Dht`, woken every 50 ms (20 a second) when nothing happens |
 | Datagrams, idle, table full | about **25 sent and 24 received a minute** (a ping to every node every 5 minutes, and the replies) |
-| Datagrams, idle, table rotted (§3.3) | about 6 sent and 3 received a minute on average, nearly all of it one self-lookup of about 80 sent and 50 received every 15 minutes |
+| Datagrams, idle, table rotted (§3.3) | 5 sent and 3 received a minute on average over 4 hours, nearly all of it one self-lookup every 15 minutes of 54-96 sent and 22-69 received |
 | Start-up | cold: 97-325 sent, 54-225 received, in 2-3 s; from 16 saved nodes: 231-287 sent, 174-208 received |
 | One lookup | **about 300 sent and 200 received** (260-364 / 193-281), 2.9-3.4 s, whether or not the key exists; the same key again from a running node: **about 70 sent and 40 received**, 2.5-2.8 s, because it only asks the 35 nodes it already knows (10 polls) |
 | One publish from a fresh node | 204-645 datagrams sent and 132-476 received over the node start, the lookup and 20-90 stores with their acknowledgements, in 2.6-6.2 s (a good start: about 600 sent and 450 received, 4-6 s; a bad start stops after 2.6 s with 200-380 sent and nothing stored) |
@@ -323,7 +350,7 @@ Each one cost, or would cost, something in C2 or around it; §10 says what to do
    timeout and ends within 50 ms of the last handle being dropped.
 2. **On Windows a quiet node floods the log.** The library prints `WARN IO error ... (os error 10060)` from
    `mainline::rpc::socket` every time its 50 ms read times out: about **17 lines a second** per node (49,503 events in the
-   25 minutes of the put/get run), because Windows reports a read timeout as `TimedOut` and the code only expects `WouldBlock`.
+   25 minutes of the put/get run, 263,000 in the 4.5 hours of the lifetime run), because Windows reports a read timeout as `TimedOut` and the code only expects `WouldBlock`.
    ICMP replies add `10054` and `10052` lines. Both binaries default their filter to `info` (`crates/host/src/main.rs:240`,
    `crates/client/src/main.rs:124`) and the host's log file is created fresh and never rotated, so `host.log` would take
    4-5 kB a second, about 400 MB a day. The filter needs `mainline=error`. (Linux and Android report `WouldBlock`: no flood
@@ -428,14 +455,14 @@ let nodes: Vec<String> = dht.to_bootstrap().await;                   // "ip:port
 **Cache**
 - `save_cache` right after a publish or a lookup, never at shutdown; keep the best of the last saves; do not replace a cache with
   a table of fewer than 8 nodes (§3.3). A cache 22 minutes old worked as well as a fresh one, and one 51 minutes old as well
-  (first node 74-137 ms, 85-123 nodes at 5 s); a cache four hours old is tried when the lifetime run ends.
+  (first node 74-137 ms, 85-123 nodes at 5 s); one five hours old as well (first node 55-242 ms, 8 nodes after 121-319 ms, 101-115 nodes at 5 s, 3 runs).
 
 **Corrections to the design documents** (H1 owns the edit; this file only records them)
 - [nat-traversal.md](nat-traversal.md) phase 2: "BEP 44 allows 1000 bytes" is **996 bytes** of value; "joins in well under a
   second without touching the bootstrap nodes" is "usable after about 0.1 s, finished after 3 s, and the default names stay in
   the list as a fallback"; "seq = unix time (monotonic across restarts without a counter file)" is `max(now, last + 1)` with the
   recovery above; "A DHT client sends a few hundred small UDP packets per minute" is about 50 a minute idle and about 500 per
-  lookup (§8); "nodes keep items for about two hours" is answered by §6.
+  lookup (§8); "nodes keep items for about two hours" is **at least 4.5 hours** here (§6), so the 30-minute republish has a wide margin.
 
 **For other tickets** (the short version was handed over earlier in `docs/reach-handover/S0-early-findings.md`; where that note and
 this document differ, this one is right)
@@ -457,16 +484,15 @@ this document differ, this one is right)
 
 ## 11. Still pending
 
-- **Another network** (§5). One run on a laptop on other Wi-Fi or a phone hotspot. Nothing here can stand in for it: WSL2 adds a
-  NAT layer but shares the router and the ISP with the PC. The commands are in §5.
-- **The item lifetime beyond 60 minutes**, the 120 and 180 minute rows of §6. The watcher was still running when this was written;
-  the rows are filled by a second commit when it ends, about four hours after the publish.
-- **Not measurable from here**: whether the DHT port can ever be seen as reachable (hairpin NAT, an inbound rule, a router
-  mapping), which decides if the adaptive switch to server mode can happen; the router's own WAN address (carrier NAT check, B1
-  and E2); IPv6-only and mobile networks, Android included (a v4 socket through 464XLAT); a network that really blocks UDP (only
-  simulated, §3.4); a saved table a day or a week old (the oldest tried: 51 minutes); `request_timeout` below its 2 s default on the
-  real network (it would shorten publishes and lookups at the price of missed answers); the bytes on the wire (no administrator
-  right on the PC for a packet trace, so byte counts are estimates from the protocol).
+- **Pending: another network** (§5). One run on a laptop on other Wi-Fi or a phone hotspot, which needs the author's laptop or a
+  phone. Nothing here can stand in for it: WSL2 adds a NAT layer but shares the router and the ISP with the PC. The commands are
+  in §5.
+- **Not measured, and not measurable from here**: whether the DHT port can ever be seen as reachable (hairpin NAT, an inbound rule,
+  a router mapping), which decides if the adaptive switch to server mode can happen; the router's own WAN address (carrier NAT
+  check, B1 and E2); IPv6-only and mobile networks, Android included (a v4 socket through 464XLAT); a network that really blocks UDP
+  (only simulated, §3.4); a saved table a day or a week old (the oldest tried: five hours); `request_timeout` below its 2 s default
+  on the real network (it would shorten publishes and lookups at the price of missed answers); the bytes on the wire (no
+  administrator right on the PC for a packet trace, so byte counts are estimates from the protocol).
 
 ## 12. Reproducing
 
