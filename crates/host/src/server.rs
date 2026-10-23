@@ -419,6 +419,8 @@ impl Shared {
             }
             Request::SendFiles { paths } => self.send_files(paths),
             Request::SetStayAwake { on } => self.awake.set(&self.state, on),
+            // reach: filled in by E1
+            Request::SetReach { .. } => Ok(()),
         };
         result.and_then(|()| self.status()).map_err(|e| format!("{e:#}"))
     }
@@ -476,7 +478,8 @@ impl Shared {
         let pairing = self.pairing.lock().unwrap().as_ref().and_then(|p| {
             let left = p.expires.checked_duration_since(Instant::now())?;
             Some(control::Pairing {
-                uri: pairing_uri_with(&p.address, &p.also, &p.code),
+                // reach: the key and the device secret are filled in by E1
+                uri: pairing_uri_with(&p.address, &p.also, &p.code, None, None),
                 code: p.code.encode(),
                 address: p.address.clone(),
                 expires_in_secs: left.as_secs(),
@@ -507,6 +510,7 @@ impl Shared {
                 })
                 .collect(),
             stay_awake: self.awake.setting(&self.state),
+            reach: None, // reach: filled in by E1
         })
     }
 
@@ -951,6 +955,12 @@ async fn run_session(
                 }
                 ClientMsg::SelectDisplay { index } => tracing::debug!("no display {index}"),
                 ClientMsg::Unsupported { tag } => tracing::debug!("ignoring unsupported message {tag}"),
+                // reach: filled in by E1
+                ClientMsg::Reached { .. }
+                | ClientMsg::RelayRegister { .. }
+                | ClientMsg::RelayTo { .. }
+                | ClientMsg::Wake { .. }
+                | ClientMsg::PunchRequest { .. } => {}
                 ClientMsg::Hello { .. } => bail!("unexpected hello"),
             }
         }

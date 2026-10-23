@@ -9,7 +9,10 @@ use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
-use crate::tls::Fingerprint;
+use crate::{
+    tls::Fingerprint,
+    wire::{AddressKind, DEVICE_SECRET_LEN, REACH_KEY_LEN},
+};
 
 /// A self-signed certificate and its PKCS#8 private key, both DER-encoded.
 #[derive(Clone)]
@@ -47,7 +50,11 @@ pub struct AuthorizedClient {
 }
 
 /// Host this client has paired with.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// The fields after `also` are what standalone reach adds (see `HostMsg::Reach`): hosts paired
+/// before it have none of them, and a host that never uses it never gets any. Empty ones are
+/// not written, so the file of such a host is the one earlier versions wrote.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KnownHost {
     pub name: String,
     pub address: String,
@@ -55,6 +62,42 @@ pub struct KnownHost {
     /// Other addresses the host told about (LAN, VPN mesh), tried along with `address`.
     #[serde(default)]
     pub also: Vec<String>,
+    /// The host's addresses with their kinds, as its last `HostMsg::Reach` listed them. `address`
+    /// and `also` hold the same addresses without kinds, for versions that predate them; empty
+    /// until the host sends one. A refresh replaces the whole list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kinds: Vec<(AddressKind, String)>,
+    /// The host's Ed25519 key, where it publishes its DHT record: from the pairing link or from
+    /// `HostMsg::Reach`. Written as base64url text.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "base64_bytes")]
+    pub key: Option<[u8; REACH_KEY_LEN]>,
+    /// The secret that opens that record for this device. Written as base64url text.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "base64_bytes")]
+    pub secret: Option<[u8; DEVICE_SECRET_LEN]>,
+    /// The relays the host is registered with, as its last `HostMsg::Reach` listed them: each
+    /// one's fingerprint (base64url) and the addresses it answers at.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relays: Vec<(String, Vec<String>)>,
+    /// The MAC address of the host's network adapter, for Wake-on-LAN. Written as base64url text.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "base64_bytes")]
+    pub mac: Option<[u8; 6]>,
+}
+
+/// `Option<[u8; N]>` as base64url text, which reads better in a state file than a list of
+/// numbers. Text that is not valid or not of the right size reads as absent: a damaged field
+/// costs that field (the host sends it again on the next connection), not the whole file.
+mod base64_bytes {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer, const N: usize>(value: &Option<[u8; N]>, s: S) -> Result<S::Ok, S::Error> {
+        value.as_ref().map(|bytes| URL_SAFE_NO_PAD.encode(bytes)).serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>, const N: usize>(d: D) -> Result<Option<[u8; N]>, D::Error> {
+        let text = Option::<String>::deserialize(d)?;
+        Ok(text.and_then(|text| URL_SAFE_NO_PAD.decode(text).ok()).and_then(|bytes| bytes.try_into().ok()))
+    }
 }
 
 /// Per-role state directory (`<config>/host` or `<config>/client`).
@@ -137,4 +180,78 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
         f.sync_all()?;
     }
     fs::rename(&tmp, path).with_context(|| format!("writing {}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const FINGERPRINT: &str = "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM";
+
+    /// A known-hosts file as earlier versions wrote it.
+    const OLD_FILE: &str = r#"[
+  {
+    "name": "PC",
+    "address": "192.168.1.9:7420",
+    "fingerprint": "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM",
+    "also": [
+      "100.101.102.103:7420",
+      "[fd7a:115c:a1e0::1]:7420"
+    ]
+  }
+]"#;
+
+    fn old_host() -> KnownHost {
+        KnownHost {
+            name: "PC".into(),
+            address: "192.168.1.9:7420".into(),
+            fingerprint: FINGERPRINT.into(),
+            also: vec!["100.101.102.103:7420".into(), "[fd7a:115c:a1e0::1]:7420".into()],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn known_hosts_from_earlier_versions_read_and_are_written_back_unchanged() {
+        let hosts: Vec<KnownHost> = serde_json::from_str(OLD_FILE).unwrap();
+        assert_eq!(hosts, vec![old_host()]);
+        assert_eq!(serde_json::to_string_pretty(&hosts).unwrap(), OLD_FILE);
+        // The first versions had no `also` either.
+        let first: KnownHost = serde_json::from_str(r#"{"name":"PC","address":"a:1","fingerprint":"f"}"#).unwrap();
+        assert_eq!((first.also, first.kinds, first.key, first.secret, first.relays, first.mac), Default::default());
+    }
+
+    #[test]
+    fn reach_fields_are_written_as_text_and_read_back() {
+        let host = KnownHost {
+            kinds: vec![
+                (AddressKind::Lan, "192.168.1.9:7420".into()),
+                (AddressKind::Public, "203.0.113.7:51820".into()),
+                (AddressKind::Relay("relay".into()), "198.51.100.2:7420".into()),
+            ],
+            key: Some([0xAB; REACH_KEY_LEN]),
+            secret: Some([0xCD; DEVICE_SECRET_LEN]),
+            relays: vec![("relay".into(), vec!["198.51.100.2:7420".into()])],
+            mac: Some([0x00, 0x1a, 0x2b, 0x3c, 0x4d, 0x5e]),
+            ..old_host()
+        };
+        let json = serde_json::to_string(&host).unwrap();
+        assert!(json.contains(r#""key":"q6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6s""#), "{json}");
+        assert!(json.contains(r#""secret":"zc3Nzc3Nzc3Nzc3Nzc3NzQ""#), "{json}");
+        assert!(json.contains(r#""mac":"ABorPE1e""#), "{json}");
+        assert!(
+            json.contains(r#""kinds":[["lan","192.168.1.9:7420"],["public","203.0.113.7:51820"],[{"relay":"relay"},"#),
+            "{json}"
+        );
+        assert_eq!(serde_json::from_str::<KnownHost>(&json).unwrap(), host);
+    }
+
+    #[test]
+    fn a_damaged_reach_field_costs_that_field_not_the_file() {
+        let json = r#"[{"name":"PC","address":"a:1","fingerprint":"f","key":"not base64!","secret":"AAAA",
+            "mac":"","kinds":[["lan","a:1"]]}]"#;
+        let hosts: Vec<KnownHost> = serde_json::from_str(json).unwrap();
+        assert_eq!((hosts[0].key, hosts[0].secret, hosts[0].mac), (None, None, None));
+        assert_eq!(hosts[0].kinds, vec![(AddressKind::Lan, "a:1".to_string())]);
+    }
 }
