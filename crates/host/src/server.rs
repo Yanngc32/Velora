@@ -1003,10 +1003,14 @@ enum Auth {
 /// once the password (if any) was right too, so a device asked for the password can retry
 /// with the same code. Unpaired devices learn nothing about the password.
 ///
-/// `link_hello` is whether the hello is the one of a relay link. It matters for one device only: a
-/// computer whose *host* this one's user paired with (it is in `known_hosts.json` of the client
-/// side, see `reach::relay::trusts`). It registers with a relay under its host identity, which is
-/// not in the list of client devices, and may open a link and nothing else.
+/// `link_hello` is whether the hello is the one of a relay link, which reaches no screen. A link from
+/// a device this host knows needs no password (the password protects the screen, and a client that
+/// dials a relay holds only the password of the host it wants to reach, not this one's). Known means
+/// a paired client, or a computer whose *host* this one's user paired with (it is in
+/// `known_hosts.json` of the client side, see `reach::relay::trusts`): that registers with a relay
+/// under its host identity, which is not in the list of client devices, and may open a link and
+/// nothing else. Any other hello of such a device, and any link from one nobody knows, is judged
+/// as it always was.
 fn authorize(
     shared: &Shared,
     fingerprint: Fingerprint,
@@ -1028,9 +1032,14 @@ fn authorize(
     // What is let in here is served as a link, because the same hello decides both. A link reaches
     // no screen, which is what the access password protects, so none is asked. Any other hello of
     // the same device, a session or files, is judged below, as it always was.
-    if !known && link_hello && secret.is_none() && reach::relay::trusts(shared.reach.context(), &fingerprint) {
-        tracing::info!("accepted a link from the paired computer {fingerprint}");
-        return Ok(Auth::Known);
+    if link_hello && secret.is_none() {
+        if known {
+            return Ok(Auth::Known);
+        }
+        if reach::relay::trusts(shared.reach.context(), &fingerprint) {
+            tracing::info!("accepted a link from the paired computer {fingerprint}");
+            return Ok(Auth::Known);
+        }
     }
     if !known && !secret.as_ref().is_some_and(pairing_valid) {
         return Ok(Auth::Denied);
@@ -1876,7 +1885,7 @@ mod tests {
         pair_back(&host, &computer);
         host.pair(&client, "phone");
         // An access password protects the screen, and a link reaches none: it does not stand in the way
-        // of the host, while a paired client is still asked for it, as it always was.
+        // of the host's link.
         crate::password::set(&host.shared.state, Some("a password")).unwrap();
 
         let mut link = host.connect(&computer, Some(link_hello())).await;
@@ -1894,8 +1903,35 @@ mod tests {
         assert!(host.shared.files.lock().unwrap().is_empty());
         let paired: Vec<AuthorizedClient> = host.shared.state.load(StateDir::AUTHORIZED_CLIENTS).unwrap();
         assert!(paired.iter().all(|c| c.fingerprint != computer.fingerprint().to_base64()));
-        let mut asked = host.connect(&client, Some(link_hello())).await;
-        assert!(matches!(asked.next().await, HostMsg::PasswordRequired { wrong: false }));
+    }
+
+    #[tokio::test]
+    async fn a_link_of_a_paired_device_needs_no_password_but_a_session_and_files_do() {
+        let host = host("password-links", false).await;
+        let (client, stranger) = (Identity::generate().unwrap(), Identity::generate().unwrap());
+        host.pair(&client, "phone");
+        crate::password::set(&host.shared.state, Some("a password")).unwrap();
+
+        // A link reaches no screen, and the client that dials a relay has no password of this
+        // computer to send: it gets in.
+        let mut link = host.connect(&client, Some(link_hello())).await;
+        assert!(matches!(link.next().await, HostMsg::Welcome { width: 0, height: 0, features: Some(0), .. }));
+        assert!(matches!(link.next().await, HostMsg::Reach { .. }));
+
+        // Its other hellos still ask for the password: a session (before and after extensions) and a
+        // file manager.
+        let session = HelloExt { clipboard: true, reach: true, ..Default::default() };
+        let files = HelloExt { files_only: true, addresses: true, ..Default::default() };
+        for ext in [None, Some(session), Some(files)] {
+            let mut asked = host.connect(&client, ext).await;
+            assert!(matches!(asked.next().await, HostMsg::PasswordRequired { wrong: false }), "hello: {ext:?}");
+        }
+        assert!(host.shared.active.lock().unwrap().is_none());
+
+        // A device nobody knows is refused as before, and learns nothing about the password.
+        let mut unknown = host.connect(&stranger, Some(link_hello())).await;
+        let HostMsg::Rejected { reason } = unknown.next().await else { panic!("refused") };
+        assert_eq!(reason, "this device is not paired with the host");
     }
 
     #[tokio::test]
