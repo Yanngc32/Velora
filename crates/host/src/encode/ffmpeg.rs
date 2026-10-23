@@ -16,12 +16,19 @@ use ffmpeg_sys_next as ff;
 use super::{
     bitstream::ParameterSets,
     convert::{bgrx_to_yuv420, even_dims, Chroma},
-    Encoded, EncodedFrame, EncoderSettings, VideoEncoder,
+    Encoded, EncodedFrame, EncoderSettings, GpuDevice, VideoEncoder,
 };
 use crate::capture::Frame;
 
 /// Longest we wait for a pipelined encoder to return the frame just submitted.
 const MAX_OUTPUT_WAIT: Duration = Duration::from_millis(8);
+/// Encoders that take frames on the capture's GPU (Windows).
+#[cfg(windows)]
+const ZERO_COPY: &[&str] = &["h264_nvenc", "h264_amf", "h264_qsv"];
+/// GPU frames in the encoder's pool: those it holds while encoding, the last picture, and one
+/// being converted.
+#[cfg(windows)]
+const GPU_POOL: i32 = 8;
 
 /// Low-latency options per encoder. Unknown keys are ignored by libavcodec, so options that
 /// only newer FFmpeg versions understand are harmless on older ones.
@@ -88,9 +95,12 @@ pub struct Ffmpeg {
     /// NV12 picture in system memory; kept so a keyframe of an unchanged screen can be re-sent.
     picture: *mut ff::AVFrame,
     has_picture: bool,
-    /// VA-API only: device and pool of GPU surfaces.
+    /// VA-API, and zero copy on Windows: device and pool of GPU surfaces.
     hw_device: *mut ff::AVBufferRef,
     hw_frames: *mut ff::AVBufferRef,
+    /// Zero copy (Windows): frames converted on the capture's GPU.
+    #[cfg(windows)]
+    gpu: Option<Gpu>,
     packet: *mut ff::AVPacket,
     pts: i64,
     /// Frames submitted whose packets have not come out yet.
@@ -98,22 +108,78 @@ pub struct Ffmpeg {
     parameter_sets: ParameterSets,
 }
 
+/// Zero copy on Windows: the capture's device, the converter into the pool, and for Quick
+/// Sync the same pool seen as its own frames.
+#[cfg(windows)]
+struct Gpu {
+    device: GpuDevice,
+    converter: super::d3d11::Converter,
+    qsv_device: *mut ff::AVBufferRef,
+    qsv_frames: *mut ff::AVBufferRef,
+    /// The last picture, in the pool: sent again for a keyframe of an unchanged screen.
+    last: *mut ff::AVFrame,
+}
+
+#[cfg(windows)]
+impl Drop for Gpu {
+    fn drop(&mut self) {
+        // SAFETY: owned references, freed once; the functions accept null.
+        unsafe {
+            ff::av_frame_free(&mut self.last);
+            ff::av_buffer_unref(&mut self.qsv_frames);
+            ff::av_buffer_unref(&mut self.qsv_device);
+        }
+    }
+}
+
 impl Ffmpeg {
     /// Like [`Self::open`] but silences FFmpeg's own error output, for trying encoders that
     /// are expected to be missing.
-    pub fn probe(name: &str, settings: EncoderSettings, width: u32, height: u32) -> Result<Self> {
+    pub fn probe(
+        name: &str,
+        settings: EncoderSettings,
+        width: u32,
+        height: u32,
+        gpu: Option<&GpuDevice>,
+    ) -> Result<Self> {
         init_logging();
         // SAFETY: global log level getter/setter; probing only happens on the capture thread.
         unsafe {
             let level = ff::av_log_get_level();
             ff::av_log_set_level(ff::AV_LOG_QUIET);
-            let result = Self::open(name, settings, width, height);
+            let result = Self::open(name, settings, width, height, gpu);
             ff::av_log_set_level(level);
             result
         }
     }
 
-    pub fn open(name: &str, settings: EncoderSettings, width: u32, height: u32) -> Result<Self> {
+    /// Opens `name`, taking frames on `gpu` (the capture's device) when it can, else from memory.
+    pub fn open(
+        name: &str,
+        settings: EncoderSettings,
+        width: u32,
+        height: u32,
+        gpu: Option<&GpuDevice>,
+    ) -> Result<Self> {
+        #[cfg(windows)]
+        if let Some(device) = gpu.filter(|_| ZERO_COPY.contains(&name)) {
+            match Self::with(name, settings, width, height, Some(device)) {
+                Ok(enc) => return Ok(enc),
+                Err(e) => tracing::debug!("{name} cannot take frames on the GPU: {e:#}"),
+            }
+        }
+        #[cfg(not(windows))]
+        let _ = gpu;
+        Self::with(name, settings, width, height, None)
+    }
+
+    fn with(
+        name: &str,
+        settings: EncoderSettings,
+        width: u32,
+        height: u32,
+        #[allow(unused_variables)] gpu: Option<&GpuDevice>,
+    ) -> Result<Self> {
         init_logging();
         let mut enc = Self {
             name: name.to_string(),
@@ -125,6 +191,8 @@ impl Ffmpeg {
             has_picture: false,
             hw_device: ptr::null_mut(),
             hw_frames: ptr::null_mut(),
+            #[cfg(windows)]
+            gpu: None,
             packet: ptr::null_mut(),
             pts: 0,
             pending: 0,
@@ -132,12 +200,13 @@ impl Ffmpeg {
         };
         // On error `enc` is dropped, which frees whatever was allocated.
         // SAFETY: every pointer is checked after allocation and owned by `enc`.
-        unsafe { enc.init()? };
-        tracing::info!("using encoder {name} ({}x{})", enc.width, enc.height);
+        unsafe { enc.init(gpu)? };
+        let input = if enc.on_gpu() { ", frames on the GPU" } else { "" };
+        tracing::info!("using encoder {name} ({}x{}{input})", enc.width, enc.height);
         Ok(enc)
     }
 
-    unsafe fn init(&mut self) -> Result<()> {
+    unsafe fn init(&mut self, #[allow(unused_variables)] gpu: Option<&GpuDevice>) -> Result<()> {
         unsafe {
             let cname = CString::new(self.name.as_str())?;
             let codec = ff::avcodec_find_encoder_by_name(cname.as_ptr());
@@ -171,6 +240,10 @@ impl Ffmpeg {
             c.color_trc = ff::AVColorTransferCharacteristic::AVCOL_TRC_SMPTE170M;
             c.pix_fmt = ff::AVPixelFormat::AV_PIX_FMT_NV12;
 
+            #[cfg(windows)]
+            if let Some(device) = gpu {
+                self.init_gpu(device)?;
+            }
             if self.name.ends_with("_vaapi") {
                 check(
                     ff::av_hwdevice_ctx_create(
@@ -206,6 +279,10 @@ impl Ffmpeg {
             ff::av_dict_free(&mut dict);
             check(opened, &format!("opening {}", self.name))?;
 
+            #[cfg(windows)]
+            if self.gpu.is_some() {
+                return Ok(());
+            }
             let p = &mut *self.picture;
             p.format = ff::AVPixelFormat::AV_PIX_FMT_NV12 as i32;
             p.width = self.width as i32;
@@ -215,8 +292,129 @@ impl Ffmpeg {
         Ok(())
     }
 
+    /// Zero copy: a pool of NV12 textures on the capture's device for the encoder (one array,
+    /// as decoders make them), which converted frames are copied into. Quick Sync takes them as
+    /// frames of its own, derived from the pool; NVENC and AMF take them as they are.
+    #[cfg(windows)]
+    unsafe fn init_gpu(&mut self, device: &GpuDevice) -> Result<()> {
+        use windows::{
+            core::Interface,
+            Win32::Graphics::Direct3D11::{ID3D11Multithread, D3D11_BIND_DECODER},
+        };
+        unsafe {
+            // Encoders use the device from threads of their own; Quick Sync refuses it otherwise.
+            if let Ok(multithread) = device.cast::<ID3D11Multithread>() {
+                let _ = multithread.SetMultithreadProtected(true);
+            }
+            self.hw_device = ff::av_hwdevice_ctx_alloc(ff::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA);
+            if self.hw_device.is_null() {
+                bail!("av_hwdevice_ctx_alloc failed");
+            }
+            let hw = &mut *((*self.hw_device).data as *mut ff::AVHWDeviceContext);
+            // FFmpeg releases the reference it is given.
+            (*(hw.hwctx as *mut ff::AVD3D11VADeviceContext)).device =
+                device.clone().into_raw() as *mut ff::ID3D11Device;
+            check(ff::av_hwdevice_ctx_init(self.hw_device), "using the capture's GPU")?;
+
+            self.hw_frames = ff::av_hwframe_ctx_alloc(self.hw_device);
+            if self.hw_frames.is_null() {
+                bail!("av_hwframe_ctx_alloc failed");
+            }
+            let frames = &mut *((*self.hw_frames).data as *mut ff::AVHWFramesContext);
+            frames.format = ff::AVPixelFormat::AV_PIX_FMT_D3D11;
+            frames.sw_format = ff::AVPixelFormat::AV_PIX_FMT_NV12;
+            frames.width = self.width as i32;
+            frames.height = self.height as i32;
+            frames.initial_pool_size = GPU_POOL;
+            (*(frames.hwctx as *mut ff::AVD3D11VAFramesContext)).BindFlags = D3D11_BIND_DECODER.0 as u32;
+            check(ff::av_hwframe_ctx_init(self.hw_frames), "creating frames on the GPU")?;
+
+            let mut gpu = Gpu {
+                device: device.clone(),
+                converter: super::d3d11::Converter::new(device, self.width as u32, self.height as u32)?,
+                qsv_device: ptr::null_mut(),
+                qsv_frames: ptr::null_mut(),
+                last: ptr::null_mut(),
+            };
+            let c = &mut *self.ctx;
+            if self.name == "h264_qsv" {
+                check(
+                    ff::av_hwdevice_ctx_create_derived(
+                        &mut gpu.qsv_device,
+                        ff::AVHWDeviceType::AV_HWDEVICE_TYPE_QSV,
+                        self.hw_device,
+                        0,
+                    ),
+                    "opening Quick Sync on the capture's GPU",
+                )?;
+                check(
+                    ff::av_hwframe_ctx_create_derived(
+                        &mut gpu.qsv_frames,
+                        ff::AVPixelFormat::AV_PIX_FMT_QSV,
+                        gpu.qsv_device,
+                        self.hw_frames,
+                        0,
+                    ),
+                    "sharing frames with Quick Sync",
+                )?;
+                c.pix_fmt = ff::AVPixelFormat::AV_PIX_FMT_QSV;
+                c.hw_frames_ctx = ff::av_buffer_ref(gpu.qsv_frames);
+            } else {
+                c.pix_fmt = ff::AVPixelFormat::AV_PIX_FMT_D3D11;
+                c.hw_frames_ctx = ff::av_buffer_ref(self.hw_frames);
+            }
+            self.gpu = Some(gpu);
+        }
+        Ok(())
+    }
+
+    /// Zero copy: converts the frame on the GPU into a new picture of the pool.
+    #[cfg(windows)]
+    unsafe fn fill_gpu(&mut self, frame: &Frame) -> Result<()> {
+        use windows::{core::Interface, Win32::Graphics::Direct3D11::ID3D11Texture2D};
+        let texture = frame.texture.context("the captured frame is not on the GPU")?;
+        let gpu = self.gpu.as_mut().context("not encoding on the GPU")?;
+        unsafe {
+            let mut picture = ff::av_frame_alloc();
+            if picture.is_null() {
+                bail!("out of memory");
+            }
+            let got = ff::av_hwframe_get_buffer(self.hw_frames, picture, 0);
+            if got < 0 {
+                ff::av_frame_free(&mut picture);
+                check(got, "getting a GPU frame")?;
+            }
+            // The pool: one array texture, a slice per picture.
+            let pool = (*picture).data[0] as *mut std::ffi::c_void;
+            let index = (*picture).data[1] as usize as u32;
+            let converted = match ID3D11Texture2D::from_raw_borrowed(&pool) {
+                Some(pool) => gpu.converter.convert(texture, pool, index),
+                None => Err(anyhow::anyhow!("the GPU frame has no texture")),
+            };
+            if let Err(e) = converted {
+                ff::av_frame_free(&mut picture);
+                return Err(e);
+            }
+            ff::av_frame_free(&mut gpu.last);
+            gpu.last = picture;
+        }
+        Ok(())
+    }
+
+    /// Whether frames come in on the GPU (zero copy).
+    pub fn on_gpu(&self) -> bool {
+        #[cfg(windows)]
+        return self.gpu.is_some();
+        #[cfg(not(windows))]
+        false
+    }
+
     unsafe fn free(&mut self) {
         unsafe {
+            #[cfg(windows)]
+            {
+                self.gpu = None;
+            }
             ff::avcodec_free_context(&mut self.ctx);
             ff::av_frame_free(&mut self.picture);
             ff::av_packet_free(&mut self.packet);
@@ -241,7 +439,30 @@ impl Ffmpeg {
     unsafe fn submit(&mut self, keyframe: bool, out: &mut Vec<EncodedFrame>) -> Result<()> {
         unsafe {
             let mut hw: *mut ff::AVFrame = ptr::null_mut();
-            let input = if self.hw_frames.is_null() {
+            #[cfg(windows)]
+            let gpu = self.gpu.as_ref().map(|g| (g.last, g.qsv_frames));
+            #[cfg(not(windows))]
+            let gpu: Option<(*mut ff::AVFrame, *mut ff::AVBufferRef)> = None;
+            let input = if let Some((last, qsv_frames)) = gpu {
+                if qsv_frames.is_null() {
+                    last
+                } else {
+                    // Quick Sync sees the same texture slice as one of its frames, of the
+                    // frames context derived from the pool.
+                    hw = ff::av_frame_alloc();
+                    if hw.is_null() {
+                        bail!("out of memory");
+                    }
+                    (*hw).format = ff::AVPixelFormat::AV_PIX_FMT_QSV as i32;
+                    (*hw).hw_frames_ctx = ff::av_buffer_ref(qsv_frames);
+                    let mapped = ff::av_hwframe_map(hw, last, ff::AV_HWFRAME_MAP_DIRECT as i32);
+                    if mapped < 0 {
+                        ff::av_frame_free(&mut hw);
+                        check(mapped, "handing the frame to Quick Sync")?;
+                    }
+                    hw
+                }
+            } else if self.hw_frames.is_null() {
                 self.picture
             } else {
                 hw = ff::av_frame_alloc();
@@ -308,6 +529,10 @@ impl VideoEncoder for Ffmpeg {
         &self.name
     }
 
+    fn on_gpu(&self) -> bool {
+        Ffmpeg::on_gpu(self)
+    }
+
     /// NVENC and Quick Sync pick up a changed bitrate on the next frame.
     fn set_bitrate(&mut self, kbps: u32) -> bool {
         if self.ctx.is_null() {
@@ -331,12 +556,25 @@ impl VideoEncoder for Ffmpeg {
             if (w, h) != (self.width, self.height) {
                 // Encoders cannot change resolution in place.
                 tracing::info!("resolution changed to {w}x{h}, reopening {}", self.name);
-                *self = Self::open(&self.name, self.settings, w as u32, h as u32)?;
+                #[cfg(windows)]
+                let gpu = self.gpu.as_ref().map(|g| g.device.clone());
+                #[cfg(not(windows))]
+                let gpu: Option<GpuDevice> = None;
+                *self = Self::open(&self.name, self.settings, w as u32, h as u32, gpu.as_ref())?;
                 keyframe = true;
             }
             let start = Instant::now();
-            // SAFETY: the frame was allocated with the current dimensions.
-            unsafe { self.fill(frame)? };
+            // SAFETY: the frame (or the GPU pool) was allocated with the current dimensions.
+            #[cfg(windows)]
+            if self.gpu.is_some() {
+                unsafe { self.fill_gpu(frame)? };
+            } else {
+                unsafe { self.fill(frame)? };
+            }
+            #[cfg(not(windows))]
+            unsafe {
+                self.fill(frame)?
+            };
             self.has_picture = true;
             out.convert_time = start.elapsed();
         }
@@ -370,7 +608,7 @@ mod tests {
     #[test]
     fn encodes_through_libavcodec() {
         let settings = EncoderSettings { fps: 60, bitrate_kbps: 2000 };
-        let Ok(mut enc) = Ffmpeg::probe("libx264", settings, 64, 48) else {
+        let Ok(mut enc) = Ffmpeg::probe("libx264", settings, 64, 48, None) else {
             eprintln!("libx264 unavailable, skipping");
             return;
         };
@@ -379,7 +617,7 @@ mod tests {
         };
         let mut encode = |w: u32, h: u32, shade: Option<u8>, key: bool| {
             let data = shade.map(|s| picture(w, h, s));
-            let frame = data.as_ref().map(|d| Frame { width: w, height: h, stride: w as usize * 4, data: d });
+            let frame = data.as_ref().map(|d| Frame::new(w, h, w as usize * 4, d));
             enc.encode(frame.as_ref(), key).unwrap().frames
         };
 

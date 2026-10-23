@@ -33,11 +33,15 @@ pub const MAX_ADDRESSES: usize = 8;
 pub const MAX_LINK_LEN: usize = 1024;
 /// Longest access password, in bytes.
 pub const MAX_PASSWORD_LEN: usize = 256;
+/// Most displays a [`HostMsg::Displays`] lists.
+pub const MAX_DISPLAYS: usize = 16;
 
 /// [`HostMsg::Welcome`] feature bit: the host serves file streams.
 pub const FEATURE_FILES: u32 = 1;
 /// [`HostMsg::Welcome`] feature bit: the host shares its clipboard (see `files::FileMsg::Clipboard`).
 pub const FEATURE_CLIPBOARD: u32 = 2;
+/// [`HostMsg::Welcome`] feature bit: the host sends its sound (see [`AudioPacket`]).
+pub const FEATURE_AUDIO: u32 = 4;
 
 /// What a client that knows about extensions adds to its hello. Hosts that predate them reject
 /// such a hello, and only hellos with it are answered with `features` in the welcome.
@@ -49,6 +53,26 @@ pub struct HelloExt {
     pub clipboard: bool,
     /// The client wants the host's other addresses in the welcome (see `HostMsg::Welcome`).
     pub addresses: bool,
+    /// The client can pick among the host's displays (see [`HostMsg::Displays`]).
+    pub displays: bool,
+    /// The client plays the host's sound (see [`AudioPacket`]).
+    pub audio: bool,
+}
+
+/// One of the host's displays, as [`HostMsg::Displays`] lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisplayInfo {
+    pub name: String,
+    pub width: u16,
+    pub height: u16,
+    pub primary: bool,
+}
+
+/// The host's displays, left to right, and the one being streamed.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DisplayList {
+    pub current: u8,
+    pub list: Vec<DisplayInfo>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -160,6 +184,10 @@ pub enum ClientMsg {
     OfferPairing {
         link: String,
     },
+    /// Stream another of the host's displays, by its index in [`HostMsg::Displays`].
+    SelectDisplay {
+        index: u8,
+    },
     /// A message from a newer client that this version does not know; ignored.
     Unsupported {
         tag: u8,
@@ -193,6 +221,9 @@ pub enum HostMsg {
     PasswordRequired {
         wrong: bool,
     },
+    /// The host's displays, after the welcome and whenever the streamed one changes. Sent only
+    /// to clients that ask ([`HelloExt::displays`]) and only when there is a choice.
+    Displays(DisplayList),
 }
 
 /// Unreliable absolute pointer update. `seq` lets the host drop reordered datagrams.
@@ -223,6 +254,36 @@ impl MouseMove {
             x: u16::from_le_bytes(b[5..7].try_into().unwrap()),
             y: u16::from_le_bytes(b[7..9].try_into().unwrap()),
         })
+    }
+
+    /// Whether `self` is newer than `last`, tolerating sequence wrap-around.
+    pub fn is_newer_than(&self, last: u32) -> bool {
+        (self.seq.wrapping_sub(last) as i32) > 0
+    }
+}
+
+/// Host -> client datagram: 20 ms of the host's sound in Opus (see `velora-audio`). Lost ones
+/// are gaps, not retransmissions; `seq` lets the client drop reordered ones.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AudioPacket {
+    pub seq: u32,
+    pub data: Vec<u8>,
+}
+
+impl AudioPacket {
+    const TAG: u8 = 2;
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut b = Vec::with_capacity(5 + self.data.len());
+        b.push(Self::TAG);
+        b.extend_from_slice(&self.seq.to_le_bytes());
+        b.extend_from_slice(&self.data);
+        b
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Self> {
+        ensure!(b.len() > 5 && b[0] == Self::TAG, "invalid audio datagram");
+        Ok(Self { seq: u32::from_le_bytes(b[1..5].try_into().unwrap()), data: b[5..].to_vec() })
     }
 
     /// Whether `self` is newer than `last`, tolerating sequence wrap-around.
@@ -389,7 +450,11 @@ impl ClientMsg {
                     (None, None) => {}
                 }
                 if let Some(ext) = ext {
-                    w.u8(ext.files_only as u8 | (ext.clipboard as u8) << 1 | (ext.addresses as u8) << 2);
+                    w.u8(ext.files_only as u8
+                        | (ext.clipboard as u8) << 1
+                        | (ext.addresses as u8) << 2
+                        | (ext.displays as u8) << 3
+                        | (ext.audio as u8) << 4);
                 }
                 w.finish()
             }
@@ -430,6 +495,11 @@ impl ClientMsg {
                 w.str_max(link, MAX_LINK_LEN);
                 w.finish()
             }
+            Self::SelectDisplay { index } => {
+                let mut w = Writer::new(10);
+                w.u8(*index);
+                w.finish()
+            }
             Self::Unsupported { tag } => Writer::new(*tag).finish(),
         }
     }
@@ -450,7 +520,13 @@ impl ClientMsg {
                     None
                 } else {
                     let flags = r.u8()?;
-                    Some(HelloExt { files_only: flags & 1 != 0, clipboard: flags & 2 != 0, addresses: flags & 4 != 0 })
+                    Some(HelloExt {
+                        files_only: flags & 1 != 0,
+                        clipboard: flags & 2 != 0,
+                        addresses: flags & 4 != 0,
+                        displays: flags & 8 != 0,
+                        audio: flags & 16 != 0,
+                    })
                 };
                 Self::Hello { version, name, pairing_secret, password, ext }
             }
@@ -464,6 +540,7 @@ impl ClientMsg {
             7 => Self::ReleaseAll,
             8 => Self::Text { text: r.str()? },
             9 => Self::OfferPairing { link: r.str()? },
+            10 => Self::SelectDisplay { index: r.u8()? },
             // Forward compatibility: skip messages added by newer clients.
             tag => return Ok(Self::Unsupported { tag }),
         };
@@ -505,6 +582,19 @@ impl HostMsg {
                 w.u8(*wrong as u8);
                 w.finish()
             }
+            Self::Displays(displays) => {
+                let mut w = Writer::new(5);
+                w.u8(displays.current);
+                let list = &displays.list[..displays.list.len().min(MAX_DISPLAYS)];
+                w.u8(list.len() as u8);
+                for d in list {
+                    w.str(&d.name);
+                    w.u16(d.width);
+                    w.u16(d.height);
+                    w.u8(d.primary as u8);
+                }
+                w.finish()
+            }
         }
     }
 
@@ -528,6 +618,15 @@ impl HostMsg {
             2 => Self::Paired,
             3 => Self::Rejected { reason: r.str()? },
             4 => Self::PasswordRequired { wrong: r.bool()? },
+            5 => {
+                let current = r.u8()?;
+                let n = r.u8()? as usize;
+                ensure!(n <= MAX_DISPLAYS, "too many displays");
+                let list = (0..n)
+                    .map(|_| Ok(DisplayInfo { name: r.str()?, width: r.u16()?, height: r.u16()?, primary: r.bool()? }))
+                    .collect::<Result<_>>()?;
+                Self::Displays(DisplayList { current, list })
+            }
             t => bail!("unknown host message tag {t}"),
         };
         r.end()?;
@@ -596,14 +695,20 @@ mod tests {
                 name: "laptop".into(),
                 pairing_secret: None,
                 password,
-                ext: Some(HelloExt { files_only: true, clipboard: false, addresses: false }),
+                ext: Some(HelloExt { files_only: true, ..Default::default() }),
             });
             roundtrip_client(ClientMsg::Hello {
                 version: 1,
                 name: "a".into(),
                 pairing_secret: None,
                 password: None,
-                ext: Some(HelloExt { files_only: false, clipboard: true, addresses: true }),
+                ext: Some(HelloExt {
+                    files_only: false,
+                    clipboard: true,
+                    addresses: true,
+                    displays: true,
+                    audio: true,
+                }),
             });
         }
         roundtrip_client(ClientMsg::Key { code: 30, state: KeyState::Repeat });
@@ -614,6 +719,7 @@ mod tests {
         roundtrip_client(ClientMsg::ReleaseAll);
         roundtrip_client(ClientMsg::Text { text: "olá, ação ✓".into() });
         roundtrip_client(ClientMsg::OfferPairing { link: "velora://pair?address=10.0.0.2%3A7420&code=VL1-x".into() });
+        roundtrip_client(ClientMsg::SelectDisplay { index: 2 });
     }
 
     #[test]
@@ -669,6 +775,13 @@ mod tests {
         roundtrip_host(HostMsg::Paired);
         roundtrip_host(HostMsg::PasswordRequired { wrong: true });
         roundtrip_host(HostMsg::Rejected { reason: "not authorized".into() });
+        roundtrip_host(HostMsg::Displays(DisplayList {
+            current: 1,
+            list: vec![
+                DisplayInfo { name: "DISPLAY1".into(), width: 2560, height: 1440, primary: true },
+                DisplayInfo { name: "DISPLAY2".into(), width: 1920, height: 1080, primary: false },
+            ],
+        }));
     }
 
     #[test]
@@ -678,6 +791,14 @@ mod tests {
         assert!(ClientMsg::decode(&[7, 0]).is_err()); // trailing byte
         assert!(ClientMsg::decode(&[3, 9, 1, 0, 0, 0, 0]).is_err()); // bad button
         assert!(HostMsg::decode(&[1, 1, 0, 0, 0, 9, 0, 0, 0, 0]).is_err()); // bad codec
+    }
+
+    #[test]
+    fn audio_packet_roundtrip_and_ordering() {
+        let packet = AudioPacket { seq: 7, data: vec![1, 2, 3] };
+        assert_eq!(AudioPacket::decode(&packet.encode()).unwrap(), packet);
+        assert!(AudioPacket::decode(&MouseMove { seq: 1, x: 0, y: 0 }.encode()).is_err());
+        assert!(packet.is_newer_than(6) && !packet.is_newer_than(7) && packet.is_newer_than(u32::MAX));
     }
 
     #[test]

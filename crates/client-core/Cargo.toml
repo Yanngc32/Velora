@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 velora-protocol.workspace = true
+velora-audio.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tokio.workspace = true
@@ -33,4 +34,4 @@ default = ["decode"]
 # Software H.264 decoding to RGB (desktop). Mobile apps decode in hardware and leave it off.
 decode = ["dep:openh264"]
 # Hardware decoding (D3D11VA, VA-API) through the system FFmpeg libraries, OpenH264 as fallback.
-ffmpeg = ["decode", "dep:ffmpeg-sys-next", "dep:windows"]
+ffmpeg = ["decode", "dep:ffmpeg-sys-next", "dep:windows", "velora-audio/ffmpeg"]

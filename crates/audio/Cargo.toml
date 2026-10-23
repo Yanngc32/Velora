@@ -1,0 +1,25 @@
+[package]
+name = "velora-audio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+tracing.workspace = true
+ffmpeg-sys-next = { version = "9", default-features = false, features = ["avcodec"], optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+  "Win32_Foundation",
+  "Win32_Media_Audio",
+  "Win32_System_Com",
+  "Win32_System_Com_StructuredStorage",
+  "Win32_System_Variant",
+] }
+
+[features]
+# Opus through the system FFmpeg libraries. Without it there is no sound.
+ffmpeg = ["dep:ffmpeg-sys-next"]

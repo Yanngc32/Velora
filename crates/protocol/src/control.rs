@@ -51,6 +51,10 @@ pub enum Request {
         accept: bool,
         always: bool,
     },
+    /// Keeps the computer from sleeping while the host runs (see [`Status::stay_awake`]).
+    SetStayAwake {
+        on: bool,
+    },
 }
 
 pub type Reply = std::result::Result<Status, String>;
@@ -83,6 +87,10 @@ pub struct Status {
     /// that predate requests.
     #[serde(default)]
     pub requests: Vec<FileRequest>,
+    /// The computer stays awake while the host runs, so it remains reachable; the screen is
+    /// kept on during a session. `None` from hosts that can't do it or predate it.
+    #[serde(default)]
+    pub stay_awake: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -216,5 +224,18 @@ mod tests {
         let err: Reply = Err("nope".into());
         let json = serde_json::to_string(&err).unwrap();
         assert_eq!(serde_json::from_str::<Reply>(&json).unwrap(), err);
+
+        let awake = Request::SetStayAwake { on: false };
+        assert_eq!(serde_json::to_string(&awake).unwrap(), r#"{"op":"set_stay_awake","on":false}"#);
+    }
+
+    /// A status from a host that predates the newer fields still reads, with them unset.
+    #[test]
+    fn older_status() {
+        let json = r#"{"name":"PC","version":"0.3.1","fingerprint":"AB12","address":null,
+            "service":false,"devices":[],"pairing":null}"#;
+        let status: Status = serde_json::from_str(json).unwrap();
+        assert_eq!(status.stay_awake, None);
+        assert!(status.also.is_empty() && status.requests.is_empty() && !status.password_set);
     }
 }

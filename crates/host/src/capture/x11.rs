@@ -138,7 +138,7 @@ impl Capturer for X11Capturer {
         // SAFETY: the segment is mapped for `len` bytes and the X server finished writing it
         // before replying.
         let data = unsafe { std::slice::from_raw_parts(self.shm.addr, self.shm.len) };
-        Ok(Some(Frame { width: self.width as u32, height: self.height as u32, stride: self.width as usize * 4, data }))
+        Ok(Some(Frame::new(self.width as u32, self.height as u32, self.width as usize * 4, data)))
     }
 }
 

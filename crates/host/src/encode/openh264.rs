@@ -146,7 +146,7 @@ mod tests {
     #[test]
     fn first_frame_is_a_keyframe_and_reencode_works() {
         let data: Vec<u8> = (0..64 * 64).flat_map(|_| [10, 200, 30, 255]).collect();
-        let frame = Frame { width: 64, height: 64, stride: 256, data: &data };
+        let frame = Frame::new(64, 64, 256, &data);
         let mut enc = Software::new(EncoderSettings { fps: 60, bitrate_kbps: 4000 }).unwrap();
         assert!(enc.encode(None, true).unwrap().frames.is_empty(), "nothing to encode yet");
         let first = enc.encode(Some(&frame), true).unwrap().frames.remove(0);

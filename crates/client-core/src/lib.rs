@@ -17,7 +17,7 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicU32, Ordering},
-        Arc,
+        Arc, Mutex,
     },
 };
 
@@ -27,8 +27,8 @@ use velora_protocol::{
     identity::Identity,
     tls::{self, Fingerprint},
     wire::{
-        self, ClientMsg, FrameHeader, HelloExt, HostMsg, KeyState, MouseButton, MouseMove, FEATURE_CLIPBOARD,
-        FEATURE_FILES, PROTOCOL_VERSION,
+        self, AudioPacket, ClientMsg, DisplayList, FrameHeader, HelloExt, HostMsg, KeyState, MouseButton, MouseMove,
+        FEATURE_AUDIO, FEATURE_CLIPBOARD, FEATURE_FILES, PROTOCOL_VERSION,
     },
 };
 
@@ -200,8 +200,20 @@ async fn handshake(params: &ConnectParams, ext: Option<HelloExt>) -> Result<Hand
             }
             HostMsg::Rejected { reason } => bail!("host rejected the connection: {reason}"),
             HostMsg::PasswordRequired { wrong } => return Err(PasswordRequired { wrong }.into()),
+            // Only follows the welcome.
+            HostMsg::Displays(_) => bail!("displays before the welcome"),
         }
     }
+}
+
+/// Called with the host's displays (see [`Session::on_displays`]).
+pub type DisplaysListener = Arc<dyn Fn(&DisplayList) + Send + Sync>;
+
+/// The host's displays as last announced, and who to tell when they change.
+#[derive(Default)]
+struct Displays {
+    list: Option<DisplayList>,
+    listener: Option<DisplaysListener>,
 }
 
 pub struct Session {
@@ -214,6 +226,9 @@ pub struct Session {
     pub height: u16,
     pub input: InputSender,
     features: u32,
+    displays: Arc<Mutex<Displays>>,
+    /// Plays the host's sound, when it sends it.
+    audio: Option<Arc<velora_audio::Player>>,
     conn: quinn::Connection,
     runtime: tokio::runtime::Handle,
     _endpoint: quinn::Endpoint,
@@ -252,6 +267,37 @@ impl Session {
         on_clip: Arc<dyn Fn(u8, Vec<u8>) + Send + Sync>,
     ) {
         self.runtime.spawn(files::receive_offers(self.conn.clone(), dest, on_event, on_clip));
+    }
+
+    /// The host's displays, when it has more than one to choose from (hosts that predate the
+    /// choice never say).
+    pub fn displays(&self) -> Option<DisplayList> {
+        self.displays.lock().unwrap().list.clone()
+    }
+
+    /// Calls `listener` with the host's displays: right away if they are known, and whenever
+    /// they change (another one is streamed).
+    pub fn on_displays(&self, listener: DisplaysListener) {
+        let now = {
+            let mut displays = self.displays.lock().unwrap();
+            displays.listener = Some(listener.clone());
+            displays.list.clone()
+        };
+        if let Some(list) = now {
+            listener(&list);
+        }
+    }
+
+    /// The host's sound plays here.
+    pub fn has_audio(&self) -> bool {
+        self.audio.is_some()
+    }
+
+    /// Mutes or unmutes the host's sound.
+    pub fn set_muted(&self, muted: bool) {
+        if let Some(audio) = &self.audio {
+            audio.set_muted(muted);
+        }
     }
 
     /// Sends this computer's clipboard content to the host, when it shares its clipboard.
@@ -299,7 +345,8 @@ impl Drop for FilesSession {
 /// Connects for file transfers only.
 pub async fn connect_files(params: ConnectParams) -> Result<FilesSession> {
     const TOO_OLD: &str = "this computer's Velora is too old for file transfers; update it";
-    let hs = match handshake(&params, Some(HelloExt { files_only: true, clipboard: false, addresses: true })).await {
+    let ext = HelloExt { files_only: true, addresses: true, ..Default::default() };
+    let hs = match handshake(&params, Some(ext)).await {
         Err(e) if e.is::<NoReply>() => bail!(TOO_OLD),
         hs => hs?,
     };
@@ -317,7 +364,14 @@ pub async fn connect_files(params: ConnectParams) -> Result<FilesSession> {
 
 /// Connects, authenticates and starts delivering video to `output`.
 pub async fn connect(params: ConnectParams, output: VideoOutput) -> Result<Session> {
-    let hs = match handshake(&params, Some(HelloExt { files_only: false, clipboard: true, addresses: true })).await {
+    let ext = HelloExt {
+        files_only: false,
+        clipboard: true,
+        addresses: true,
+        displays: true,
+        audio: velora_audio::SUPPORTED,
+    };
+    let hs = match handshake(&params, Some(ext)).await {
         // Hosts that predate hello extensions drop the connection: ask again as they expect.
         Err(e) if e.is::<NoReply>() => handshake(&params, None).await?,
         hs => hs?,
@@ -333,8 +387,50 @@ pub async fn connect(params: ConnectParams, output: VideoOutput) -> Result<Sessi
             }
         }
     });
-    // Keep reading so a host-side close is noticed; no further host messages are defined yet.
-    tokio::spawn(async move { while let Ok(Some(_)) = wire::read_msg(&mut recv).await {} });
+    // Keep reading: the host announces its displays here, and a host-side close is noticed.
+    let displays = Arc::new(Mutex::new(Displays::default()));
+    {
+        let displays = displays.clone();
+        tokio::spawn(async move {
+            while let Ok(Some(body)) = wire::read_msg(&mut recv).await {
+                if let Ok(HostMsg::Displays(list)) = HostMsg::decode(&body) {
+                    let listener = {
+                        let mut displays = displays.lock().unwrap();
+                        displays.list = Some(list.clone());
+                        displays.listener.clone()
+                    };
+                    if let Some(listener) = listener {
+                        listener(&list);
+                    }
+                }
+            }
+        });
+    }
+
+    // The host's sound arrives in datagrams; newer ones only, a lost one is a short gap.
+    let audio = (features & FEATURE_AUDIO != 0).then(velora_audio::Player::start).and_then(|player| match player {
+        Ok(player) => Some(Arc::new(player)),
+        Err(e) => {
+            tracing::warn!("cannot play the host's sound: {e:#}");
+            None
+        }
+    });
+    if let Some(player) = audio.clone() {
+        let conn = conn.clone();
+        tokio::spawn(async move {
+            let mut last = 0;
+            while let Ok(datagram) = conn.read_datagram().await {
+                let Ok(packet) = AudioPacket::decode(&datagram) else { continue };
+                if packet.is_newer_than(last) {
+                    if last == 0 {
+                        tracing::info!("playing the host's sound");
+                    }
+                    last = packet.seq;
+                    player.push(packet.data);
+                }
+            }
+        });
+    }
 
     let decoder = match output {
         #[cfg(feature = "decode")]
@@ -366,6 +462,8 @@ pub async fn connect(params: ConnectParams, output: VideoOutput) -> Result<Sessi
         height,
         input: InputSender { conn: conn.clone(), control: control_tx, seq: Arc::new(AtomicU32::new(0)) },
         features,
+        displays,
+        audio,
         conn,
         runtime: tokio::runtime::Handle::current(),
         _endpoint: endpoint,
@@ -405,6 +503,11 @@ impl InputSender {
 
     pub fn release_all(&self) {
         self.send(ClientMsg::ReleaseAll);
+    }
+
+    /// Streams the host's display at `index` in [`Session::displays`].
+    pub fn select_display(&self, index: u8) {
+        self.send(ClientMsg::SelectDisplay { index });
     }
 
     pub fn request_keyframe(&self) {

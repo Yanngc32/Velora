@@ -30,7 +30,7 @@ use settings::Settings;
 use velora_client_core::{hosts, FrameSlot, InputSender, OfferEvent, Session, VideoFrame, VideoOutput};
 use velora_protocol::{
     identity::StateDir,
-    wire::{KeyState, MouseButton},
+    wire::{DisplayList, KeyState, MouseButton},
 };
 use winit::{
     application::ApplicationHandler,
@@ -139,7 +139,9 @@ fn run() -> Result<()> {
                     tracing::warn!("cannot turn sharing on: {e:#}");
                 }
             }
-            if !settings.open_at_login {
+            // On Windows the launcher then waits in the tray, to announce devices asking to
+            // send files; elsewhere only when asked to open.
+            if !settings.open_at_login && !(cfg!(windows) && settings.share_at_login) {
                 return Ok(());
             }
         }
@@ -309,13 +311,24 @@ fn run_window(
             std::process::exit(0);
         });
     }
-    println!("Shortcuts: Ctrl+Alt+Shift+F fullscreen, Ctrl+Alt+Shift+Q quit");
+    // The host's displays, when it has several: shown in the title, picked with shortcuts.
+    let displays = Arc::new(Mutex::new(None));
+    {
+        let (displays, proxy) = (displays.clone(), proxy.clone());
+        session.on_displays(Arc::new(move |list| {
+            *displays.lock().unwrap() = Some(list.clone());
+            let _ = proxy.send_event(());
+        }));
+    }
+    println!("Shortcuts, with Ctrl+Alt+Shift: F fullscreen, M next display, 1-9 a display, A sound on/off, Q quit");
     let mut app = App {
         input: session.input.clone(),
         frames,
         runtime: runtime.handle().clone(),
         proxy,
         transfers,
+        displays,
+        muted: false,
         title: format!("{} — Velora", session.host_name),
         shown_title: String::new(),
         remote_size: (session.width as u32, session.height as u32),
@@ -415,7 +428,10 @@ struct App {
     runtime: tokio::runtime::Handle,
     proxy: EventLoopProxy<()>,
     transfers: Arc<Mutex<Transfers>>,
-    /// Base title, and the one on screen (with transfers).
+    displays: Arc<Mutex<Option<DisplayList>>>,
+    /// The host's sound is muted here.
+    muted: bool,
+    /// Base title, and the one on screen (with the display, sound and transfers).
     title: String,
     shown_title: String,
     remote_size: (u32, u32),
@@ -465,10 +481,18 @@ impl App {
     }
 
     fn refresh_title(&mut self) {
-        let title = match self.transfers.lock().unwrap().summary() {
-            Some(summary) => format!("{} · {summary}", self.title),
-            None => self.title.clone(),
-        };
+        let mut title = self.title.clone();
+        if let Some(d) = self.displays.lock().unwrap().as_ref().filter(|d| d.list.len() > 1) {
+            let s = gui::strings::current();
+            let (n, of) = ((d.current as usize + 1).to_string(), d.list.len().to_string());
+            title = format!("{title} · {}", gui::strings::fill(s.session_display, &[&n, &of]));
+        }
+        if self.muted {
+            title = format!("{title} · {}", gui::strings::current().session_muted);
+        }
+        if let Some(summary) = self.transfers.lock().unwrap().summary() {
+            title = format!("{title} · {summary}");
+        }
         if title != self.shown_title {
             if let Some(w) = &self.window {
                 w.set_title(&title);
@@ -530,12 +554,46 @@ impl App {
                 self.session.close();
                 event_loop.exit();
             }
-            _ => return false,
+            KeyCode::KeyA if self.session.has_audio() => {
+                self.muted = !self.muted;
+                self.session.set_muted(self.muted);
+                self.refresh_title();
+            }
+            // The host's next display, or one by its number.
+            KeyCode::KeyM => {
+                let displays = self.displays.lock().unwrap().clone();
+                if let Some(d) = displays.filter(|d| d.list.len() > 1) {
+                    self.input.select_display(((d.current as usize + 1) % d.list.len()) as u8);
+                }
+            }
+            _ => {
+                let Some(index) = digit(key) else { return false };
+                let count = self.displays.lock().unwrap().as_ref().map_or(0, |d| d.list.len());
+                if index < count {
+                    self.input.select_display(index as u8);
+                }
+            }
         }
         // The modifiers already reached the host; don't leave them held there.
         self.input.release_all();
         true
     }
+}
+
+/// 0 for the 1 key up to 8 for the 9 key.
+fn digit(key: KeyCode) -> Option<usize> {
+    const DIGITS: [KeyCode; 9] = [
+        KeyCode::Digit1,
+        KeyCode::Digit2,
+        KeyCode::Digit3,
+        KeyCode::Digit4,
+        KeyCode::Digit5,
+        KeyCode::Digit6,
+        KeyCode::Digit7,
+        KeyCode::Digit8,
+        KeyCode::Digit9,
+    ];
+    DIGITS.iter().position(|&d| d == key)
 }
 
 impl ApplicationHandler for App {

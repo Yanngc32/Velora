@@ -4723,6 +4723,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "velora-audio"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "ffmpeg-sys-next",
+ "tracing",
+ "windows",
+]
+
+[[package]]
 name = "velora-client-core"
 version = "0.4.0"
 dependencies = [
@@ -4733,6 +4743,7 @@ dependencies = [
  "quinn",
  "tokio",
  "tracing",
+ "velora-audio",
  "velora-protocol",
  "windows",
 ]
@@ -4768,6 +4779,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "velora-audio",
  "velora-clipboard",
  "velora-protocol",
  "velora-update",

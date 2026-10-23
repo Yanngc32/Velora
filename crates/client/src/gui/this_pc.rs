@@ -95,6 +95,31 @@ impl HostLink {
     pub fn send(&self, request: Request) {
         let _ = self.requests.send(request);
     }
+
+    /// The same link, for another thread (the tray icon's).
+    #[cfg(windows)]
+    pub fn handle(&self) -> HostHandle {
+        HostHandle { view: self.view.clone(), requests: self.requests.clone() }
+    }
+}
+
+/// A [`HostLink`] seen from another thread.
+#[cfg(windows)]
+#[derive(Clone)]
+pub struct HostHandle {
+    view: Arc<Mutex<Arc<HostView>>>,
+    requests: mpsc::Sender<Request>,
+}
+
+#[cfg(windows)]
+impl HostHandle {
+    pub fn view(&self) -> Arc<HostView> {
+        self.view.lock().unwrap().clone()
+    }
+
+    pub fn send(&self, request: Request) {
+        let _ = self.requests.send(request);
+    }
 }
 
 /// `velora-host`, installed next to this executable.
@@ -117,6 +142,7 @@ enum Action {
     Service(bool),
     /// Set (`Some`) or remove the access password.
     SetPassword(Option<String>),
+    StayAwake(bool),
 }
 
 /// An elevated `velora-host service install|uninstall` in progress, or its outcome.
@@ -481,6 +507,10 @@ impl Launcher {
                 ui.add_space(16.0);
                 self.password_card(ui, status.password_set, &mut action);
                 ui.add_space(16.0);
+                if let Some(on) = status.stay_awake {
+                    self.stay_awake_card(ui, on, &mut action);
+                    ui.add_space(16.0);
+                }
                 ui.horizontal(|ui| {
                     // The service would only start the host again.
                     if !status.service && secondary_button(ui, s.share_stop).clicked() {
@@ -511,6 +541,7 @@ impl Launcher {
                 self.draft_password.clear();
                 self.host.send(Request::SetPassword { password });
             }
+            Some(Action::StayAwake(on)) => self.host.send(Request::SetStayAwake { on }),
             None => {}
         }
     }
@@ -540,6 +571,28 @@ impl Launcher {
                 if set && secondary_button(ui, s.password_remove).clicked() {
                     *action = Some(Action::SetPassword(None));
                 }
+            });
+        });
+    }
+
+    /// Keeping the computer awake while it is shared.
+    fn stay_awake_card(&self, ui: &mut egui::Ui, on: bool, action: &mut Option<Action>) {
+        let s = self.s;
+        card(ui, |ui| {
+            ui.horizontal(|ui| {
+                // Leave room for the switch so the note wraps before it.
+                let text_width = ui.available_width() - 64.0;
+                ui.allocate_ui_with_layout(egui::vec2(text_width, 0.0), Layout::top_down(Align::Min), |ui| {
+                    ui.spacing_mut().item_spacing.y = 4.0;
+                    card_title(ui, s.stay_awake_title);
+                    ui.add(egui::Label::new(RichText::new(s.stay_awake_text).color(WEAK)).wrap());
+                });
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let mut next = on;
+                    if toggle(ui, &mut next, true).changed() {
+                        *action = Some(Action::StayAwake(next));
+                    }
+                });
             });
         });
     }

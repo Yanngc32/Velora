@@ -12,6 +12,8 @@ mod motion;
 pub(crate) mod strings;
 mod theme;
 mod this_pc;
+#[cfg(windows)]
+mod tray;
 mod widgets;
 
 use std::{
@@ -42,7 +44,8 @@ use crate::settings::Settings;
 const ICON_PNG: &[u8] = include_bytes!("../../assets/velora-icon.png");
 const REPO_URL: &str = "https://github.com/Yanngc32/Velora";
 
-/// Opens the launcher; `minimized` when started at sign-in.
+/// Opens the launcher; `minimized` when started at sign-in. On Windows it then starts in the
+/// tray, without a window.
 pub fn run(state: StateDir, config_dir: Option<PathBuf>, no_update: bool, minimized: bool) -> Result<()> {
     let icon = image::load_from_memory(ICON_PNG)?.into_rgba8();
     let (w, h) = icon.dimensions();
@@ -66,10 +69,15 @@ pub fn run(state: StateDir, config_dir: Option<PathBuf>, no_update: bool, minimi
                 egui::TextureOptions::LINEAR,
             );
             let icons = Icons::load(&cc.egui_ctx)?;
-            if minimized {
+            #[allow(unused_mut)]
+            let mut launcher = Launcher::new(state, config_dir, no_update, logo, icons, &cc.egui_ctx);
+            #[cfg(windows)]
+            launcher.start_tray(cc, &icon, minimized);
+            // Without a tray icon there is nowhere else to wait: the taskbar.
+            if minimized && !launcher.has_tray() {
                 cc.egui_ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
             }
-            Ok(Box::new(Launcher::new(state, config_dir, no_update, logo, icons, &cc.egui_ctx)))
+            Ok(Box::new(launcher))
         }),
     )
     .map_err(|e| anyhow!("{e}"))
@@ -187,6 +195,11 @@ struct Launcher {
     password_prompt: Option<PasswordPrompt>,
     /// The file manager of one paired computer, kept while you look elsewhere.
     files: Option<files::FileManager>,
+    /// The icon next to the clock; closing the window leaves the launcher there.
+    #[cfg(windows)]
+    tray: Option<tray::Tray>,
+    /// Started at sign-in with a tray icon: hide the window once eframe first shows it.
+    start_hidden: bool,
 }
 
 impl Launcher {
@@ -241,6 +254,9 @@ impl Launcher {
             draft_password: String::new(),
             password_prompt: None,
             files: None,
+            #[cfg(windows)]
+            tray: None,
+            start_hidden: false,
         };
         if !launcher.hosts.is_empty() {
             launcher.page = Page::Devices;
@@ -249,6 +265,53 @@ impl Launcher {
             launcher.check_updates(ctx, true);
         }
         launcher
+    }
+
+    /// Adds the tray icon, which needs the launcher's window to show it again. `hidden`: start
+    /// with only the icon (at sign-in).
+    #[cfg(windows)]
+    fn start_tray(&mut self, cc: &eframe::CreationContext, icon: &image::RgbaImage, hidden: bool) {
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+        let Some(window) = cc.window_handle().ok().and_then(|h| match h.as_raw() {
+            RawWindowHandle::Win32(h) => Some(h.hwnd.get()),
+            _ => None,
+        }) else {
+            return;
+        };
+        self.tray = tray::Tray::start(icon, self.host.handle(), cc.egui_ctx.clone(), self.config_dir.clone(), self.s);
+        if let Some(tray) = &self.tray {
+            tray.set_launcher(window);
+            self.start_hidden = hidden;
+        }
+    }
+
+    /// Closing the window leaves the launcher in the tray, when there is one and the setting
+    /// says so.
+    fn close_to_tray(&mut self, ctx: &egui::Context) {
+        // eframe shows the window after painting its first frame, whatever it was built with;
+        // commands from that frame apply after, so it is hidden right away.
+        if std::mem::take(&mut self.start_hidden) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        }
+        #[cfg(windows)]
+        if let Some(tray) = &self.tray {
+            if self.settings.close_to_tray && ctx.input(|i| i.viewport().close_requested()) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                tray.hidden();
+            }
+        }
+        #[cfg(not(windows))]
+        let _ = ctx;
+    }
+
+    /// Whether closing the window can leave the launcher in the tray.
+    fn has_tray(&self) -> bool {
+        #[cfg(windows)]
+        return self.tray.is_some();
+        #[cfg(not(windows))]
+        false
     }
 
     fn refresh_hosts(&mut self) {
@@ -784,12 +847,18 @@ impl Launcher {
                 })
                 .inner
             };
-            row(ui, s.open_at_login, s.open_at_login_text, &mut next.open_at_login, true);
+            let tray = self.has_tray();
+            let open_note = if tray { s.open_at_login_tray_text } else { s.open_at_login_text };
+            row(ui, s.open_at_login, open_note, &mut next.open_at_login, true);
             ui.add_space(10.0);
             let note = if service { s.share_at_login_service } else { s.share_at_login_text };
             let mut share = next.share_at_login && !service;
             if row(ui, s.share_at_login, note, &mut share, !service) {
                 next.share_at_login = share;
+            }
+            if tray {
+                ui.add_space(10.0);
+                row(ui, s.close_to_tray, s.close_to_tray_text, &mut next.close_to_tray, true);
             }
         });
         if next != self.settings {
@@ -1008,6 +1077,7 @@ impl Launcher {
 impl eframe::App for Launcher {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.now = ui.input(|i| i.time);
+        self.close_to_tray(&ui.ctx().clone());
         self.poll_sessions();
         if !self.sessions.is_empty() || matches!(*self.update.lock().unwrap(), UpdateState::Checking) {
             ui.ctx().request_repaint_after(Duration::from_millis(300));

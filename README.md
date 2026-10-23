@@ -53,8 +53,8 @@ image quality.
     </td>
     <td width="33%" valign="top">
       <b>🎮 GPU end to end</b><br>
-      NVENC, AMF, Quick Sync or VA-API encoding. On Windows, GPU decoding shown in place:
-      2.7 ms per frame at 1080p.
+      NVENC, AMF, Quick Sync or VA-API encoding. On Windows, frames stay on the GPU from
+      capture to encoder and from decoder to screen.
     </td>
     <td width="33%" valign="top">
       <b>📶 Adaptive bitrate</b><br>
@@ -194,8 +194,24 @@ its own window.
 access password. **Settings → Start with Windows** opens the app and/or turns sharing on at
 sign-in.
 
+On Windows, Velora also has an icon next to the clock. It shows whether this PC is shared and
+who is connected, opens the app, and its menu turns sharing on and off or quits. Closing the
+window leaves Velora there (**Settings → Keep running next to the clock when closed**), where
+it announces devices asking to send files. Started at sign-in, it opens straight to the icon.
+
+While sharing is on, the host keeps the computer from going to sleep, so it stays reachable
+even when it sits locked for hours (**This PC → Keep this PC awake**, on by default). The
+screen may still turn off, but stays on during a session. On Windows, `powercfg /requests`
+lists both under Velora. A closed laptop lid still puts it to sleep.
+
 Client shortcuts: <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>F</kbd> toggles
 fullscreen, <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>Q</kbd> quits.
+
+When a Windows host has several displays, a session starts on the main one and its window
+title says which is shown ("Display 2 of 3").
+<kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>M</kbd> moves to the next display and
+<kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>1</kbd>…<kbd>9</kbd> picks one; the mouse
+follows. A Linux host streams its whole desktop, every monitor at once.
 
 When a second paired device connects, it takes over the session. Switching from the phone to
 the laptop just works.
@@ -226,6 +242,14 @@ velora-host revoke <name|fingerprint>
 velora-host password [--clear]      # password paired devices must also type to connect
 velora-host run --fps 60 --bitrate 12000 --bind 0.0.0.0:7420 --encoder auto
 ```
+
+### Sound
+
+On Windows, what the host plays comes out of the client during a session. It travels as Opus
+at 96 kbit/s, 20 ms per datagram, through a short buffer: a lost packet is a 20 ms gap, never
+a delay for the ones after it. <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>A</kbd>
+mutes it. Sound needs builds with FFmpeg (the released ones) on both computers; Linux hosts
+and the Android app don't send or play it yet.
 
 ### Lock screen access (Windows)
 
@@ -361,6 +385,7 @@ project yet (no GPU in CI).
 | `crates/mobile` (`velora-mobile`) | Client core exported to the mobile apps through [UniFFI](https://mozilla.github.io/uniffi-rs/) |
 | `crates/uniffi-bindgen` | Generates the Kotlin (later Swift) bindings for `velora-mobile` |
 | `android/` | Android app (Kotlin): MediaCodec hardware decoding, trackpad, soft and physical keyboards |
+| `crates/audio` (`velora-audio`) | The host's sound: WASAPI loopback capture and playback, Opus through FFmpeg |
 | `crates/update` | Self-updates from GitHub Releases |
 | `crates/release` (`velora-release`) | Release tooling used by CI: packaging and the update manifest |
 
@@ -395,6 +420,12 @@ NVENC, then AMF, then Quick Sync on Windows, and NVENC, then VA-API, then Quick 
 If none opens, it falls back to software. To force one, pass `--encoder nvenc|amf|qsv|vaapi|software`,
 or `--encoder ffmpeg:<name>` for any FFmpeg encoder. All hardware encoders are configured for
 low latency: no B-frames, CBR, no lookahead, and keyframes only on demand.
+
+On Windows, NVENC, AMF and Quick Sync take frames without them leaving the GPU: the D3D11
+video processor converts the captured desktop to NV12 on the GPU that captured it, straight
+into the encoder's own textures, and the CPU does none of it (measured with Quick Sync on an
+Intel UHD 750: about 5 ms per 1080p frame). If that path fails, the host goes back to
+converting on the CPU; `VELORA_ZERO_COPY=0` keeps it there.
 
 The bitrate adapts to the network: `--bitrate` (12000 kbit/s by default) is the most. When
 frames take well longer than usual to be acknowledged, or the host has to hold frames back,
@@ -461,16 +492,15 @@ the Rust core and generates its Kotlin bindings.
 
 ## Roadmap
 
-1. **Zero-copy GPU pipeline.** Hardware encoders work today, but frames still go through CPU
-   color conversion and an upload. Next: convert on the GPU (D3D11 video processor, VA-API VPP)
-   and hand the DXGI texture straight to the encoder.
+1. **Zero-copy capture on Linux.** On Windows, captured frames reach the encoder without
+   leaving the GPU; on Linux they are still converted on the CPU and uploaded. Next: VA-API VPP.
 2. **Zero-copy decoding on Linux.** Windows decodes and shows pictures without leaving the
    GPU; VA-API still copies them back. Next: import the VA-API surface into EGL (dma-buf).
 3. **Mobile:** an iOS app (Swift + VideoToolbox) on the same `velora-mobile` core. On Android:
    pinch to zoom, a direct-touch mode, and Play Store publishing.
 4. **NAT traversal.** A self-hostable rendezvous server, UDP hole punching, and a relay fallback.
-5. Wayland capture (xdg-desktop-portal + PipeWire), multi-monitor selection, cursor shape sync,
-   audio, relative mouse mode for games.
+5. Wayland capture (xdg-desktop-portal + PipeWire), display selection on Linux, cursor shape sync,
+   sound on Linux and Android, relative mouse mode for games.
 6. A systemd user service; installers.
 
 ## Releasing (maintainers)

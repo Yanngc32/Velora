@@ -10,7 +10,7 @@ use std::{
     net::SocketAddr,
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -25,7 +25,8 @@ use velora_protocol::{
     pairing::{pairing_uri_with, parse_pairing_uri, PairingCode},
     tls::{self, Fingerprint},
     wire::{
-        self, ClientMsg, Codec, FrameHeader, HostMsg, MouseMove, FEATURE_CLIPBOARD, FEATURE_FILES, PROTOCOL_VERSION,
+        self, AudioPacket, ClientMsg, Codec, DisplayInfo, DisplayList, FrameHeader, HelloExt, HostMsg, MouseMove,
+        FEATURE_AUDIO, FEATURE_CLIPBOARD, FEATURE_FILES, PROTOCOL_VERSION,
     },
 };
 
@@ -102,6 +103,7 @@ pub struct Shared {
     active: Mutex<Option<Active>>,
     files: Mutex<Vec<FilesConn>>,
     shutdown: tokio::sync::Notify,
+    awake: crate::awake::Awake,
 }
 
 /// Runs until the endpoint fails or the launcher stops the host, or until an update was
@@ -119,7 +121,9 @@ pub async fn run(options: HostOptions, state: StateDir, pair: bool, auto_update:
         identity.fingerprint()
     );
 
+    let awake = crate::awake::Awake::start(&state);
     let shared = Arc::new(Shared {
+        awake,
         options,
         state,
         password: crate::password::Gate::default(),
@@ -290,7 +294,9 @@ async fn handle_connection(incoming: quinn::Incoming, shared: Arc<Shared>) -> Re
 
     let clipboard = ext.is_some_and(|e| e.clipboard).then(|| share_clipboard(&conn)).flatten();
     let peer = Peer { shared: shared.clone(), name: name.clone(), fingerprint, clipboard };
-    let result = run_session(&conn, send, recv, &shared, features, addresses, peer).await;
+    // The screen stays on while the device watches it.
+    let _screen = shared.awake.screen_on();
+    let result = run_session(&conn, send, recv, &shared, ext, addresses, peer).await;
 
     shared.input.send(InputCmd::ReleaseAll);
     let mut active = shared.active.lock().unwrap();
@@ -378,10 +384,15 @@ impl Shared {
         }
         // Sending files changes nothing about access, and reads them as the user at the console.
         // Dismissing an offer only forgets it: access to this computer stays as it was. Answering
-        // a device's files is the user's call: it can reach their screen already.
+        // a device's files is the user's call: it can reach their screen already. Staying awake
+        // decides only whether the computer sleeps.
         let harmless = matches!(
             request,
-            Request::Status | Request::SendFiles { .. } | Request::DismissOffer { .. } | Request::AnswerFiles { .. }
+            Request::Status
+                | Request::SendFiles { .. }
+                | Request::DismissOffer { .. }
+                | Request::AnswerFiles { .. }
+                | Request::SetStayAwake { .. }
         );
         if self.options.service && !privileged && !harmless {
             return Err("only an administrator can change this computer's access".into());
@@ -407,6 +418,7 @@ impl Shared {
                 Ok(())
             }
             Request::SendFiles { paths } => self.send_files(paths),
+            Request::SetStayAwake { on } => self.awake.set(&self.state, on),
         };
         result.and_then(|()| self.status()).map_err(|e| format!("{e:#}"))
     }
@@ -494,6 +506,7 @@ impl Shared {
                     folder: r.folder.clone(),
                 })
                 .collect(),
+            stay_awake: self.awake.setting(&self.state),
         })
     }
 
@@ -744,6 +757,12 @@ struct Session {
     max_in_flight: AtomicU32,
     last_ack: Mutex<Instant>,
     stats: Mutex<Stats>,
+    /// The display the client asked for, by index in `capture::list()`.
+    display: AtomicUsize,
+    /// The display being captured, once the capture thread switched to it.
+    shown: AtomicUsize,
+    /// The capture thread switched displays (or could not): tell the client.
+    display_changed: tokio::sync::Notify,
 }
 
 /// Deliveries and waits of the current rate control period.
@@ -781,12 +800,18 @@ async fn run_session(
     mut control_send: quinn::SendStream,
     mut control_recv: quinn::RecvStream,
     shared: &Arc<Shared>,
-    features: Option<u32>,
+    ext: Option<HelloExt>,
     addresses: Vec<String>,
     peer: Peer,
 ) -> Result<()> {
     let client_name = peer.name.clone();
     let opts = &shared.options;
+    // The host's sound goes to clients that play it, from builds that can capture it.
+    let audio = ext.is_some_and(|e| e.audio) && velora_audio::SUPPORTED;
+    let features = ext.map(|_| FEATURE_FILES | FEATURE_CLIPBOARD | if audio { FEATURE_AUDIO } else { 0 });
+    // Sessions start on the primary display.
+    let displays = capture::list();
+    let first = displays.iter().position(|d| d.primary).unwrap_or(0);
     let session = Arc::new(Session {
         running: AtomicBool::new(true),
         keyframe_requested: AtomicBool::new(true),
@@ -796,6 +821,9 @@ async fn run_session(
         max_in_flight: AtomicU32::new(MIN_IN_FLIGHT + 1),
         last_ack: Mutex::new(Instant::now()),
         stats: Mutex::new(Stats::default()),
+        display: AtomicUsize::new(first),
+        shown: AtomicUsize::new(first),
+        display_changed: tokio::sync::Notify::new(),
     });
 
     let (frame_tx, mut frame_rx) = mpsc::channel::<OutFrame>(4);
@@ -839,6 +867,51 @@ async fn run_session(
         )
         .await?;
 
+    if audio {
+        let (conn, session) = (conn.clone(), session.clone());
+        std::thread::Builder::new().name("audio".into()).spawn(move || {
+            let mut seq = 0u32;
+            let sent = velora_audio::stream_loopback(
+                || session.running.load(Ordering::Relaxed),
+                |data| {
+                    seq = seq.wrapping_add(1);
+                    // Fails only once the connection is gone.
+                    conn.send_datagram(AudioPacket { seq, data: data.to_vec() }.encode().into()).is_ok()
+                },
+            );
+            if let Err(e) = sent {
+                tracing::warn!("sound not shared: {e:#}");
+            }
+        })?;
+    }
+
+    // Clients that can pick a display hear which there are, now and after every switch.
+    let offer_displays = ext.is_some_and(|e| e.displays) && displays.len() > 1;
+    let display_list = |current: usize| {
+        let list = displays
+            .iter()
+            .map(|d| DisplayInfo {
+                name: d.name.clone(),
+                width: d.rect.width.min(u16::MAX as u32) as u16,
+                height: d.rect.height.min(u16::MAX as u32) as u16,
+                primary: d.primary,
+            })
+            .collect();
+        HostMsg::Displays(DisplayList { current: current as u8, list })
+    };
+    if offer_displays {
+        control_send.write_all(&display_list(first).encode()).await?;
+    }
+    let announce = async {
+        if !offer_displays {
+            return std::future::pending().await;
+        }
+        loop {
+            session.display_changed.notified().await;
+            control_send.write_all(&display_list(session.shown.load(Ordering::Relaxed)).encode()).await?;
+        }
+    };
+
     let video = async {
         while let Some(frame) = frame_rx.recv().await {
             let header =
@@ -873,6 +946,10 @@ async fn run_session(
                 }
                 ClientMsg::Text { text } => shared.input.send(InputCmd::Text(text)),
                 ClientMsg::OfferPairing { link } => shared.offer(&client_name, link),
+                ClientMsg::SelectDisplay { index } if (index as usize) < displays.len() => {
+                    session.display.store(index as usize, Ordering::Relaxed)
+                }
+                ClientMsg::SelectDisplay { index } => tracing::debug!("no display {index}"),
                 ClientMsg::Unsupported { tag } => tracing::debug!("ignoring unsupported message {tag}"),
                 ClientMsg::Hello { .. } => bail!("unexpected hello"),
             }
@@ -935,11 +1012,33 @@ async fn run_session(
         r = control => r,
         r = pointer => r,
         r = monitor => r,
+        r = announce => r,
         r = crate::transfer::accept(conn.clone(), peer) => r,
         e = conn.closed() => Err(e.into()),
     };
     session.running.store(false, Ordering::Relaxed);
     result
+}
+
+/// Opens the encoder for `capturer`'s frames: on its GPU when `gpu` allows and the encoder can
+/// take them there, else from memory. The capture follows the encoder's choice.
+fn open_encoder(
+    choice: &EncoderChoice,
+    settings: EncoderSettings,
+    rect: DisplayRect,
+    capturer: &mut dyn capture::Capturer,
+    gpu: bool,
+) -> Result<Box<dyn encode::VideoEncoder>> {
+    #[cfg(windows)]
+    let device = if gpu { capturer.device() } else { None };
+    #[cfg(not(windows))]
+    let device: Option<encode::GpuDevice> = {
+        let _ = gpu;
+        None
+    };
+    let encoder = encode::open(choice, settings, rect.width, rect.height, device.as_ref())?;
+    capturer.set_gpu_frames(encoder.on_gpu());
+    Ok(encoder)
 }
 
 fn capture_loop(
@@ -950,10 +1049,13 @@ fn capture_loop(
     ready: oneshot::Sender<Result<DisplayRect>>,
     input: &InputHandle,
 ) -> Result<()> {
+    let mut shown = session.display.load(Ordering::Relaxed);
+    // Frames stay on the GPU for encoders that take them there, until that fails once.
+    let mut gpu = encode::zero_copy();
     let setup = || -> Result<_> {
-        let capturer = capture::open()?;
+        let mut capturer = capture::open(shown)?;
         let rect = capturer.rect();
-        let encoder = encode::open(choice, settings, rect.width, rect.height)?;
+        let encoder = open_encoder(choice, settings, rect, capturer.as_mut(), gpu)?;
         tracing::info!("encoder: {}", encoder.name());
         Ok((capturer, encoder))
     };
@@ -975,6 +1077,30 @@ fn capture_loop(
     let mut last_capture = Instant::now() - interval;
 
     while session.running.load(Ordering::Relaxed) {
+        // The client picked another display: capture it instead, at its size.
+        let wanted = session.display.load(Ordering::Relaxed);
+        if wanted != shown {
+            match capture::open(wanted) {
+                Ok(next) => {
+                    capturer = next;
+                    rect = capturer.rect();
+                    input.send(InputCmd::SetDisplay(rect));
+                    let settings = EncoderSettings { bitrate_kbps: bitrate, ..settings };
+                    encoder = open_encoder(choice, settings, rect, capturer.as_mut(), gpu)?;
+                    session.keyframe_requested.store(true, Ordering::Relaxed);
+                    have_picture = false;
+                    shown = wanted;
+                    tracing::info!("streaming display {}", wanted + 1);
+                }
+                Err(e) => {
+                    tracing::warn!("cannot capture display {}: {e:#}", wanted + 1);
+                    session.display.store(shown, Ordering::Relaxed);
+                }
+            }
+            session.shown.store(shown, Ordering::Relaxed);
+            session.display_changed.notify_one();
+        }
+
         // Never capture faster than the target frame rate.
         let since = last_capture.elapsed();
         if since < interval {
@@ -1016,14 +1142,34 @@ fn capture_loop(
             bitrate = target;
             if !encoder.set_bitrate(target) {
                 let settings = EncoderSettings { bitrate_kbps: target, ..settings };
-                encoder = encode::open(choice, settings, rect.width, rect.height)?;
+                encoder = open_encoder(choice, settings, rect, capturer.as_mut(), gpu)?;
                 session.keyframe_requested.store(true, Ordering::Relaxed);
+                continue;
             }
+        }
+        // Captured before the encoder switched between the GPU and memory: wait for the next.
+        #[cfg(windows)]
+        if frame.as_ref().is_some_and(|f| f.texture.is_some() != encoder.on_gpu()) {
+            session.keyframe_requested.store(true, Ordering::Relaxed);
+            continue;
         }
         let keyframe = keyframe || session.keyframe_requested.load(Ordering::Relaxed);
         session.keyframe_requested.store(false, Ordering::Relaxed);
         let encode_start = Instant::now();
-        let encoded = encoder.encode(frame.as_ref(), keyframe)?;
+        let encoded = match encoder.encode(frame.as_ref(), keyframe) {
+            Ok(encoded) => encoded,
+            // Encoding on the GPU is the newer path: if it fails, copy frames to memory instead.
+            Err(e) if encoder.on_gpu() => {
+                tracing::warn!("encoding frames on the GPU failed: {e:#}; copying them to memory instead");
+                gpu = false;
+                let settings = EncoderSettings { bitrate_kbps: bitrate, ..settings };
+                encoder = open_encoder(choice, settings, rect, capturer.as_mut(), gpu)?;
+                session.keyframe_requested.store(true, Ordering::Relaxed);
+                have_picture = false;
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
         {
             let mut stats = session.stats.lock().unwrap();
             stats.convert_time += encoded.convert_time;
