@@ -8,11 +8,13 @@ pub mod files;
 pub mod hosts;
 #[cfg(feature = "ffmpeg")]
 mod hwdecode;
+pub mod reach;
 mod reorder;
 #[cfg(feature = "decode")]
 mod video;
 
 use std::{
+    future::Future,
     net::SocketAddr,
     path::PathBuf,
     sync::{
@@ -33,6 +35,7 @@ use velora_protocol::{
 };
 
 pub use files::{OfferEvent, RemoteFiles};
+pub use reach::{ReachInfo, Route, WakeOutcome};
 
 #[cfg(feature = "decode")]
 pub use video::{Chroma, FrameSlot, GpuPicture, VideoFrame};
@@ -57,6 +60,7 @@ pub enum VideoOutput {
     Encoded(Arc<dyn Fn(EncodedFrame) + Send + Sync>),
 }
 
+#[derive(Clone)]
 pub struct ConnectParams {
     pub addr: SocketAddr,
     /// Other addresses of the host (LAN, VPN mesh): tried at once, a little after `addr`, and
@@ -69,6 +73,10 @@ pub struct ConnectParams {
     pub pairing_secret: Option<[u8; wire::PAIRING_SECRET_LEN]>,
     /// The host's access password, when the user gave one.
     pub password: Option<String>,
+    /// What this device remembers about reaching the host from other networks (see [`reach`]):
+    /// more addresses with their kinds, relays, the DHT key. `None` for a host never connected
+    /// to, as when pairing; the race then has `addr` and `also` and nothing else.
+    pub reach: Option<reach::ReachParams>,
 }
 
 /// The host has an access password: ask the user for it and connect again with
@@ -112,51 +120,50 @@ struct Handshake {
     height: u16,
     features: u32,
     addresses: Vec<String>,
+    route: Route,
 }
 
-/// How long each further address waits before it is tried: the first usually answers.
-const ADDRESS_STAGGER: std::time::Duration = std::time::Duration::from_millis(250);
+/// A connection to the host whose TLS handshake is done, and the way it was made.
+struct Established {
+    endpoint: quinn::Endpoint,
+    conn: quinn::Connection,
+    route: Route,
+}
 
-/// Sets up the secure connection to the host, racing its addresses when it has several. Only
-/// the TLS handshake races: the host opens nothing before the hello, which goes on the winner
-/// alone, so the others never become a session that would take over.
-async fn establish(params: &ConnectParams) -> Result<(quinn::Endpoint, quinn::Connection)> {
+/// Sets up the secure connection to the host, racing the ways of reaching it (see [`reach`]):
+/// the addresses stored for it, then more that the DHT lookup finds while the race runs, the
+/// relays it is registered with, a hole punch. Only the TLS handshake races: the host opens
+/// nothing before the hello, which goes on the winner alone, so the others never become a
+/// session that would take over.
+async fn establish(params: &ConnectParams) -> Result<Established> {
+    let shared = Arc::new(params.clone());
+    // Only with the host's key and this device's secret, which come with its `Reach`.
+    let lookup = reach::can_resolve(params).then(|| {
+        let shared = shared.clone();
+        async move { reach::resolve_record(&shared).await }
+    });
+    establish_with(shared, lookup).await
+}
+
+/// [`establish`] with the lookup given, so that tests can bring candidates in late.
+async fn establish_with<L>(params: Arc<ConnectParams>, lookup: Option<L>) -> Result<Established>
+where
+    L: Future<Output = Result<Vec<reach::Candidate>>> + Send + 'static,
+{
     let config = tls::client_config(&params.identity, params.host_fingerprint)?;
-    let mut addrs = vec![params.addr];
-    addrs.extend(params.also.iter().filter(|a| **a != params.addr));
-    let mut attempts = tokio::task::JoinSet::new();
-    for (i, addr) in addrs.into_iter().enumerate() {
-        let config = config.clone();
-        attempts.spawn(async move {
-            tokio::time::sleep(ADDRESS_STAGGER * i as u32).await;
-            let reached = async {
-                let bind: SocketAddr = if addr.is_ipv6() { "[::]:0".parse()? } else { "0.0.0.0:0".parse()? };
-                let mut endpoint = quinn::Endpoint::client(bind)?;
-                endpoint.set_default_client_config(config);
-                let conn = endpoint.connect(addr, tls::SERVER_NAME)?.await?;
-                anyhow::Ok((endpoint, conn))
-            };
-            reached.await.map_err(|e| (i, e))
-        });
-    }
-    let mut failure: Option<(usize, anyhow::Error)> = None;
-    while let Some(attempt) = attempts.join_next().await {
-        match attempt {
-            Ok(Ok(found)) => {
-                attempts.abort_all();
-                return Ok(found);
-            }
-            // The main address's failure says most; keep it over the others.
-            Ok(Err((i, e))) if failure.as_ref().is_none_or(|(j, _)| i < *j) => failure = Some((i, e)),
-            _ => {}
-        }
-    }
-    let error = failure.map_or_else(|| anyhow::anyhow!("no address to try"), |(_, e)| e);
-    Err(error.context("could not establish a secure connection (wrong address or host fingerprint changed?)"))
+    let first = reach::stored_candidates(&params);
+    let dial = move |candidate: reach::Candidate| {
+        let (params, config) = (params.clone(), config.clone());
+        async move { reach::dial(&params, config, &candidate).await }
+    };
+    let (candidate, (endpoint, conn)) = reach::race(first, lookup, dial).await.map_err(|e| {
+        e.context("could not establish a secure connection (wrong address or host fingerprint changed?)")
+    })?;
+    Ok(Established { endpoint, conn, route: candidate.route() })
 }
 
 async fn handshake(params: &ConnectParams, ext: Option<HelloExt>) -> Result<Handshake> {
-    let (endpoint, conn) = establish(params).await?;
+    let Established { endpoint, conn, route } = establish(params).await?;
 
     let (mut send, mut recv) = conn.open_bi().await?;
     send.write_all(
@@ -196,13 +203,15 @@ async fn handshake(params: &ConnectParams, ext: Option<HelloExt>) -> Result<Hand
                     height,
                     features: features.unwrap_or(0),
                     addresses,
+                    route,
                 });
             }
             HostMsg::Rejected { reason } => bail!("host rejected the connection: {reason}"),
             HostMsg::PasswordRequired { wrong } => return Err(PasswordRequired { wrong }.into()),
             // Only follows the welcome.
             HostMsg::Displays(_) => bail!("displays before the welcome"),
-            // reach: filled in by F1
+            // `Reach` follows the welcome too (see `read_control`); the other two are what a relay says to the dialer
+            // that asked it, on a connection of its own, never to the hello of a host.
             HostMsg::Reach { .. } | HostMsg::RelayStatus { .. } | HostMsg::PunchRequest { .. } => {
                 bail!("unexpected message before the welcome")
             }
@@ -220,6 +229,16 @@ struct Displays {
     listener: Option<DisplaysListener>,
 }
 
+/// Called with what the host said about reaching it from elsewhere (see [`Session::on_reach`]).
+pub type ReachListener = Arc<dyn Fn(&ReachInfo) + Send + Sync>;
+
+/// What the host last said about reaching it, and who to tell when it says it.
+#[derive(Default)]
+struct ReachSlot {
+    info: Option<ReachInfo>,
+    listeners: Vec<ReachListener>,
+}
+
 pub struct Session {
     pub host_name: String,
     /// Where else the host answers (see `HostMsg::Welcome`).
@@ -231,6 +250,8 @@ pub struct Session {
     pub input: InputSender,
     features: u32,
     displays: Arc<Mutex<Displays>>,
+    reach: Arc<Mutex<ReachSlot>>,
+    route: Route,
     /// Plays the host's sound, when it sends it.
     audio: Option<Arc<velora_audio::Player>>,
     conn: quinn::Connection,
@@ -290,6 +311,31 @@ impl Session {
         if let Some(list) = now {
             listener(&list);
         }
+    }
+
+    /// What the host said about reaching it from other networks, once it has said it (hosts that
+    /// predate standalone reach never do). Arrives just after the welcome.
+    pub fn reach(&self) -> Option<ReachInfo> {
+        self.reach.lock().unwrap().info.clone()
+    }
+
+    /// Calls `listener` with what the host says about reaching it: right away if it has said,
+    /// and again if it says more. Listeners add up; none replaces another, since `hosts` keeps
+    /// the known-hosts file up to date through one of them.
+    pub fn on_reach(&self, listener: ReachListener) {
+        let now = {
+            let mut slot = self.reach.lock().unwrap();
+            slot.listeners.push(listener.clone());
+            slot.info.clone()
+        };
+        if let Some(info) = now {
+            listener(&info);
+        }
+    }
+
+    /// How this connection was made: the kind of the address that won the race and that address.
+    pub fn route(&self) -> &Route {
+        &self.route
     }
 
     /// The host's sound plays here.
@@ -374,15 +420,27 @@ pub async fn connect(params: ConnectParams, output: VideoOutput) -> Result<Sessi
         addresses: true,
         displays: true,
         audio: velora_audio::SUPPORTED,
-        reach: false, // reach: filled in by F1
+        // Hosts that predate standalone reach ignore the bit and send nothing more.
+        reach: true,
     };
     let hs = match handshake(&params, Some(ext)).await {
         // Hosts that predate hello extensions drop the connection: ask again as they expect.
         Err(e) if e.is::<NoReply>() => handshake(&params, None).await?,
         hs => hs?,
     };
-    let Handshake { endpoint, conn, mut send, mut recv, host_name, newly_paired, width, height, features, addresses } =
-        hs;
+    let Handshake {
+        endpoint,
+        conn,
+        mut send,
+        recv,
+        host_name,
+        newly_paired,
+        width,
+        height,
+        features,
+        addresses,
+        route,
+    } = hs;
 
     let (control_tx, mut control_rx) = mpsc::unbounded_channel::<ClientMsg>();
     tokio::spawn(async move {
@@ -392,25 +450,11 @@ pub async fn connect(params: ConnectParams, output: VideoOutput) -> Result<Sessi
             }
         }
     });
-    // Keep reading: the host announces its displays here, and a host-side close is noticed.
+    // Keep reading: the host announces its displays and how else it can be reached here, and a
+    // host-side close is noticed.
     let displays = Arc::new(Mutex::new(Displays::default()));
-    {
-        let displays = displays.clone();
-        tokio::spawn(async move {
-            while let Ok(Some(body)) = wire::read_msg(&mut recv).await {
-                if let Ok(HostMsg::Displays(list)) = HostMsg::decode(&body) {
-                    let listener = {
-                        let mut displays = displays.lock().unwrap();
-                        displays.list = Some(list.clone());
-                        displays.listener.clone()
-                    };
-                    if let Some(listener) = listener {
-                        listener(&list);
-                    }
-                }
-            }
-        });
-    }
+    let reach = Arc::new(Mutex::new(ReachSlot::default()));
+    tokio::spawn(read_control(recv, displays.clone(), reach.clone(), control_tx.clone(), route.clone()));
 
     // The host's sound arrives in datagrams; newer ones only, a lost one is a short gap.
     let audio = (features & FEATURE_AUDIO != 0).then(velora_audio::Player::start).and_then(|player| match player {
@@ -468,11 +512,64 @@ pub async fn connect(params: ConnectParams, output: VideoOutput) -> Result<Sessi
         input: InputSender { conn: conn.clone(), control: control_tx, seq: Arc::new(AtomicU32::new(0)) },
         features,
         displays,
+        reach,
+        route,
         audio,
         conn,
         runtime: tokio::runtime::Handle::current(),
         _endpoint: endpoint,
     })
+}
+
+/// Reads what the host says on the control stream after the welcome: its displays, and how else
+/// it can be reached. Ends with the stream.
+async fn read_control(
+    mut recv: quinn::RecvStream,
+    displays: Arc<Mutex<Displays>>,
+    reach: Arc<Mutex<ReachSlot>>,
+    control: mpsc::UnboundedSender<ClientMsg>,
+    route: Route,
+) {
+    let mut reported = false;
+    while let Ok(Some(body)) = wire::read_msg(&mut recv).await {
+        // What this version does not know, or is not for this end, is skipped.
+        match HostMsg::decode(&body) {
+            Ok(HostMsg::Displays(list)) => {
+                let listener = {
+                    let mut displays = displays.lock().unwrap();
+                    displays.list = Some(list.clone());
+                    displays.listener.clone()
+                };
+                if let Some(listener) = listener {
+                    listener(&list);
+                }
+            }
+            Ok(HostMsg::Reach { addresses, key, secret, relays, mac, relays_for_others }) => {
+                let info = ReachInfo {
+                    addresses,
+                    key: reach::non_zero(key),
+                    secret: reach::non_zero(secret),
+                    relays,
+                    mac,
+                    relays_for_others,
+                };
+                tracing::debug!("the host told how else it can be reached: {info:?}");
+                let listeners = {
+                    let mut slot = reach.lock().unwrap();
+                    slot.info = Some(info.clone());
+                    slot.listeners.clone()
+                };
+                for listener in listeners {
+                    listener(&info);
+                }
+                // Only a host that sent `Reach` knows this message, and it wants to hear it once.
+                if !std::mem::replace(&mut reported, true) {
+                    let _ = control.send(ClientMsg::Reached { address: route.address.clone() });
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Thread-safe, non-blocking input sink. Coordinates are normalized to `0..=65535` over the
@@ -580,4 +677,316 @@ fn spawn_encoded(
         })
         .expect("spawning video thread");
     tx
+}
+
+/// What the tests that need a host share: a temporary directory and a fake host that speaks just enough protocol.
+#[cfg(test)]
+pub(crate) mod testing {
+    use std::{
+        net::SocketAddr,
+        path::{Path, PathBuf},
+        sync::atomic::{AtomicU32, Ordering},
+        time::Duration,
+    };
+
+    use anyhow::{anyhow, bail};
+    use velora_protocol::{
+        identity::KnownHost,
+        wire::{AddressKind, Codec, FEATURE_CLIPBOARD, FEATURE_FILES},
+    };
+
+    use super::*;
+
+    /// A directory under the system's temporary one, removed when dropped.
+    pub struct TempDir(PathBuf);
+
+    impl TempDir {
+        pub fn new() -> Self {
+            static COUNT: AtomicU32 = AtomicU32::new(0);
+            let name = format!("velora-client-core-{}-{}", std::process::id(), COUNT.fetch_add(1, Ordering::Relaxed));
+            let path = std::env::temp_dir().join(name);
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        pub fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// What a fake host does besides welcoming the client.
+    #[derive(Clone, Default)]
+    pub struct Script {
+        /// Sent right after the welcome, to a client that set the hello's reach bit.
+        pub reach: Option<HostMsg>,
+        /// Drops the connection on a hello that has extensions, as the hosts that predate them do.
+        pub legacy: bool,
+    }
+
+    /// A host that accepts any client, answers its hello with a welcome, says what the script says and records what the
+    /// client sends. It listens on loopback.
+    pub struct FakeHost {
+        pub identity: Identity,
+        pub addr: SocketAddr,
+        /// The extensions of each hello received.
+        pub hellos: mpsc::UnboundedReceiver<Option<HelloExt>>,
+        /// The control messages that follow a hello.
+        pub messages: mpsc::UnboundedReceiver<ClientMsg>,
+        _endpoint: quinn::Endpoint,
+    }
+
+    impl FakeHost {
+        pub fn start(script: Script) -> Self {
+            let identity = Identity::generate().unwrap();
+            let endpoint =
+                quinn::Endpoint::server(tls::server_config(&identity).unwrap(), "127.0.0.1:0".parse().unwrap())
+                    .unwrap();
+            let addr = endpoint.local_addr().unwrap();
+            let (hello_tx, hellos) = mpsc::unbounded_channel();
+            let (message_tx, messages) = mpsc::unbounded_channel();
+            let accepting = endpoint.clone();
+            tokio::spawn(async move {
+                while let Some(incoming) = accepting.accept().await {
+                    let (script, hello_tx, message_tx) = (script.clone(), hello_tx.clone(), message_tx.clone());
+                    tokio::spawn(async move {
+                        if let Err(e) = serve(incoming, script, hello_tx, message_tx).await {
+                            tracing::debug!("fake host: {e:#}");
+                        }
+                    });
+                }
+            });
+            Self { identity, addr, hellos, messages, _endpoint: endpoint }
+        }
+
+        /// The entry a client that paired with this host holds for it.
+        pub fn entry(&self) -> KnownHost {
+            KnownHost {
+                name: "fake-pc".into(),
+                address: self.addr.to_string(),
+                fingerprint: self.identity.fingerprint().to_base64(),
+                ..Default::default()
+            }
+        }
+    }
+
+    async fn serve(
+        incoming: quinn::Incoming,
+        script: Script,
+        hellos: mpsc::UnboundedSender<Option<HelloExt>>,
+        messages: mpsc::UnboundedSender<ClientMsg>,
+    ) -> Result<()> {
+        let conn = incoming.await?;
+        let (mut send, mut recv) = conn.accept_bi().await?;
+        let body = wire::read_msg(&mut recv).await?.ok_or_else(|| anyhow!("closed before the hello"))?;
+        let ClientMsg::Hello { ext, .. } = ClientMsg::decode(&body)? else { bail!("expected a hello") };
+        let _ = hellos.send(ext);
+        if script.legacy && ext.is_some() {
+            conn.close(0u32.into(), b"");
+            return Ok(());
+        }
+        let welcome = HostMsg::Welcome {
+            version: PROTOCOL_VERSION,
+            host_name: "fake-pc".into(),
+            codec: Codec::H264,
+            width: 1280,
+            height: 720,
+            features: ext.map(|_| FEATURE_FILES | FEATURE_CLIPBOARD),
+            addresses: if ext.is_some_and(|e| e.addresses) { vec!["192.0.2.10:7420".into()] } else { Vec::new() },
+        };
+        send.write_all(&welcome.encode()).await?;
+        // Like a real host: `Reach` goes only to a client that asked for it.
+        if let Some(reach) = script.reach.filter(|_| ext.is_some_and(|e| e.reach)) {
+            send.write_all(&reach.encode()).await?;
+        }
+        while let Some(body) = wire::read_msg(&mut recv).await? {
+            let _ = messages.send(ClientMsg::decode(&body)?);
+        }
+        Ok(())
+    }
+
+    /// A `Reach` such as a host with a mapped port and one relay would send.
+    pub fn reach_msg() -> HostMsg {
+        HostMsg::Reach {
+            addresses: vec![
+                (AddressKind::Lan, "192.0.2.10:7420".into()),
+                (AddressKind::Public, "198.51.100.7:51820".into()),
+            ],
+            key: [7; 32],
+            secret: [9; 16],
+            relays: vec![(Fingerprint([5; 32]).to_base64(), vec!["203.0.113.9:7420".into()])],
+            mac: Some([0x02, 1, 2, 3, 4, 5]),
+            relays_for_others: true,
+        }
+    }
+
+    /// Discards the video.
+    pub fn sink() -> VideoOutput {
+        VideoOutput::Encoded(Arc::new(|_| {}))
+    }
+
+    /// A test that waits for something that never comes should fail, not hang.
+    pub async fn within<T>(what: &str, future: impl Future<Output = T>) -> T {
+        tokio::time::timeout(Duration::from_secs(10), future).await.unwrap_or_else(|_| panic!("timed out: {what}"))
+    }
+
+    /// Polls `check` until it gives something.
+    pub async fn eventually<T>(what: &str, mut check: impl FnMut() -> Option<T>) -> T {
+        within(what, async {
+            loop {
+                if let Some(found) = check() {
+                    return found;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use velora_protocol::{
+        identity::{KnownHost, StateDir},
+        wire::AddressKind,
+    };
+
+    use super::{testing::*, *};
+
+    fn params(host: &FakeHost, addr: SocketAddr) -> ConnectParams {
+        ConnectParams {
+            addr,
+            also: Vec::new(),
+            host_fingerprint: host.identity.fingerprint(),
+            identity: Identity::generate().unwrap(),
+            device_name: "test device".into(),
+            pairing_secret: None,
+            password: None,
+            reach: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_host_without_reach_is_connected_to_as_before() {
+        let mut host = FakeHost::start(Script::default());
+        let session = within("connect", connect(params(&host, host.addr), sink())).await.unwrap();
+
+        // The hello asks for `Reach` (a host that predates it ignores the bit), and nothing of the kind comes back.
+        assert!(within("hello", host.hellos.recv()).await.unwrap().unwrap().reach);
+        assert_eq!(session.host_name, "fake-pc");
+        assert_eq!(session.addresses, vec!["192.0.2.10:7420".to_string()]);
+        assert_eq!(session.route(), &Route { kind: AddressKind::Lan, address: host.addr.to_string() });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(session.reach(), None);
+
+        // So nothing about it is said to the host either: the first message it hears is the user's.
+        session.input.release_all();
+        assert_eq!(within("message", host.messages.recv()).await, Some(ClientMsg::ReleaseAll));
+    }
+
+    #[tokio::test]
+    async fn a_host_with_reach_is_heard_and_told_where_it_was_reached() {
+        let mut host = FakeHost::start(Script { reach: Some(reach_msg()), ..Default::default() });
+        let session = within("connect", connect(params(&host, host.addr), sink())).await.unwrap();
+
+        let info = eventually("the reach information", || session.reach()).await;
+        assert_eq!(
+            info,
+            ReachInfo {
+                addresses: vec![
+                    (AddressKind::Lan, "192.0.2.10:7420".into()),
+                    (AddressKind::Public, "198.51.100.7:51820".into())
+                ],
+                key: Some([7; 32]),
+                secret: Some([9; 16]),
+                relays: vec![(Fingerprint([5; 32]).to_base64(), vec!["203.0.113.9:7420".into()])],
+                mac: Some([0x02, 1, 2, 3, 4, 5]),
+                relays_for_others: true,
+            }
+        );
+        // The host hears once which of its addresses this connection was made to.
+        let reached = ClientMsg::Reached { address: host.addr.to_string() };
+        assert_eq!(within("message", host.messages.recv()).await, Some(reached));
+        session.input.release_all();
+        assert_eq!(within("message", host.messages.recv()).await, Some(ClientMsg::ReleaseAll));
+    }
+
+    #[tokio::test]
+    async fn listeners_add_up_and_the_late_one_is_called_at_once() {
+        let host = FakeHost::start(Script { reach: Some(reach_msg()), ..Default::default() });
+        let session = within("connect", connect(params(&host, host.addr), sink())).await.unwrap();
+        let early = Arc::new(Mutex::new(Vec::new()));
+        let late = Arc::new(Mutex::new(Vec::new()));
+        let keep = |into: &Arc<Mutex<Vec<ReachInfo>>>| {
+            let into = into.clone();
+            Arc::new(move |info: &ReachInfo| into.lock().unwrap().push(info.clone())) as ReachListener
+        };
+        session.on_reach(keep(&early));
+        eventually("the reach information", || session.reach()).await;
+        eventually("the early listener", || (early.lock().unwrap().len() == 1).then_some(())).await;
+        session.on_reach(keep(&late));
+        assert_eq!(late.lock().unwrap().len(), 1);
+        assert_eq!(early.lock().unwrap().len(), 1, "the first listener was not replaced, and was not called again");
+    }
+
+    #[tokio::test]
+    async fn a_host_with_nothing_to_publish_sends_zeros_and_they_mean_none() {
+        let HostMsg::Reach { addresses, relays, mac, relays_for_others, .. } = reach_msg() else { unreachable!() };
+        let zeros = HostMsg::Reach { addresses, key: [0; 32], secret: [0; 16], relays, mac, relays_for_others };
+        let host = FakeHost::start(Script { reach: Some(zeros), ..Default::default() });
+        let session = within("connect", connect(params(&host, host.addr), sink())).await.unwrap();
+        let info = eventually("the reach information", || session.reach()).await;
+        assert_eq!((info.key, info.secret), (None, None));
+        assert_eq!(info.mac, Some([0x02, 1, 2, 3, 4, 5]));
+    }
+
+    #[tokio::test]
+    async fn a_host_that_predates_hello_extensions_is_asked_again_without_them() {
+        let mut host = FakeHost::start(Script { legacy: true, ..Default::default() });
+        let session = within("connect", connect(params(&host, host.addr), sink())).await.unwrap();
+        // The first hello had extensions and was dropped; the second had none, and its welcome has no addresses.
+        assert!(within("hello", host.hellos.recv()).await.unwrap().is_some());
+        assert_eq!(within("hello", host.hellos.recv()).await.unwrap(), None);
+        assert_eq!(session.addresses, Vec::<String>::new());
+        assert_eq!(session.reach(), None);
+    }
+
+    #[tokio::test]
+    async fn a_late_candidate_wins_over_an_address_that_never_answers() {
+        let host = FakeHost::start(Script::default());
+        // Bound and silent: what a stored address looks like once the host has moved away from it.
+        let silent = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        // The lookup finds the host's real address a little after it was asked.
+        let real = host.addr;
+        let lookup = async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            Ok(vec![reach::Candidate::Direct(real, AddressKind::Public)])
+        };
+        let began = std::time::Instant::now();
+        let stale = Arc::new(params(&host, silent.local_addr().unwrap()));
+        let established = within("race", establish_with(stale, Some(lookup))).await.unwrap();
+        assert_eq!(established.route, Route { kind: AddressKind::Public, address: host.addr.to_string() });
+        assert!(began.elapsed() >= reach::LOOKUP_DELAY, "the DHT is not asked before its delay");
+        established.conn.close(0u32.into(), b"");
+    }
+
+    /// Never called: it only has to compile. Callers spawn these futures on a multi-threaded runtime, and the hooks of
+    /// F2-F4 sit inside them, so a hook that is not `Send` would stop the clients from building.
+    #[allow(dead_code)]
+    fn the_futures_that_hold_the_hooks_are_send(params: ConnectParams, state: &StateDir, host: &KnownHost) {
+        fn send<T: Send>(_: T) {}
+        send(connect(params.clone(), sink()));
+        send(connect_files(params.clone()));
+        send(establish(&params));
+        send(hosts::connect(state, "pc", "me", None, sink()));
+        send(hosts::wake(state, "pc"));
+        send(reach::wake(&params.identity, host));
+    }
 }
