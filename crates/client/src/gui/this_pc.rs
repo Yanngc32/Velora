@@ -693,6 +693,7 @@ impl Launcher {
             let left = pairing.expires_in_secs;
             let expires = fill(s.expires_in, &[&format!("{}:{:02}", left / 60, left % 60)]);
             ui.label(RichText::new(expires).color(FAINT).size(12.5));
+            super::reach::pair_note(ui, s, status.reach.as_ref());
             ui.add_space(10.0);
             field_label(ui, s.code_other_pc);
             ui.add(egui::Label::new(RichText::new(&pairing.code).font(mono(11.5)).color(TEXT)).wrap());

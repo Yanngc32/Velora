@@ -176,6 +176,14 @@ pub(super) fn reach_card(ui: &mut egui::Ui, s: &Strings, reach: Option<&ReachSta
     (next != current).then(|| next.request())
 }
 
+/// Under the QR code of This PC: where its link also reaches this computer from other networks,
+/// when the router gave it a public address. Nothing otherwise, not even the space for it.
+pub(super) fn pair_note(ui: &mut egui::Ui, s: &Strings, reach: Option<&ReachStatus>) {
+    let Some(reach) = reach.filter(|reach| reach.standalone && !reach.public.is_empty()) else { return };
+    ui.add_space(10.0);
+    labelled(ui, s.reach_pair_public, &reach.public, true);
+}
+
 /// Under the standalone switch, while it is on: what the router did, the addresses it gave and the
 /// relays this computer is registered with, or what would help it to have one.
 fn standalone_details(ui: &mut egui::Ui, s: &Strings, reach: &ReachStatus) {
@@ -836,6 +844,35 @@ mod tests {
     }
 
     #[test]
+    fn the_public_address_goes_under_the_qr_code() {
+        for s in strings::all() {
+            // What the note painted, and the height it took.
+            let note = |status: Option<&ReachStatus>| {
+                let mut used = 0.0;
+                let painted = Frames::new().run(Vec::new(), |ui| {
+                    let top = ui.cursor().min.y;
+                    pair_note(ui, s, status);
+                    used = ui.cursor().min.y - top;
+                });
+                (painted.texts, used)
+            };
+            let (texts, used) = note(Some(&reach()));
+            assert_eq!(texts, [s.reach_pair_public, "203.0.113.7:51820"]);
+            assert!(used > 0.0);
+            // Several addresses, one to a line.
+            let two = ReachStatus { public: vec!["203.0.113.7:51820".into(), "203.0.113.8:51820".into()], ..reach() };
+            assert_eq!(note(Some(&two)).0, [s.reach_pair_public, "203.0.113.7:51820", "203.0.113.8:51820"]);
+            // Nothing to say, and no room taken: an older host, standalone reach off, or no public address
+            // (a shared one is not advertised).
+            let off = ReachStatus { standalone: false, ..reach() };
+            let shared = ReachStatus { public: Vec::new(), ..reach() };
+            for status in [None, Some(&off), Some(&shared)] {
+                assert_eq!(note(status), (Vec::new(), 0.0));
+            }
+        }
+    }
+
+    #[test]
     fn flipping_a_switch_sends_all_three_with_that_one_changed() {
         let s = strings::current();
         let status = reach();
@@ -966,6 +1003,7 @@ mod tests {
             for status in &statuses {
                 shown.extend(frames.run(Vec::new(), |ui| _ = reach_card(ui, s, Some(status))).texts);
             }
+            shown.extend(frames.run(Vec::new(), |ui| pair_note(ui, s, Some(&reach()))).texts);
             // The button: under way, then each outcome, then at rest with a hover.
             let known = host(Some(MAC));
             let mut button = |ui: &mut egui::Ui| wake_button(ui, s, &known, card_area(), None);
@@ -996,6 +1034,7 @@ mod tests {
                 ("reach_mapping_closed", s.reach_mapping_closed),
                 ("reach_mapping_closed_detail", s.reach_mapping_closed_detail),
                 ("reach_public", s.reach_public),
+                ("reach_pair_public", s.reach_pair_public),
                 ("reach_v6", s.reach_v6),
                 ("reach_dht", s.reach_dht),
                 ("reach_dht_text", s.reach_dht_text),
