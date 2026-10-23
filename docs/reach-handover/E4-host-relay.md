@@ -1,26 +1,81 @@
 # E4 host relay: hand-over for I3 and H1 (and G2, F3, the review)
 
-Branch `reach-e4-host-relay`, from `integration-wave2` (`0fc65e2`): `f0586b9` (two assertions of E1's dispatch test that checked the
-stub's answer, see "Outside `relay.rs`"), `fa0069a` (the code and its tests: `crates/host/src/reach/relay.rs`), `560914e` (what an
-independent read of it found), `09f5d41` and `467d1f7` (two tests for those fixes) and the commit of this note. fmt,
-`clippy -p velora-host --all-targets -D warnings` and `cargo test -p velora-host` green on Windows (115 pass, 29 of them in `relay.rs`,
-2 `#[ignore]`d by E1). Linux was not compiled here. I broke the code on purpose 11 ways (answers waited for, the close code lost to the
-control stream, no shutdown on abort, a state file that cannot be read taken for empty, an unreadable list taken for empty, a status
-wait with a deadline per message, a MAC address not told, listed relays taking a slot, remembered hosts not pruned, a revoke before the
-file is read, the snapshot taken before the lock); each made a test fail.
+Branch `reach-e4-host-relay`, from `integration-wave2` (`0fc65e2`). Commits, in order: `f0586b9` (two assertions of E1's dispatch
+test that checked the stub's answer, see "Outside `relay.rs`"), `fa0069a` (the code and its tests: `crates/host/src/reach/relay.rs`),
+`560914e` (what an independent read of it found), `09f5d41` and `467d1f7` (two tests for those fixes), `82fe545` and `da9ad38` (the
+first version of this note), `eb13294` (the one change in `server.rs`, approved: a link from a host the relay's user paired with),
+`8a0631f` (the relay tests on the real pairing flow), `e2f1450` (such a host may register and ask for nothing else) and the commit of
+this version of the note. fmt, `clippy -p velora-host --all-targets -D warnings` and `cargo test -p velora-host` green on Windows (120 pass,
+30 of them in `relay.rs` and 4 new in `server.rs`, 2 `#[ignore]`d by E1). Linux was not compiled here. I broke the code on purpose 15
+ways (answers waited for, the close code lost to the control stream, no shutdown on abort, a state file that cannot be read taken for
+empty, an unreadable list taken for empty, a status wait with a deadline per message, a MAC address not told, listed relays taking a
+slot, remembered hosts not pruned, a revoke before the file is read, the snapshot taken before the lock; in `server.rs`: any hello of a
+trusted host let in, any link let in, the password asked of a trusted host; and the pairing check on a trusted host's requests
+removed); each made a test fail.
+
+## The pairing triangle (H1, I3, G2: this is what a user has to do)
+
+Three computers. **C** is the client you watch from (phone, laptop). **H** is the host you want to reach, which no one can reach
+directly (behind a CGNAT, say). **R** is the relay: a PC or a VPS that others can reach. A relayed connection needs three pairings:
+
+1. **C is paired with R, as a client of R.** R lists C among its paired devices. C opens a link to R and asks it to pass the
+   connection on; R serves only devices it knows.
+2. **R is paired with H, as a client of H.** H is one of the computers R's own user connects to: it is in the `known_hosts.json` of R's
+   *client side* (what `velora list` shows on R). H registers with R under its host identity, and R lets it in only because R itself
+   pinned that identity when its user paired R with H. R also needs H's pairing to be *this* way round: R being paired with C, or C with
+   H, does not make H trusted at R. H must also know where R is: H is paired with R the same way (R is in H's known hosts), or R is
+   listed in H's `relays.json`.
+3. **C is paired with H, as a client of H**, as always. Once R passes the packets on, C and H run the ordinary handshake and H checks C
+   like any client (its access password included).
+
+In one sentence for the docs: *pair your phone with both PCs as usual, and pair the two PCs with each other, each as a client of the
+other.*
+
+When one is missing the log says which: no (1): the client's link to R is refused, "this device is not paired with the host"; no (2):
+H's log has `relay '<name>' (<fp>): it refused this host: this device is not paired with the host` and R's side logs the refusal, and
+the client's `RelayTo` gets "this relay does not know that device; it has never registered here"; no (3): the connection through the
+relay fails at the inner hello with "this device is not paired with the host".
+
+**Doing it with what exists today.** Pairing (2) in both directions is what the pairing *offer* does (`velora pair <R address> <code>
+--offer <H's pairing link>`, or the launcher's pair-back): H pairs with R, and R's side pairs back with H. But pairing back means R
+**connects to H**, and a host that is behind a CGNAT cannot be connected to: it works if H and R are on the same network (or a VPN, or H
+has a public address) at that moment, and not otherwise. Without that, R's side can be given H by hand: add an entry for H to
+`known_hosts.json` of R's client side (`<config>/client/known_hosts.json`, beside R's `<config>/host`):
+
+```json
+[ { "name": "home PC", "address": "any:0", "fingerprint": "<H's host fingerprint, base64url>" } ]
+```
+
+(the address is not dialed for this; H's full fingerprint is the `fingerprint` field of H's entry in any client's `known_hosts.json`).
+On a VPS that runs only `velora-host run --relay-only` there is no `velora` client to pair with, so this is how it is done.
+
+**For G2 (a simpler way to guide it).** Today's offer already carries what R needs: the pairing link contains H's host fingerprint. So
+the launcher can make (2) one step on H and one tap on R, and it works for a host nobody can reach:
+
+- On H, one action "Use a PC as my relay": pick R among H's paired PCs (or pair with it), and H sends its offer. H then registers by
+  itself (the switch is E1's `standalone`; nothing else to set).
+- On R, the offer shows as "H wants to use this PC as a relay: allow?". Allowing it records H in R's client-side `known_hosts.json`
+  from the fingerprint in the offer, **without dialing H** (`pair_back` today dials H and fails for a hidden host). That one entry is
+  all `relay::trusts` reads.
+- On R, a list "Computers allowed to use this PC as a relay" (the known hosts that have registered, with a Remove: removing the entry
+  drops the registration within 30 s, `reconcile`), the "Let my other PCs connect through this one" switch with the bandwidth note,
+  and the registered hosts / relayed clients count (D2's `Relay::registered()`, which `Status` does not carry yet).
+- On H, "Registered with <name>" from `Status.reach.registered_with` (the relay is listed only while the registration is up), and,
+  when it is not, the reason: the host logs it (`relay '<name>' (<fp>): <why>`) but `Status` has no field for it.
 
 ## What it does
 
 **Serving** (a host that relays for others: the switch, or `--relay-only`). `serve(ctx)` loads `relay_known.json` into D2's forwarder
 (one `Relay` per host, in `ctx.ext::<RelayState>()`), then every 30 s drops what is no longer allowed (devices removed with `velora-host
-revoke`, which the running host is not told about, and hosts it only remembers) and saves what the forwarder remembers if it changed;
-when stopped, or aborted, it calls `Relay::shutdown()` (a drop guard) and saves. `handle_message` gives `RelayRegister`/`RelayTo` to
-`Relay::handle` and queues the `RelayStatus` on the sender's control stream; `Wake` and `PunchRequest` do the same from a task of
-their own (the first sends a magic packet, the second waits up to 2 s for the registered host's connection), and the answer is dropped,
-not waited for, when the device does not read its control stream. A successful `RelayRegister` also saves `relay_known.json` (a relay PC
-that reboots can still wake a host that was asleep when it did). `on_revoked` calls `Relay::remove` (connections end with
-`CLOSE_REMOVED`/`CLOSE_HOST_GONE`) and saves. `busy` is true while a client is paired with a registered host; a registration alone does
-not count.
+revoke`, which the running host is not told about, hosts removed from the client side's `known_hosts.json`, and hosts it only
+remembers) and saves what the forwarder remembers if it changed; when stopped, or aborted, it calls `Relay::shutdown()` (a drop guard)
+and saves. `handle_message` gives `RelayRegister`/`RelayTo` to `Relay::handle` and queues the `RelayStatus` on the sender's control
+stream; `Wake` and `PunchRequest` do the same from a task of their own (the first sends a magic packet, the second waits up to 2 s for
+the registered host's connection), and the answer is dropped, not waited for, when the device does not read its control stream. Only
+`RelayRegister` is answered for a host that is merely trusted (below); the other three need a sender in `authorized_clients.json`. A
+successful `RelayRegister` also saves `relay_known.json` (a relay PC that reboots can still wake a host that was asleep when it did).
+`on_revoked` calls `Relay::remove` (connections end with `CLOSE_REMOVED`/`CLOSE_HOST_GONE`) and saves. `busy` is true while a client
+is paired with a registered host; a registration alone does not count.
 
 **Registering** (`register_with`, a task while `standalone` is on and the host is not `--relay-only`). Every 30 s it reads its
 candidates and keeps one supervisor task for each (at most 16): the relays the user listed in `relays.json`, and, while the host
@@ -29,7 +84,7 @@ side (`known_hosts.json` beside the host's state directory). A list that cannot 
 registrations that exist stay. A supervisor does, until told to stop:
 
 1. dial the relay's addresses a little apart (300 ms), from the listening port, with `tls::client_config(&ctx.identity, relay_fp)`:
-   the host's **host** identity (see "Who may register");
+   the host's **host** identity;
 2. open the control stream and say hello as a **link** (`files_only` + `reach`, the name is the computer's name), read the welcome and
    the `Reach`; no `Reach` within 3 s, or `relays_for_others == false`: not a relay, leave it alone (a minute for a relay the user
    listed, ten for a paired computer, most of which say no);
@@ -51,6 +106,34 @@ A registration that is established is **not** cut off when a public address turn
 The tunnel's inner connections are ordinary incoming connections of the endpoint, from a synthetic address; E1 skips Retry for them
 and `ClientConn::via_relay` says which relay.
 
+## Who may register: `server::authorize` and `relay::trusts` (decision 1, approved)
+
+D2 keys a registration by the connection's certificate, and a client asks `RelayTo` for the host by the fingerprint it pinned: the
+host's **host** identity, which is not one of the client identities in the relay's `authorized_clients.json`. `authorize(.., link_hello)`
+(in `server.rs`, `eb13294`) therefore lets in one more kind of device, and exactly one kind of connection from it:
+
+- the fingerprint is in `known_hosts.json` of the client side of the relay's own computer (`relay::trusts`; the relay pinned it
+  itself when its user paired with that host: nothing a connecting device says is believed), **and**
+- the hello is a link's (`files_only` and `reach`) with no pairing secret.
+
+What it gets is a link, served as one because the same hello decides both: no session and nobody sent away, no file stream, no
+clipboard, no access-password prompt (a link reaches no screen), and in `relay.rs` only `RelayRegister` is answered (a request to be
+relayed to a host, to wake one or to punch toward one is refused unless the sender is in `authorized_clients.json`). The acceptance is
+logged once at info with the short fingerprint (`accepted a link from the paired computer <fp>`), no address. Every other hello of that
+same device (a session, files, a pairing) and every link from an unknown fingerprint is judged exactly as before; a paired client's
+link still gets the password question. Tests in `server.rs`: an unknown fingerprint is refused a link; a known host gets a link and
+registers, with an access password set, and writes nothing to `authorized_clients.json`; the same host is refused a session (before and
+after extensions) and a file manager, on a relay-only host and on an ordinary one; a paired client, also a known host, gets in as before.
+
+Limits to know (H1/G2): under the Windows service the relay's state is `C:\ProgramData\Velora\host`, so its "client side" is
+`...\Velora\client`, not the user's `%APPDATA%` one that the launcher and `velora pair` write: `trusts` finds nobody there, and a
+service relay needs H's host fingerprint as an entry of `authorized_clients.json` (a client entry, by hand) until the launcher can hand the
+service the hosts its user allowed (for example a control request that stores them in the service's own state; I did not add a second
+source because the brief said trust comes only from the client side's `known_hosts.json`). A relay run by the user (`velora-host run`,
+including `--relay-only` on a VPS) has the same config folder for both sides and works. And a relay PC with an **access password** still
+refuses paired *clients* on a link (F3's decision 1: the dialer has no password to give); only the trusted host is exempt. If clients
+should be exempt as well it is one condition (`link_hello && known`) in `authorize`; I did not make it.
+
 ## Files in the host's state directory
 
 | file | written by | content |
@@ -71,45 +154,15 @@ and `ClientConn::via_relay` says which relay.
 Addresses may be `ip:port` or `name:port`; `kinds` (as `known_hosts.json` keeps them) are used when present and a `Relay(..)` kind is
 never dialled. The file is read again every 30 s.
 
-## Who may register (decision 1 — needs a change outside `relay.rs`)
-
-D2 keys a registration by the connection's certificate, and a client asks `RelayTo` for the host by the fingerprint it pinned: the
-host's **host** identity. So the registering host must dial under its host identity. But the relay's `server::authorize` lets in
-the **client** identities of `authorized_clients.json`, which the user's pairing of the host PC with the relay PC fills with the host
-PC's *client* identity. A host registering under its host identity is therefore `Denied` ("not paired") unless its host fingerprint
-was put in the relay's `authorized_clients.json` by hand — the tests do exactly that. Nothing in `relay.rs` can fix it.
-
-`relay::trusts(ctx, &fingerprint)` is the hook for it: true for a host in the *client side's* `known_hosts.json` of the relay PC (a
-two-way pairing, `OfferPairing`). The patch that uses it is in E1's `server.rs`, so it is **not applied**; it is tested (a relay PC
-with an access password, a host it only trusts, a client that is only paired; the test fails without the `server.rs` half) and saved as
-`E4-trusted-links.patch` in the notes folder of the sessions (`git apply` it on this branch; 124 lines: `server.rs` and the test in
-`relay.rs`). It does two things in `authorize`, which now takes `link: bool` (decided in `handle_connection` before authorizing):
-
-```rust
-// A link reaches no screen, which is what the access password protects, so a paired device gets in without it.
-// So does a computer this one's user paired with as a client: it registers under its host identity,
-// which is not in the list of client devices.
-if link && secret.is_none() && (known || reach::relay::trusts(shared.reach.context(), &fingerprint)) {
-    return Ok(Auth::Known);
-}
-```
-
-The second half (`known` links skip the access password) answers F3's decision 1 as well: a relay PC with an access password cannot be
-used today, by a client or by a registering host, because a link has no password to give. Take only the first half
-(`!known && link && ... trusts(..)`) if the password should stay for known devices.
-
-Without the patch a relay PC needs the host's host fingerprint in its `authorized_clients.json` (as a client entry; the full fingerprint
-is the `fingerprint` field of the host's entry in any paired client's `known_hosts.json`). I3 should expect this to be the first thing
-that fails in the field: the host logs `relay '<name>' (<fp>): it refused this host: this device is not paired with the host`.
-
 ## Using it
 
-**I3 (field test).** Relay PC: turn "relay for others" on (`reach.json` `{"relay_for_others": true}`, or `velora-host run --relay-only`
-on a VPS) and make its UDP port reachable. Pair the client with the relay PC and with the host PC as usual; pair the host PC's client
-side with the relay PC; give the relay the host's host fingerprint (decision 1). Host PC: `standalone` on; with no public address
-(CGNAT) it registers by itself 10 s after start, or at once if the relay is in `relays.json`. Log lines (info) to look for:
+**I3 (field test).** Relay PC R: turn "relay for others" on (`reach.json` `{"relay_for_others": true}`, or `velora-host run --relay-only`
+on a VPS) and make its UDP port reachable. Make the triangle above (on a VPS, with the hand-written entry for H). Host PC H: `standalone`
+on; with no public address (CGNAT) it registers by itself 10 s after start, or at once if R is in `relays.json`. Log lines (info) to
+look for:
 
-- relay: `this computer relays for the user's other devices`; `<fp> registered with the relay from <addr>` (D2); `<fp> is relayed to <fp>`;
+- relay: `this computer relays for the user's other devices`; `accepted a link from the paired computer <fp>` (H was let in as a known
+  host); `<fp> registered with the relay from <addr>` (D2); `<fp> is relayed to <fp>`;
 - host: `registered with the relay '<name>' (<fp>) at <addr>`; `relay '<name>' (<fp>): <why>; trying again in N s` (the first
   occurrence of a reason is info, repeats are debug); `punch request of <fp> not taken: <why>` (E5 refused it); `client '<name>' (<fp>)
   connected from [fd00:7e1a:...]:1` for the relayed client (the tunnel's synthetic address).
@@ -118,17 +171,17 @@ side with the relay PC; give the relay the host's host fingerprint (decision 1).
 connection reports `via_relay` and a `Reached` message is recorded with the relay's kind. `Relay::registered()` (D2) has the per-
 direction counters (`packets`, `datagrams`, `dropped`): `datagrams` well above `packets` is the MTU effect below.
 
-**H1 (docs).** What a relay user must know: the relay PC forwards every picture of a relayed session (as much upload as the video
-bitrate, and the same in download), only one client at a time per registered host (D2 decision 2); the host and the client both
-need to be paired with it, and the host's PC must be one the relay's user paired with too (decision 1); a relay with an access
-password refuses both until `authorize` changes (above); a computer switched to relay is found by hosts within ten minutes at most
-(they ask the paired computers that do not relay only that often) or at once when it is listed in `relays.json`.
-Headless relay: `velora-host run --relay-only` serves relays and nothing else (no capture, no input, every connection is a link).
+**H1 (docs).** What a relay user must know: the three pairings above (in the one sentence); the relay PC forwards every picture of a
+relayed session (as much upload as the video bitrate, and the same in download), only one client at a time per registered host (D2
+decision 2); a relay PC should not have an access password while clients are paired with it (they cannot give it on a link); a Windows
+service relay needs the hand-written entry of H for now; a computer switched to relay is found by hosts within ten minutes at most (they
+ask the paired computers that do not relay only that often) or at once when it is listed in `relays.json`. Headless relay: `velora-host
+run --relay-only` serves relays and nothing else (no capture, no input, every connection is a link).
 
 ## Decisions to review
 
-1. **Host identity at registration, and the authorization gap** above. Alternatives: register under the client identity and let D2
-   key by something else (a D2 change), or have the pairing flow also store the host identity at the relay (pairing code, E1/G).
+1. **Host identity at registration** and the one change in `server.rs` that follows from it (above). Alternatives: register under the
+   client identity and let D2 key by something else (a D2 change), or have the pairing flow also store the host identity at the relay.
 2. **`relays.json`** as the "user asks" source and the only one under the service; **the paired computers as candidates** come from the
    client side's `known_hosts.json`. `KnownHost` has no field for "this host relays for others", so every candidate is asked.
 3. **Slots and caps:** 4 registrations for paired computers (listed relays are outside the cap), 16 supervisors, 8 addresses per relay,
@@ -144,19 +197,23 @@ Headless relay: `velora-host run --relay-only` serves relays and nothing else (n
 8. **Punch requests** are read from the relay's unidirectional streams only (D2's way); a `PunchRequest` on the control stream is ignored.
    `punch::respond` refusals are logged at info (E5 asked for that for the odd ones; its `Refusal` type is not in this branch yet, so
    they are not told apart).
-9. **`MAX_REGISTRATIONS`** is `pub` so a UI can show "n of 4".
+9. **A host that is only trusted may register and nothing else** (an addition of mine inside the brief's "a link only"): `RelayTo`,
+   `Wake` and `PunchRequest` from it are refused in `relay.rs`.
 10. **Not done: the inner MTU** (F3's "Video packet size" gotcha). The host's endpoint discovers the path MTU up to 1452 bytes and sends
     video packets of that size to a relayed client, but an outer datagram carries about 1400, so every full-size packet becomes two
     datagrams (D1 handles it, at about 1.6 times the datagrams per megabyte and twice the loss for those packets). The cure is a
     `MtuDiscoveryConfig` upper bound near 1350 for connections that come in through a tunnel, which needs `Incoming::accept_with` in
-    `server.rs` (or `tls::transport_config`): not mine. Dropping the oversize packets in the pump would also work but can stall a
-    handshake that starts at 1200. I3 should measure before anyone changes it.
+    `server.rs` (or `tls::transport_config`). Dropping the oversize packets in the pump would also work but can stall a handshake that
+    starts at 1200. I3 should measure before anyone changes it.
+11. **`MAX_REGISTRATIONS`** is `pub` so a UI can show "n of 4".
 
 ## Outside `relay.rs`
 
-`f0586b9` changes two assertions of `reach::tests::relay_requests_are_refused_unless_the_host_relays_for_others` in `reach/mod.rs`
-(test only): they compared the hook's answer to the stub's "this build cannot relay yet". They now check that the request got past
-the dispatch (it was not answered with the dispatch's own refusals). Drop the commit if you prefer to do this at the merge.
+- `eb13294` (`server.rs`, approved): `authorize` takes `link_hello`; `handle_connection` decides `link_hello` before authorizing and uses
+  it for `link` as well. About 25 lines of code and four tests in `server.rs`'s test module; the two test calls of `authorize` got `, false`.
+- `f0586b9` changes two assertions of `reach::tests::relay_requests_are_refused_unless_the_host_relays_for_others` in `reach/mod.rs`
+  (test only): they compared the hook's answer to the stub's "this build cannot relay yet". They now check that the request got past
+  the dispatch (it was not answered with the dispatch's own refusals). Drop the commit if you prefer to do this at the merge.
 
 ## Gotchas
 
@@ -168,14 +225,16 @@ the dispatch (it was not answered with the dispatch's own refusals). Drop the co
   connect to an IPv6 address from an IPv4-only endpoint.
 - `Link`, `pump` and `advertised` are private but written to be reused: F3's dialer has the same two jobs (link hello, framed pump).
 - `crate::hostname()` is the name in the hello; it is the computer's name and shows in the relay's logs.
-- Under `--relay-only` `register_with` is not started (E1), so a relay-only host never registers anywhere.
+- Under `--relay-only` `register_with` is not started (E1), so a relay-only host never registers anywhere. On a relay-only host a plain
+  hello is served as a link too, but a trusted host's plain hello is still refused: the shortcut is for the link hello only.
 - A MutexGuard from `ctx.reach.read()` kept in an `if let` scrutinee lives through its body: bind the value first (the compiler
   caught one across an `.await`).
 
 ## Not tested
 
-Linux compile; a real NAT, CGNAT or a relay on another network; `name:port` addresses (the resolver path is compiled, not run); a
-relay with an access password (only with the patch, in the patch's test); an old host as relay (the 3 s wait for a `Reach` that never
-comes); the 30 s serving tick, the 30 s rescan and the 5 s "does the host need a relay" check (their bodies are tested, the timers
-are not); waking a real PC through the relay; an outer path whose MTU changes during a session (framing is tested at the sizes
-loopback gives); the pre-dial skip when every slot is taken (the cap itself is).
+Linux compile; a real NAT, CGNAT or a relay on another network; `name:port` addresses (the resolver path is compiled, not run); an
+old host as relay (the 3 s wait for a `Reach` that never comes); the 30 s serving tick, the 30 s rescan and the 5 s "does the host
+need a relay" check (their bodies are tested, the timers are not); waking a real PC through the relay; an outer path whose MTU changes
+during a session (framing is tested at the sizes loopback gives); the pre-dial skip when every slot is taken (the cap itself is); the
+log line of an accepted link (there is no subscriber in the tests); a trusted host that also offers a pairing secret (it falls to the
+old path by the `secret.is_none()` condition, untested).
