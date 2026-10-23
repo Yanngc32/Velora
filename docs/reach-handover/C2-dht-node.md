@@ -74,7 +74,7 @@ enum Error { NoNetwork, TooBig { len }, SaltTooBig { len }, Refused { acknowledg
   is gone, and that becomes `Error::Stopped` and a node built again on the next call. The task that carries a lookup
   keeps its node alive until the lookup ends, so dropping the `Node` mid-lookup does not make `mainline` panic.
 
-## Measured on the public DHT (the `#[ignore]` test, run twice by hand, 23 Oct 2026, one home line)
+## Measured on the public DHT (the `#[ignore]` test, by hand, 23 Oct 2026, one home line; the table is two of the runs)
 
 Throwaway key and random bytes, nothing of the product; the records expire by themselves in about two hours.
 
@@ -89,6 +89,11 @@ Throwaway key and random bytes, nothing of the product; the records expire by th
 So the first record from a saved table comes in 0.49-0.60 s from `Node::open` to the value, with the 200 ms `settle` in it
 (the ticket's "warm start under a second" in the form S0 gave it). In run 2 the lower and the equal `seq` with another value
 were refused as `SeqTooLow` by the read, and a client read the newer record after the republish.
+
+The test was run 11 times in all; the last run, on the code as it is now, gave 0.57-0.65 s from open to value for warm
+clients, 1.04 s for a cold one, 7.3 s for the first publish (20 nodes acknowledged) and 3.26 s for the republish. The warm
+time moves between about 0.35 and 1.0 s from one run to the next with the quality of the saved table (older and newer
+builds run alternately gave overlapping ranges), so "under a second" holds with little room when the table is poor.
 
 ## Decisions to review
 
