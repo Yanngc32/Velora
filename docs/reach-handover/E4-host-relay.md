@@ -4,7 +4,7 @@ Branch `reach-e4-host-relay`, from `integration-wave2` (`0fc65e2`): `f0586b9` (t
 stub's answer, see "Outside `relay.rs`"), `fa0069a` (the code and its tests: `crates/host/src/reach/relay.rs`), `560914e` (what an
 independent read of it found), `09f5d41` and `467d1f7` (two tests for those fixes) and the commit of this note. fmt,
 `clippy -p velora-host --all-targets -D warnings` and `cargo test -p velora-host` green on Windows (115 pass, 29 of them in `relay.rs`,
-2 `#[ignore]`d by E1). Linux was not compiled here. I broke the code on purpose 12 ways (answers waited for, the close code lost to the
+2 `#[ignore]`d by E1). Linux was not compiled here. I broke the code on purpose 11 ways (answers waited for, the close code lost to the
 control stream, no shutdown on abort, a state file that cannot be read taken for empty, an unreadable list taken for empty, a status
 wait with a deadline per message, a MAC address not told, listed relays taking a slot, remembered hosts not pruned, a revoke before the
 file is read, the snapshot taken before the lock); each made a test fail.
