@@ -82,9 +82,10 @@ Format: lane · wave · estimate · depends on · runs in parallel with.
 Workspace · wave 0 · 0.5 d · depends on nothing · serial.
 - Create `crates/nat` (`velora-nat`), `crates/dht` (`velora-dht`), `crates/relay`
   (`velora-relay`, library only), add them to the workspace, and declare their dependencies
-  now: `natpmp 0.5`, `igd-next 0.18`, `stunclient 0.4` (nat); `mainline 8` pinned with its
-  `ed25519-dalek 3.0.0-pre.1`, `postcard 1` (dht); `quinn`, `bytes` (relay); `ring` is
-  already a workspace dependency.
+  now: `natpmp 0.5`, `igd-next 0.18`, `stunclient 0.4`, `netdev 0.31` and, on Windows,
+  `windows` (nat); `mainline =8.0.1` with `ed25519-dalek 3` (the final release, not the
+  pre-release) and `postcard 1` (dht); `quinn`, `bytes`, `velora-protocol`, `velora-nat`
+  (relay); `ring` is already a workspace dependency.
 - Each `lib.rs` declares the modules of §2 as empty files, so later tickets never edit it.
 - CI already runs clippy and tests for the whole workspace on Ubuntu and Windows; add the
   Android check for `velora-mobile` with the new transitive crates (`cargo check -p

@@ -195,10 +195,11 @@ Covers: dynamic IPs; the signaling of phases 3 and 4.
 
 Does not cover: reaching a host that has no mapping (phases 3 and 4).
 
-Cost: 5-6 days after the spike. New dependencies: `mainline` (pure Rust) and, through it,
-`ed25519-dalek 3.0.0-pre.1`, a pre-release; acceptable for a signing-only use but worth
-pinning. A `dht.rs` in the host and in client-core (so the Android app resolves too), the
-link parameters, `HostMsg::Reach`.
+Cost: 5-6 days after the spike. New dependencies: `mainline` (pure Rust, pinned to 8.0.1)
+and, through it, `ed25519-dalek 3`: the final release, since mainline asks for
+`^3.0.0-pre.1` (forcing the pre-release itself does not build against the current
+RustCrypto crates, which the scaffold found). A `dht.rs` in the host and in client-core
+(so the Android app resolves too), the link parameters, `HostMsg::Reach`.
 
 Risks:
 - The DHT is public and IPv4-only: a record's existence leaks that some Velora device exists
@@ -363,7 +364,7 @@ sleeping PC's ARP entry, and most routers refuse to forward to the broadcast add
 |---|---|---|---|
 | Router mapping, public v4, Retry | yes | high | mature crates (`natpmp`, `igd-next`), the address race exists, no welcome change |
 | IPv6 | yes to advertise; reaching depends on the router | medium | needs the dual-stack bind; home routers' v6 firewalls often block inbound; cheap to try and to measure |
-| DHT record | yes | high after the spike | `mainline` implements BEP 44/42 and is used in production (pkarr/pubky); one pre-release dependency |
+| DHT record | yes | high after the spike | `mainline` implements BEP 44/42 and is used in production (pkarr/pubky); pinned to 8.0.1 |
 | Relay via own PC | yes | high | plain datagram forwarding with both ends connecting out; the chunking is the only subtle part |
 | Hole punching | yes, for cone NATs | medium | standard technique; observing from the right socket is the subtle part; testing is the cost |
 | Symmetric NAT on both sides, no reachable PC | no | — | needs a relay someone runs: `velora-relay` on a VPS |
@@ -433,7 +434,8 @@ All of it stays in the local logs; the user reads it under This PC and in `host.
 12. Retry (address validation) is added with the exposed port, against amplification.
 13. The DHT's bootstrap nodes are named as the third party they are, and the saved routing
     table keeps later starts off them.
-14. `mainline` pulls `ed25519-dalek 3.0.0-pre.1`, a pre-release: noted, pinned, accepted.
+14. `mainline` 8.0.1 is pinned (`=8.0.1`). It signs with `ed25519-dalek 3`, which is final by
+    now: the pre-release concern of the first reading is gone (found while scaffolding).
 15. `MAX_ADDRESSES = 8` would overflow with public and v6 addresses: raised to 16, which old
     clients truncate harmlessly.
 16. Estimates went up where the design got more concrete: about five weeks in all.
