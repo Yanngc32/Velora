@@ -5,9 +5,9 @@ Companion to [nat-traversal.md](nat-traversal.md) (revision 2). Status: in progr
 | Wave | Tickets | State |
 |---|---|---|
 | 0 | W0 | done, 2026-10-23 |
-| 1 | T0 S0 B1 B2 B3 C1 D1 | built and merged into `standalone-reach`, 2026-10-23 (S0: the 120 and 180 minute lifetime rows and a run on another network are pending) |
-| 2 | E1 F1 G1 C2 C3 D2 | in progress since 2026-10-23 |
-| 3 | E2-E6 F2-F5 G2 G3 | not started |
+| 1 | T0 S0 B1 B2 B3 C1 D1 | built and merged into `standalone-reach`, 2026-10-23 (S0: only a run from another network is pending) |
+| 2 | E1 F1 G1 C2 C3 D2 | built and merged into `standalone-reach`, 2026-10-23 |
+| 3 | E2-E6 F2-F5 G2 G3 | in progress: E5 and F3 built; E4, F2 and G2 under way; E6 is folded into E4 and F5 into F3 |
 | 4 | I1-I4 H1 H2 | not started |
 
 What the finished tickets handed over is in `docs/reach-handover/`; §14 of the plan lists what
