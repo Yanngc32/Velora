@@ -37,6 +37,7 @@ use crate::{
     password::Check,
     rate::{self, RateControl},
     reach::{self, socket::Multiplexer, ClientConn, ControlSender, ReachContext, ReachState, Runtime, Switches},
+    refine::Refine,
     transfer::Peer,
 };
 
@@ -1150,6 +1151,7 @@ struct RateWindow {
     delivery: Duration,
     delivered: u32,
     held_back: Duration,
+    sent: u64,
 }
 
 struct OutFrame {
@@ -1310,6 +1312,7 @@ async fn run_session(
             let header =
                 FrameHeader { frame_id: frame.id, keyframe: frame.keyframe, width: frame.width, height: frame.height };
             session.stats.lock().unwrap().sent(frame.id, frame.captured, frame.data.len());
+            session.window.lock().unwrap().sent += frame.data.len() as u64;
             let mut stream = conn.open_uni().await?;
             stream.write_all(&header.encode()).await?;
             stream.write_all(&frame.data).await?;
@@ -1381,6 +1384,7 @@ async fn run_session(
                 let sample = rate::Sample {
                     delivery: (window.delivered > 0).then(|| window.delivery / window.delivered),
                     held_back: window.held_back,
+                    sent_bytes: window.sent,
                 };
                 if let Some(kbps) = rate.update(sample, Instant::now()) {
                     tracing::info!(
@@ -1471,6 +1475,7 @@ fn capture_loop(
     let mut have_picture = false;
     let mut next_id = 0u32;
     let mut last_capture = Instant::now() - interval;
+    let mut refine = Refine::new(settings.fps);
 
     while session.running.load(Ordering::Relaxed) {
         // The client picked another display: capture it instead, at its size.
@@ -1519,14 +1524,19 @@ fn capture_loop(
         }
 
         let keyframe = session.keyframe_requested.load(Ordering::Relaxed);
+        // The picture is still being sharpened: encode it again if the screen did not change.
+        let refine_due = have_picture && refine.due(bitrate);
         // Block until the screen changes (bounded so shutdown and keyframe requests are
-        // noticed), but return immediately when a keyframe of an unchanged screen is due.
-        let timeout = if keyframe && have_picture { Duration::ZERO } else { Duration::from_millis(100) };
+        // noticed), but return immediately when a keyframe of an unchanged screen, or refining
+        // it, is due.
+        let timeout =
+            if (keyframe && have_picture) || refine_due { Duration::ZERO } else { Duration::from_millis(100) };
         let frame = capturer.capture(timeout)?;
         let changed = frame.is_some();
         let captured_at = Instant::now();
         last_capture = captured_at;
-        if !changed && !(keyframe && have_picture) {
+        let refining = !changed && !keyframe && refine_due;
+        if !changed && !(keyframe && have_picture) && !refining {
             continue;
         }
         have_picture = true;
@@ -1575,6 +1585,13 @@ fn capture_loop(
         if capturer.rect() != rect {
             rect = capturer.rect();
             input.send(InputCmd::SetDisplay(rect));
+        }
+
+        let bytes = encoded.frames.iter().map(|f| f.data.len()).sum();
+        if refining {
+            refine.refined(bytes, bitrate);
+        } else {
+            refine.changed(bytes, bitrate);
         }
 
         for encoded in encoded.frames {

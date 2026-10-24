@@ -156,4 +156,48 @@ mod tests {
         let again = enc.encode(None, true).unwrap().frames.remove(0);
         assert!(again.keyframe);
     }
+
+    /// What refining a still picture (`crate::refine`) relies on: encoding the same picture
+    /// again spends each frame's budget on what it lacks, until there is nothing to add.
+    #[test]
+    fn encoding_a_still_picture_again_sharpens_it() {
+        // Lines of text-like marks on a gradient, at a bitrate that blurs the keyframe.
+        let (w, h) = (640u32, 360u32);
+        let data: Vec<u8> = (0..w * h)
+            .flat_map(|i| {
+                let (x, y) = (i % w, i / w);
+                let ink = y % 16 < 10 && x % 9 < 6 && (x * 31 + y * 17) % 7 < 3 && (x / 9 + y / 16) % 5 != 0;
+                let v = if ink { 30 } else { 235 - (x / 8) as u8 };
+                [v, v, v, 255]
+            })
+            .collect();
+        let frame = Frame::new(w, h, w as usize * 4, &data);
+        let mut enc = Software::new(EncoderSettings { fps: 60, bitrate_kbps: 300 }).unwrap();
+        let mut decoder = openh264::decoder::Decoder::new().unwrap();
+        // Mean squared luma error of the decoded picture after `packet`.
+        let mut error = |packet: &[u8], source: &Yuv420| {
+            let decoded = decoder.decode(packet).unwrap().expect("a picture per packet");
+            let (stride, _, _) = decoded.strides();
+            let mut sum = 0.0;
+            for row in 0..source.height {
+                for col in 0..source.width {
+                    let d = decoded.y()[row * stride + col] as f64 - source.y()[row * source.width + col] as f64;
+                    sum += d * d;
+                }
+            }
+            sum / (source.width * source.height) as f64
+        };
+
+        let key = enc.encode(Some(&frame), true).unwrap().frames.remove(0);
+        let blurry = error(&key.data, &enc.picture);
+        let mut last = (blurry, key.data.len());
+        for _ in 0..60 {
+            let frames = enc.encode(None, false).unwrap().frames;
+            let Some(frame) = frames.first() else { break };
+            last = (error(&frame.data, &enc.picture), frame.data.len());
+        }
+        let (sharp, settled_bytes) = last;
+        assert!(sharp < blurry / 4.0, "squared error {blurry:.1} -> {sharp:.1}");
+        assert!(settled_bytes < 100, "nothing left to add: {settled_bytes} bytes");
+    }
 }

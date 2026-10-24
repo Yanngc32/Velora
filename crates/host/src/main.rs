@@ -8,6 +8,7 @@ mod input;
 mod password;
 mod rate;
 mod reach;
+mod refine;
 mod server;
 #[cfg(windows)]
 mod service;

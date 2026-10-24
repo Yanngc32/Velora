@@ -6,6 +6,10 @@
 //! Once a second, the delivery time is compared with the lowest one of the last ten seconds
 //! (what the path does when it is not queueing): well above it, or many frames held back, and
 //! the bitrate is cut (multiplicatively); calm for a while, and it grows back (additively).
+//!
+//! Delivery time only counts while the video uses a fair share of its bitrate: a path whose
+//! delay swings on its own (a mobile link, a congested uplink elsewhere) would otherwise cut the
+//! bitrate of a still screen sending almost nothing, which cannot be what queues there.
 
 use std::{
     collections::VecDeque,
@@ -20,6 +24,8 @@ const BASELINE_SECONDS: usize = 10;
 const QUEUEING: Duration = Duration::from_millis(25);
 /// Share of a period spent holding frames back that counts as congestion.
 const HELD_BACK: f64 = 0.25;
+/// Share of the bitrate sent in a period for its delivery time to count.
+const LOADED: f64 = 0.25;
 /// Cut on congestion, and growth per calm step as a share of the maximum.
 const DECREASE: f64 = 0.7;
 const INCREASE: f64 = 0.08;
@@ -35,6 +41,8 @@ pub struct Sample {
     pub delivery: Option<Duration>,
     /// Time the capture waited because too many frames were unacknowledged.
     pub held_back: Duration,
+    /// Video bytes sent.
+    pub sent_bytes: u64,
 }
 
 pub struct RateControl {
@@ -70,6 +78,8 @@ impl RateControl {
             (Some(delivery), Some(base)) => delivery > base + QUEUEING.max(base / 2),
             _ => false,
         };
+        let sent_kbps = sample.sent_bytes as f64 * 8.0 / 1000.0 / PERIOD.as_secs_f64();
+        let queueing = queueing && sent_kbps >= self.current as f64 * LOADED;
         let held_back = sample.held_back.as_secs_f64() > PERIOD.as_secs_f64() * HELD_BACK;
         let next = if queueing || held_back {
             (self.current as f64 * DECREASE) as u32
@@ -93,8 +103,13 @@ impl RateControl {
 mod tests {
     use super::*;
 
+    /// A period sending at 12 000 kbit/s, the most any test starts at.
     fn sample(ms: u64, held_back_ms: u64) -> Sample {
-        Sample { delivery: Some(Duration::from_millis(ms)), held_back: Duration::from_millis(held_back_ms) }
+        Sample {
+            delivery: Some(Duration::from_millis(ms)),
+            held_back: Duration::from_millis(held_back_ms),
+            sent_bytes: 1_500_000,
+        }
     }
 
     #[test]
@@ -132,5 +147,25 @@ mod tests {
             }
         }
         assert_eq!(rc.current(), 1_200, "a tenth of the maximum, at least 500 kbit/s");
+    }
+
+    #[test]
+    fn delay_swings_of_an_idle_path_do_not_cut() {
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let mut rc = RateControl::new(12_000, t0);
+        let idle = |ms: u64, sent_bytes: u64| Sample {
+            delivery: Some(Duration::from_millis(ms)),
+            held_back: Duration::ZERO,
+            sent_bytes,
+        };
+        // A still screen: a few kilobytes a second, while the path's delay swings from 50 to 270 ms.
+        for (s, ms) in [50, 270, 120, 230, 60, 180].into_iter().enumerate() {
+            assert_eq!(rc.update(idle(ms, 4_000), at(s as u64 + 1)), None);
+        }
+        // The same swing while sending a quarter of the bitrate is queueing: cut.
+        assert_eq!(rc.update(idle(270, 375_000), at(7)), Some(8_400));
+        // Held back frames still count, whatever was sent.
+        assert_eq!(rc.update(Sample { held_back: Duration::from_millis(600), ..idle(50, 0) }, at(8)), Some(5_880));
     }
 }
