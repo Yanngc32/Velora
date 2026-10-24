@@ -2385,6 +2385,9 @@ mod tests {
             reason: Some("standalone reach is off".into()),
         };
         assert_eq!(reach.relays, std::slice::from_ref(&expected));
+        // What the registering task reads has the other addresses too.
+        let listed: Vec<KnownHost> = host.shared.state.load("relays.json").unwrap();
+        assert_eq!(listed[0].also, ["198.51.100.20:7420"]);
         // The same relay again replaces it, under its new name and address.
         let reach =
             host.shared.control(add("Office", "office.example.net:7420", &office), true).unwrap().reach.unwrap();

@@ -615,7 +615,6 @@ pub fn remove_relay(ctx: &ReachContext, fingerprint: &str) -> Result<()> {
         ctx.state_dir.save(RELAYS_FILE, &list)?;
         tracing::info!("will no longer register with the relay {fingerprint}");
     }
-    lock(&state.reasons).remove(&fingerprint);
     state.rescan.notify_one();
     Ok(())
 }
@@ -841,6 +840,8 @@ async fn run_registration(ctx: ReachContext, started: Instant) -> Result<()> {
     let mut leaving: Vec<AbortOnDrop> = Vec::new();
     // The computer's name goes in the hello; finding it may read a file.
     let state = ctx.ext::<RelayState>();
+    // What an earlier run of this task said about a relay is not about now.
+    lock(&state.reasons).clear();
     let named = state.clone();
     let _ = tokio::task::spawn_blocking(move || named.name.get_or_init(crate::hostname).len()).await;
     loop {
@@ -3022,7 +3023,9 @@ mod tests {
         relay.trust(ctx.fingerprint, ctx.socket.local_addr());
         let relay = relay.start(relay_addr, true).await;
 
-        // The task has read an empty list and sleeps for half a minute.
+        // The task has read an empty list and sleeps for half a minute. What an earlier run said
+        // about a relay is gone by then.
+        lock(&ctx.ext::<RelayState>().reasons).insert(Fingerprint([21; 32]), "it was away".to_string());
         let registering = AbortOnDrop(tokio::spawn({
             let ctx = ctx.clone();
             async move {
@@ -3031,6 +3034,7 @@ mod tests {
         }));
         sleep(Duration::from_millis(500)).await;
         assert!(ctx.reach.read().relays.is_empty());
+        assert!(lock(&ctx.ext::<RelayState>().reasons).is_empty());
 
         // Asked from the launcher, it does not wait for the half minute (`until` gives up in 20 s).
         add_relay(&ctx, "Office PC", &relay_addr.to_string(), &[], &relay.fingerprint.to_base64()).unwrap();
