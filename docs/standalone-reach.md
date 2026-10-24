@@ -242,7 +242,7 @@ VPN, LAN) and the address that worked from the home PC.
 
 Check it: on the home PC the relay has a green dot, *Registered: your devices can reach this PC
 through it*; on the relay PC the home PC reads *Registered here now*. From another network
-`velora connect "Home PC"` should print *through another PC of yours (relay) 'Relay PC' at …*.
+`velora connect "Home PC"` should print *through: Another PC of yours (relay) · Relay PC · …*.
 
 Things to know:
 
