@@ -10,7 +10,7 @@ is [standalone-reach.md](standalone-reach.md).
 | 1 | T0 S0 B1 B2 B3 C1 D1 | done: built and merged, 2026-10-23 (S0: only a run from another network is pending) |
 | 2 | E1 F1 G1 C2 C3 D2 | done: built and merged, 2026-10-23 |
 | 3 | E2-E5 F2-F5 G2 G3, and T1 and E4b | done: built and merged. T1 and E4b (the relay lists, edited from the app) were added during the work, and E6 (the adapter address) was built with them |
-| follow-up | P1 P2 P3 | three small tickets (hardening, client polish, the punch signature); in progress when this was written |
+| follow-up | P1 P2 P3 | three small tickets: P1 (hardening: the service keeps the reach files, a safer UPnP removal) and P2 (client polish: the route says a hole punch, the Files page waits for a relayed session) are merged; P3 (the punch signature and the keepalive's answer) was in progress when this was written |
 | 4 | H1 | done: the README section and [standalone-reach.md](standalone-reach.md) |
 | 4 | I1-I4 | **not run yet**: the field tests on real networks |
 | 4 | H2 | not started |

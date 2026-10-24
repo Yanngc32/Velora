@@ -84,8 +84,8 @@ reaches a device that cannot connect, so after you change a switch each device h
 session once to hear about it.
 
 **Which way won** is shown in three places: **This PC** says *The last connection came in through*
-and the kind and address; `velora connect` prints *Connected to 'X' through the public address
-(…)*; the host's log has *'Phone' reached this computer at its public address (…)*.
+and the kind and address; `velora connect` prints *Connected to 'X' through: Public address · …*;
+the host's log has *'Phone' reached this computer at its public address (…)*.
 
 ## The switches
 
@@ -99,8 +99,10 @@ only the PC's LAN and VPN addresses.
 **Reach this PC from other networks without a VPN** (`standalone`). While it is on, the host:
 
 - asks the router to forward its UDP port to this PC, NAT-PMP first, then UPnP (3 s to find the
-  router, 5 s per protocol). The lease is one hour and is renewed every 30 minutes; the mapping is
-  removed when the host stops normally and otherwise expires by itself. When the router cannot
+  router, 5 s per protocol). The lease is one hour and is renewed every 30 minutes; when the host stops normally it
+  removes the mapping, if the router shows that it holds that port for this PC (a router that will
+  not list its mappings keeps it, and so does one that holds the port for another computer), and
+  otherwise it expires by itself. When the router cannot
   open a port it asks again after 1 minute, then 2, 4, 8, 16 and every 30 minutes; turning the
   switch off and on asks at once. If the router gives another port than the wanted one (two
   hosts behind one router), that port is what is advertised;
@@ -255,9 +257,11 @@ Things to know:
   found by itself only while it has none. List the PC that will wake yours (see
   [Waking](#waking-a-sleeping-pc)) for that reason.
 - **One device at a time.** A relay carries one client per home PC; a second device that asks
-  takes the first over. So does a Files window of the same computer: `velora connect` and
-  `velora bench` check for this and refuse a second window of the same PC while the first goes
-  through a relay, but the Files page does not check and takes the session over.
+  takes the first over. On one computer, `velora connect`, `velora bench`, the Files page and files
+  dropped on the PC's card check first: while a session of this computer holds the relay to that
+  PC they refuse, with *'X' is already open on this computer through a relay…: close the other
+  window first*, instead of taking it over. A session started later does take an idle file
+  connection over, and a transfer running on it is lost.
 - **Bandwidth.** The relay PC receives the whole picture and sends it on: as much upload as the
   session's bitrate (12 Mbit/s at most by default; the app says 6 to 12), and the same in download.
   The bitrate adapts to what that link can carry, which shows as a softer picture, not a failure.
@@ -345,9 +349,10 @@ the `Velora` service, as SYSTEM, with its state in `C:\ProgramData\Velora\host` 
   rights. Otherwise the app says *Only an administrator can change this, because Velora runs as a
   Windows service on this PC*: open Velora as administrator (right-click, **Run as
   administrator**) and try again.
-- The service has its own copy of the settings. After installing it, look at **This PC**: if the
-  switches are off, turn them on again, and connect once from each device so it learns the host's
-  current DHT key and relays.
+- When the service is installed it brings over from your own host the identity, the paired
+  devices and the access password, and the reach settings: the switches, the DHT key and the
+  devices' secrets, and the relay lists (a service that already has an identity keeps what it has).
+  Look at **This PC** after installing it all the same.
 - It adds its own firewall rule, **Velora (service)**: inbound UDP 7420 for the installed program,
   on every network profile. A service never gets Windows' "allow access" prompt.
 - Without the service, if Windows asks whether to allow `velora-host`, choose **Allow**.
@@ -432,7 +437,7 @@ the packet there and says *Wake-up signal sent* while nothing wakes.
 ```sh
 velora wake <host-name>          # name or address, as for connect
 velora connect <host-name>       # says which way in it took
-velora bench <host-name>         # starts with a similar line, and the picture size
+velora bench <host-name>         # starts with the same line, and the picture size
 velora-host run --relay-only     # relays only: no screen, no input
 ```
 
@@ -443,23 +448,26 @@ standard error: *You are not on this PC's network, and none of your PCs there co
 signal…*, *This PC has not told Velora how to wake it. Connect to it once while it is on…*, or
 *Could not send the wake-up signal: …* (for example `'x' is not paired yet`).
 
-**`velora connect`** prints one line before the window opens, such as `Connected to 'Home PC'
-through the local network (192.0.2.10:7420).`:
+**`velora connect`** prints one line before the window opens, in the app's words and form (a label,
+a middle dot and the address), such as `Connected to 'Home PC' through: Local network ·
+192.0.2.10:7420`; `velora bench` starts with the same line and the picture size after it. In
+Portuguese it reads *Conectado a 'Home PC' por: Rede local · …*.
 
-| The words after *through* | The way in |
+| What follows *through:* | The way in |
 |---|---|
-| the local network | A LAN address |
-| the VPN | A mesh VPN address |
-| the public address | A mapped or forwarded port, or a punched hole (the line cannot tell them apart) |
-| its IPv6 address | A global IPv6 address |
-| another PC of yours (relay) 'Name' at … | A relay PC, named after the computer you paired with |
-| another route | An address of a kind this version does not know |
+| Local network · address | A LAN address |
+| VPN · address | A mesh VPN address |
+| Public address · address | A mapped or forwarded port |
+| IPv6 address · address | A global IPv6 address |
+| Another PC of yours (relay) · name · address | A relay PC, named after the computer you paired with |
+| Direct through the routers (hole punch) · endpoint | A hole punch |
+| Another route · address | An address of a kind this version does not know |
 
 A host started with `--relay-only` has no screen: `connect` and `bench` end with *This PC only
 relays connections: there is no screen to show.* (status 1), and `pair` pairs all the same and says
 so (status 0), because pairing is how a device gets to use the relay. A second `velora connect` for a
 PC that is open on this computer through a relay is refused: *'X' is already open on this computer
-through a relay, which carries one connection to a host at a time: close that window first.*
+through a relay, which carries one connection to a host at a time: close the other window first.*
 
 **`velora-host run`** takes, besides the usual options: `--bind ADDRESS:PORT` (default `[::]:7420`),
 `--relay-only`, `--pair`, and the global `--config-dir DIR` and `--no-update`. `RUST_LOG` sets the
@@ -516,7 +524,8 @@ the relays; for the client's side run `velora connect` in a terminal with
 | … **Not registered: standalone reach is off** | The home PC's first switch is off | Turn it on |
 | … **Not registered: this computer only relays** | The home PC runs with `--relay-only` | Relays do not register with relays |
 | *relay '…' (…): …; trying again in N s* in the log | The reason is in the text. The host retries after 5 s, then doubling up to 5 minutes (with up to 20 % more by chance). A refusal (this PC is not allowed, the PC does not relay, it asks for a password) waits 1 minute for a relay you listed and 10 minutes for a computer found by itself; being replaced by another connection of the same PC, 90 s; being removed by the relay, 10 minutes; the relay stopping, 2 minutes; this PC already holding as many relays as it allows, 1 minute | Fix the reason. Two copies of one host (the same identity on two computers) replace each other |
-| A session through a relay ends: `velora connect` prints *disconnected: closed*, and its log says *the relay ended the link: another device took the host over* | A second device, or a Files page of the same computer, asked the same relay for the same PC | One device at a time per PC through a relay |
+| A session through a relay ends: `velora connect` prints *disconnected: closed*, and its log says *the relay ended the link: another device took the host over* | A second device asked the same relay for the same PC (a session started later also takes an idle file connection over) | One device at a time per PC through a relay |
+| *'X' is already open on this computer through a relay, which carries one connection to a host at a time: close the other window first.* | A session of this computer holds the relay to X, and `velora connect`, the Files page or dropped files will not take it over | Close that window, then try again |
 | **Wake**: *You are not on this PC's network, and none of your PCs there could send the signal…* | Not on the PC's network and no registered relay PC there could send | [Waking](#waking-a-sleeping-pc) |
 | **Wake**: *This PC has not told Velora how to wake it…* | The PC never told your device its adapter address | Open a session once while it is on, with a recent Velora on both sides |
 | **Wake**: *Wake-up signal sent…*, and nothing happens | Firmware or Windows settings, or the same-address-range case | The table under [Waking](#waking-a-sleeping-pc) |
@@ -774,6 +783,11 @@ away, and no access-password question for a device the host knows. `RelayRegiste
 are accepted only on links; `Wake` and `PunchRequest` are answered anywhere. A registering host dials with its *host*
 identity; the relay lets in a computer listed in `relay_hosts.json` or in its own client-side
 `known_hosts.json` for `RelayRegister` and nothing else.
+
+**Routes.** `Session::route()` and `FilesSession::route()` say how a connection was made: a
+`RouteKind`, either `Address(AddressKind)` (a relay is one, with its fingerprint) or `Punch`. The
+host still hears only the address (`ClientMsg::Reached`), so for the host a punch is the public
+address and nothing on the wire changed.
 
 **The QUIC socket.** The host's endpoint runs on a multiplexer. Besides ordinary QUIC it carries
 *probes* (DHT pings sent from the QUIC port, their replies kept away from quinn) and relay *tunnels*

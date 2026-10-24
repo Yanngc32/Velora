@@ -369,8 +369,9 @@ open it. Forwarding the port by hand still works, as it always did.
 
 **Windows.** The installer's firewall rule ("Velora", UDP 7420, any network) already covers the
 port. As the lock screen service, changing a switch or a relay list needs administrator rights
-(open Velora as administrator), and the service keeps its own settings in
-`C:\ProgramData\Velora`: look at **This PC** after installing it.
+(open Velora as administrator), and the service keeps its state in `C:\ProgramData\Velora`,
+where the settings of your own host are copied when it is installed: look at **This PC** all the
+same.
 
 **A relay PC, in three steps** (**This PC → Relay PCs**, on both PCs):
 
@@ -402,8 +403,8 @@ Wake-on-LAN packet. It needs, and Velora cannot check:
 home that can itself be reached (a VPS is not on that network). The Android app has no Wake button
 yet.
 
-**Command line and headless hosts.** `velora connect` prints the way in it took (*through the
-public address (…)*); `velora-host run --relay-only` serves relays and nothing else. A host with
+**Command line and headless hosts.** `velora connect` prints the way in it took (*through:
+Public address · …*); `velora-host run --relay-only` serves relays and nothing else. A host with
 no app keeps its settings in files in its state folder (`~/.config/velora/host`,
 `%APPDATA%\velora\config\host`, or `C:\ProgramData\Velora\host` for the service): `reach.json`
 (the three switches, read at start), `relays.json` and `relay_hosts.json`. Their format, a VPS
