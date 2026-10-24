@@ -1,5 +1,6 @@
 package io.github.yanngc32.velora
 
+import android.Manifest
 import android.os.Bundle
 import android.widget.Toast
 import androidx.activity.ComponentActivity
@@ -68,6 +69,7 @@ class MainActivity : ComponentActivity() {
                     HostsScreen(
                         hosts = hosts,
                         onConnect = { SessionActivity.connect(this@MainActivity, it.name) },
+                        onFiles = { FilesActivity.open(this@MainActivity, it.name) },
                         onForget = { forget(it) },
                         onScan = ::scan,
                         onManual = { pairing = PairingLink("", "") },
@@ -89,6 +91,11 @@ class MainActivity : ComponentActivity() {
             }
         }
         if (savedInstanceState == null) checkForUpdate()
+        // Android 8-9: received and downloaded files go to the public Downloads folder only
+        // with this permission (without it, to the app's own folder on the shared storage).
+        if (savedInstanceState == null && Transfers.needsLegacyPermission(this)) {
+            requestPermissions(arrayOf(Manifest.permission.WRITE_EXTERNAL_STORAGE), 1)
+        }
     }
 
     private fun checkForUpdate() {
@@ -143,6 +150,7 @@ class MainActivity : ComponentActivity() {
 private fun HostsScreen(
     hosts: List<HostEntry>,
     onConnect: (HostEntry) -> Unit,
+    onFiles: (HostEntry) -> Unit,
     onForget: (HostEntry) -> Unit,
     onScan: () -> Unit,
     onManual: () -> Unit,
@@ -162,7 +170,7 @@ private fun HostsScreen(
         PageHeader(stringResource(R.string.devices_label), stringResource(R.string.devices_title), count)
         Spacer(Modifier.height(20.dp))
         Box(Modifier.weight(1f)) {
-            if (hosts.isEmpty()) EmptyDevices(onScan) else DeviceList(hosts, onConnect, onLongPress = { confirmForget = it })
+            if (hosts.isEmpty()) EmptyDevices(onScan) else DeviceList(hosts, onConnect, onFiles, onLongPress = { confirmForget = it })
         }
         Spacer(Modifier.height(16.dp))
         PrimaryButton(stringResource(R.string.scan_qr), onScan, Modifier.fillMaxWidth(), icon = R.drawable.ic_scan_qr_code)
@@ -199,7 +207,12 @@ private fun Brand() {
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun DeviceList(hosts: List<HostEntry>, onConnect: (HostEntry) -> Unit, onLongPress: (HostEntry) -> Unit) {
+private fun DeviceList(
+    hosts: List<HostEntry>,
+    onConnect: (HostEntry) -> Unit,
+    onFiles: (HostEntry) -> Unit,
+    onLongPress: (HostEntry) -> Unit,
+) {
     VeloraCard(padding = androidx.compose.foundation.layout.PaddingValues(0.dp)) {
         LazyColumn {
             itemsIndexed(hosts, key = { _, h -> h.name }) { i, host ->
@@ -217,6 +230,8 @@ private fun DeviceList(hosts: List<HostEntry>, onConnect: (HostEntry) -> Unit, o
                         Text(host.name, style = MaterialTheme.typography.titleSmall.copy(fontSize = 15.sp))
                         Text(host.address, style = TextStyle(fontFamily = Velora.Mono, fontSize = 12.sp, color = Velora.Weak))
                     }
+                    Spacer(Modifier.width(8.dp))
+                    SecondaryButton(stringResource(R.string.files), { onFiles(host) })
                     Spacer(Modifier.width(8.dp))
                     PrimaryButton(stringResource(R.string.connect), { onConnect(host) })
                 }

@@ -22,6 +22,12 @@ pub struct RemoteFiles {
 }
 
 impl RemoteFiles {
+    /// File streams on an already authenticated connection (tests, or a caller that set up
+    /// its own).
+    pub fn new(conn: quinn::Connection) -> Self {
+        Self { conn }
+    }
+
     /// Drives and well-known folders (Downloads, Desktop, ...) of the user signed in there.
     pub async fn roots(&self) -> Result<Vec<Entry>> {
         let (mut send, mut recv) = self.conn.open_bi().await?;
@@ -71,8 +77,9 @@ pub enum OfferEvent {
 }
 
 /// Accepts the host's streams until the connection closes: offered files are saved into
-/// `dest`, clipboard content goes to `on_clip`.
-pub(crate) async fn receive_offers(
+/// `dest`, clipboard content goes to `on_clip`. Sessions start this with
+/// [`crate::Session::receive_files`].
+pub async fn receive_offers(
     conn: quinn::Connection,
     dest: PathBuf,
     on_event: Arc<dyn Fn(OfferEvent) + Send + Sync>,

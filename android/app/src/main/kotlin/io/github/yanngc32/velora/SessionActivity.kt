@@ -261,6 +261,9 @@ class SessionActivity : ComponentActivity(), SessionListener, SurfaceHolder.Call
                     connecting = false
                     setVideoSize(s.width().toInt(), s.height().toInt())
                     s.start(this)
+                    // What the computer sends meanwhile (Send To there) goes to Downloads.
+                    val incoming = IncomingFiles(this, s.hostName())
+                    s.receiveFiles(incoming.dir.absolutePath, incoming)
                 }
             } catch (e: MobileException.PasswordRequired) {
                 runOnUiThread { if (!finished) passwordPrompt = false }

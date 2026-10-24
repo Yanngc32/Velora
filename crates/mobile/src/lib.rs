@@ -17,6 +17,10 @@ use velora_protocol::{
 
 uniffi::setup_scaffolding!();
 
+mod files;
+
+pub use files::{FileEntry, FileKind, Files, OfferListener, TransferListener};
+
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 #[uniffi(flat_error)]
 pub enum MobileError {
