@@ -15,6 +15,8 @@ use std::{
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::wire::AddressKind;
+
 /// Requests and replies are tiny; anything larger is not from a well-behaved peer.
 pub const MAX_LINE: usize = 64 * 1024;
 
@@ -55,6 +57,51 @@ pub enum Request {
     SetStayAwake {
         on: bool,
     },
+    /// Sets the switches of standalone reach (see [`Status::reach`]). All three are given
+    /// together: the launcher always knows the current ones.
+    SetReach {
+        standalone: bool,
+        relay_for_others: bool,
+        dht: bool,
+    },
+    /// This computer should register with a relay: another paired computer that can be reached
+    /// from outside and passes connections on to this one (see [`ReachStatus::relays`]). The host
+    /// keeps it in its `relays.json` and replaces an entry with the same `fingerprint`. `address` is
+    /// `ip:port` or `name:port`, `also` more of the same; `fingerprint` is the relay's full host
+    /// fingerprint (base64url). At most 16 relays. An empty `name` is shown as the short fingerprint.
+    AddRelay {
+        #[serde(default)]
+        name: String,
+        #[serde(default)]
+        address: String,
+        #[serde(default)]
+        also: Vec<String>,
+        #[serde(default)]
+        fingerprint: String,
+    },
+    /// This computer stops registering with that relay (by its full fingerprint) and drops the
+    /// registration. Removing one that is not in the list changes nothing.
+    RemoveRelay {
+        #[serde(default)]
+        fingerprint: String,
+    },
+    /// The computer with this host fingerprint (base64url) may register with this one as its relay,
+    /// though it is not one of the devices paired with it: the host keeps it in its
+    /// `relay_hosts.json` (see [`ReachStatus::relay_hosts`]), where a computer this one's user paired
+    /// with from here is trusted too. A link and nothing more: it opens no session and no files.
+    /// Replaces an entry with the same `fingerprint`; at most 64 hosts.
+    AllowRelayHost {
+        #[serde(default)]
+        name: String,
+        #[serde(default)]
+        fingerprint: String,
+    },
+    /// That computer may no longer register here, and its registration, if it has one, is dropped.
+    /// Removing one that is not in the list changes nothing else.
+    RemoveRelayHost {
+        #[serde(default)]
+        fingerprint: String,
+    },
 }
 
 pub type Reply = std::result::Result<Status, String>;
@@ -91,6 +138,85 @@ pub struct Status {
     /// kept on during a session. `None` from hosts that can't do it or predate it.
     #[serde(default)]
     pub stay_awake: Option<bool>,
+    /// How this host is reached from other networks without a mesh VPN. `None` from hosts that
+    /// predate standalone reach: the launcher shows nothing for it and sends no
+    /// [`Request::SetReach`].
+    #[serde(default)]
+    pub reach: Option<ReachStatus>,
+}
+
+/// What the host does to be reachable from other networks, for This PC to show
+/// (`docs/nat-traversal.md`). Fields missing from a status read as off or empty.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ReachStatus {
+    /// Standalone reach is on: the host asks the router to map its port, and tells devices its
+    /// public and IPv6 addresses.
+    pub standalone: bool,
+    /// Other paired devices may connect through this computer to reach their own host.
+    pub relay_for_others: bool,
+    /// The host publishes its addresses in the BitTorrent Mainline DHT for its paired devices.
+    pub dht: bool,
+    /// The router's port mapping, when there is one.
+    pub mapping: Option<MappingStatus>,
+    /// Public IPv4 addresses (`ip:port`) the host advertises.
+    pub public: Vec<String>,
+    /// Global IPv6 addresses (`[ip]:port`) the host advertises.
+    pub v6: Vec<String>,
+    /// The address (and its kind) the device that connected last reached the host at.
+    pub last_reached: Option<(AddressKind, String)>,
+    /// The relays the host is registered with, by the names it knows them under.
+    pub registered_with: Vec<String>,
+    /// The relays this host is set to register with (see [`Request::AddRelay`]) and how each one
+    /// stands. Absent from hosts that predate relay management.
+    pub relays: Vec<RelayEntry>,
+    /// The computers allowed to register here as their relay's client (see
+    /// [`Request::AllowRelayHost`]). Absent from hosts that predate relay management.
+    pub relay_hosts: Vec<RelayHostEntry>,
+}
+
+/// A relay this host is set to register with.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RelayEntry {
+    /// How it is shown.
+    pub name: String,
+    /// Its full host fingerprint (base64url): what identifies it in [`Request::RemoveRelay`].
+    pub fingerprint: String,
+    /// The `ip:port` or `name:port` it is dialed at first.
+    pub address: String,
+    /// The registration is up now.
+    pub registered: bool,
+    /// Why it is not, in the host's words, when the host knows (the last reason it logged).
+    pub reason: Option<String>,
+}
+
+/// A computer allowed to register with this one as its relay.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RelayHostEntry {
+    /// How it is shown.
+    pub name: String,
+    /// Its full host fingerprint (base64url): what identifies it in [`Request::RemoveRelayHost`].
+    pub fingerprint: String,
+    /// It is registered here now.
+    pub registered: bool,
+}
+
+/// A port mapping the router granted the host (NAT-PMP or UPnP).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MappingStatus {
+    /// How the router was asked: `"natpmp"` or `"upnp"`.
+    pub protocol: String,
+    /// The `ip:port` the mapping makes the host answer at from outside: the router's external
+    /// address and the port it assigned, which is not always the host's own.
+    pub external: String,
+    /// The external address is public. `false` means the ISP shares it between customers or a
+    /// second router sits in front: the mapping reaches only that far and is not advertised.
+    pub public: bool,
+    /// Seconds until the router drops the mapping unless it is renewed, which the host does.
+    pub lease_secs: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -236,6 +362,191 @@ mod tests {
             "service":false,"devices":[],"pairing":null}"#;
         let status: Status = serde_json::from_str(json).unwrap();
         assert_eq!(status.stay_awake, None);
+        assert_eq!(status.reach, None);
         assert!(status.also.is_empty() && status.requests.is_empty() && !status.password_set);
+    }
+
+    /// The last status before standalone reach, as the host wrote it: everything but `reach`.
+    #[test]
+    fn status_before_standalone_reach() {
+        let json = r#"{"name":"PC","version":"0.4.0","fingerprint":"AB12","address":"192.168.1.9:7420","also":[],
+            "service":false,"password_set":false,"devices":[],"pairing":null,"offers":[],"requests":[],
+            "stay_awake":true}"#;
+        let status: Status = serde_json::from_str(json).unwrap();
+        assert_eq!((status.stay_awake, status.reach), (Some(true), None));
+    }
+
+    #[test]
+    fn set_reach_wire_format() {
+        let set = Request::SetReach { standalone: true, relay_for_others: false, dht: true };
+        let json = serde_json::to_string(&set).unwrap();
+        assert_eq!(json, r#"{"op":"set_reach","standalone":true,"relay_for_others":false,"dht":true}"#);
+        assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), set);
+    }
+
+    fn reach_status() -> ReachStatus {
+        ReachStatus {
+            standalone: true,
+            relay_for_others: false,
+            dht: true,
+            mapping: Some(MappingStatus {
+                protocol: "upnp".into(),
+                external: "203.0.113.7:51820".into(),
+                public: true,
+                lease_secs: 3600,
+            }),
+            public: vec!["203.0.113.7:51820".into()],
+            v6: vec!["[2804:14c:5b82:1234:abcd:ef01:2345:6789]:7420".into()],
+            last_reached: Some((AddressKind::Public, "203.0.113.7:51820".into())),
+            registered_with: vec!["STUDIO-PC".into()],
+            relays: vec![
+                RelayEntry {
+                    name: "STUDIO-PC".into(),
+                    fingerprint: "c3R1ZGlv".into(),
+                    address: "203.0.113.10:7420".into(),
+                    registered: true,
+                    reason: None,
+                },
+                RelayEntry {
+                    name: "Office PC".into(),
+                    fingerprint: "b2ZmaWNl".into(),
+                    address: "office.example.net:7420".into(),
+                    registered: false,
+                    reason: Some("it does not relay for other devices".into()),
+                },
+            ],
+            relay_hosts: vec![RelayHostEntry {
+                name: "Home PC".into(),
+                fingerprint: "aG9tZQ".into(),
+                registered: true,
+            }],
+        }
+    }
+
+    #[test]
+    fn status_with_reach_roundtrips() {
+        let status = Status {
+            name: "PC".into(),
+            version: "0.5.0".into(),
+            fingerprint: "AB12".into(),
+            address: Some("192.168.1.9:7420".into()),
+            also: Vec::new(),
+            service: false,
+            password_set: false,
+            devices: Vec::new(),
+            pairing: None,
+            offers: Vec::new(),
+            requests: Vec::new(),
+            stay_awake: None,
+            reach: Some(reach_status()),
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(json.contains(r#""last_reached":["public","203.0.113.7:51820"]"#), "{json}");
+        assert!(json.contains(
+            r#""mapping":{"protocol":"upnp","external":"203.0.113.7:51820","public":true,"lease_secs":3600}"#
+        ));
+        assert_eq!(serde_json::from_str::<Status>(&json).unwrap(), status);
+        // A relay as the last address reached carries its fingerprint.
+        let relayed = ReachStatus {
+            last_reached: Some((AddressKind::Relay("fp".into()), "198.51.100.2:7420".into())),
+            ..reach_status()
+        };
+        let json = serde_json::to_string(&relayed).unwrap();
+        assert_eq!(serde_json::from_str::<ReachStatus>(&json).unwrap(), relayed);
+    }
+
+    #[test]
+    fn relay_management_wire_format() {
+        let add = Request::AddRelay {
+            name: "Office PC".into(),
+            address: "203.0.113.10:7420".into(),
+            also: vec!["198.51.100.20:7420".into()],
+            fingerprint: "abc".into(),
+        };
+        let json = serde_json::to_string(&add).unwrap();
+        assert_eq!(
+            json,
+            r#"{"op":"add_relay","name":"Office PC","address":"203.0.113.10:7420","also":["198.51.100.20:7420"],"fingerprint":"abc"}"#
+        );
+        assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), add);
+
+        let cases = [
+            (Request::RemoveRelay { fingerprint: "abc".into() }, r#"{"op":"remove_relay","fingerprint":"abc"}"#),
+            (
+                Request::AllowRelayHost { name: "Home PC".into(), fingerprint: "def".into() },
+                r#"{"op":"allow_relay_host","name":"Home PC","fingerprint":"def"}"#,
+            ),
+            (
+                Request::RemoveRelayHost { fingerprint: "def".into() },
+                r#"{"op":"remove_relay_host","fingerprint":"def"}"#,
+            ),
+        ];
+        for (request, expected) in cases {
+            let json = serde_json::to_string(&request).unwrap();
+            assert_eq!(json, expected);
+            assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), request);
+        }
+    }
+
+    /// A launcher that leaves a field out still sends a request the host can answer: what is missing
+    /// reads as empty, and the host refuses what it cannot use.
+    #[test]
+    fn relay_requests_read_with_fields_missing() {
+        let add: Request =
+            serde_json::from_str(r#"{"op":"add_relay","address":"203.0.113.10:7420","fingerprint":"abc"}"#).unwrap();
+        let expected = Request::AddRelay {
+            name: String::new(),
+            address: "203.0.113.10:7420".into(),
+            also: Vec::new(),
+            fingerprint: "abc".into(),
+        };
+        assert_eq!(add, expected);
+        let allow: Request = serde_json::from_str(r#"{"op":"allow_relay_host","fingerprint":"def"}"#).unwrap();
+        assert_eq!(allow, Request::AllowRelayHost { name: String::new(), fingerprint: "def".into() });
+        let remove: Request = serde_json::from_str(r#"{"op":"remove_relay"}"#).unwrap();
+        assert_eq!(remove, Request::RemoveRelay { fingerprint: String::new() });
+        // And a host that predates them cannot read them at all: it answers with an error, not a crash.
+        assert!(serde_json::from_str::<Request>(r#"{"op":"add_relay_from_the_future"}"#).is_err());
+    }
+
+    /// A status from a host that has `reach` but no relay management: the lists read as empty.
+    #[test]
+    fn status_before_relay_management() {
+        let json = r#"{"name":"PC","version":"0.5.0","fingerprint":"AB12","address":null,"also":[],
+            "service":false,"password_set":false,"devices":[],"pairing":null,"offers":[],"requests":[],
+            "stay_awake":true,
+            "reach":{"standalone":true,"relay_for_others":false,"dht":true,"mapping":null,"public":[],"v6":[],
+                     "last_reached":null,"registered_with":["STUDIO-PC"]}}"#;
+        let status: Status = serde_json::from_str(json).unwrap();
+        let reach = status.reach.expect("the reach status is there");
+        assert_eq!(reach.registered_with, ["STUDIO-PC"]);
+        assert!(reach.relays.is_empty() && reach.relay_hosts.is_empty());
+    }
+
+    #[test]
+    fn relay_lists_in_a_reach_status_have_their_own_shape() {
+        let json = serde_json::to_string(&reach_status()).unwrap();
+        assert!(
+            json.contains(
+                r#""relays":[{"name":"STUDIO-PC","fingerprint":"c3R1ZGlv","address":"203.0.113.10:7420","registered":true,"reason":null},"#
+            ),
+            "{json}"
+        );
+        assert!(json.contains(r#""reason":"it does not relay for other devices"}]"#), "{json}");
+        assert!(
+            json.contains(r#""relay_hosts":[{"name":"Home PC","fingerprint":"aG9tZQ","registered":true}]"#),
+            "{json}"
+        );
+        // Fields missing from an entry read as empty, so an entry of the future still reads.
+        let entry: RelayEntry = serde_json::from_str(r#"{"fingerprint":"abc","something_new":1}"#).unwrap();
+        assert_eq!(entry, RelayEntry { fingerprint: "abc".into(), ..Default::default() });
+    }
+
+    #[test]
+    fn fields_missing_from_a_reach_status_read_as_off() {
+        let status: ReachStatus = serde_json::from_str(r#"{"standalone":true}"#).unwrap();
+        assert_eq!(status, ReachStatus { standalone: true, ..Default::default() });
+        let status: ReachStatus = serde_json::from_str(r#"{"mapping":{"protocol":"natpmp"}}"#).unwrap();
+        assert_eq!(status.mapping, Some(MappingStatus { protocol: "natpmp".into(), ..Default::default() }));
     }
 }

@@ -9,6 +9,7 @@ mod file_icons;
 mod files;
 mod icons;
 mod motion;
+mod reach;
 pub(crate) mod strings;
 mod theme;
 mod this_pc;
@@ -18,7 +19,7 @@ mod widgets;
 
 use std::{
     io::{Read, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -34,7 +35,7 @@ pub use this_pc::spawn_host;
 use this_pc::{HostLink, ServiceJob};
 use velora_client_core::hosts;
 use velora_protocol::{
-    identity::{KnownHost, StateDir},
+    identity::{ConnectMode, KnownHost, StateDir},
     pairing::{parse_pairing_link, PairingCode},
 };
 use widgets::*;
@@ -650,7 +651,14 @@ impl Launcher {
                         };
                         // A pairing session is labelled with the address it dialed.
                         let running = self.sessions.iter().any(|x| x.label == host.name || x.label == host.address);
-                        let card = DeviceCard { host, running, fresh, now: self.now, width: card_width };
+                        let card = DeviceCard {
+                            host,
+                            running,
+                            fresh,
+                            now: self.now,
+                            width: card_width,
+                            config_dir: self.config_dir.as_deref(),
+                        };
                         let (picked, rect) = card.show(ui, s, &self.icons);
                         if let Some(a) = picked {
                             action = Some((a, host.name.clone()));
@@ -669,14 +677,23 @@ impl Launcher {
             ui.add_space(24.0);
         });
         if let Some(name) = drop_on {
-            self.open_files(name.clone(), &ctx);
-            if let Some(manager) = &mut self.files {
-                manager.send_when_ready(name, dropped, &ctx);
+            if self.open_files(name.clone(), &ctx) {
+                if let Some(manager) = &mut self.files {
+                    manager.send_when_ready(name, dropped, &ctx);
+                }
             }
         }
         match action {
             Some((DeviceAction::Connect, name)) => self.spawn(name.clone(), &["connect", &name], None),
-            Some((DeviceAction::Files, name)) => self.open_files(name, ui.ctx()),
+            Some((DeviceAction::Files, name)) => {
+                self.open_files(name, ui.ctx());
+            }
+            Some((DeviceAction::Mode(mode), name)) => {
+                if let Err(e) = hosts::set_mode(&self.state, &name, mode) {
+                    self.error = Some(format!("{e:#}"));
+                }
+                self.refresh_hosts();
+            }
             Some((DeviceAction::Forget, name)) => {
                 if let Err(e) = hosts::forget(&self.state, &name) {
                     self.error = Some(format!("{e:#}"));
@@ -687,7 +704,14 @@ impl Launcher {
         }
     }
 
-    fn open_files(&mut self, host: String, ctx: &egui::Context) {
+    /// Shows `host` in the file manager, opening it if needed; whether it did. A relay carries one connection to a computer
+    /// from this one at a time, and a second takes the first over, so a session that is open through a relay to `host` is
+    /// not displaced by a file connection: the banner says to close it first (see `crate::free_relay`).
+    fn open_files(&mut self, host: String, ctx: &egui::Context) -> bool {
+        if let Err(e) = crate::free_relay(&self.state, &host, self.s) {
+            self.error = Some(format!("{e:#}"));
+            return false;
+        }
         match &mut self.files {
             // Keeps its transfers: the computer just shows on the right.
             Some(manager) => manager.show_host(host, ctx),
@@ -696,11 +720,15 @@ impl Launcher {
                     files::FileManager::open(host, self.config_dir.clone(), self.settings.device_name.clone(), ctx);
                 match manager {
                     Ok(manager) => self.files = Some(manager),
-                    Err(e) => return self.error = Some(format!("{e:#}")),
+                    Err(e) => {
+                        self.error = Some(format!("{e:#}"));
+                        return false;
+                    }
                 }
             }
         }
         self.go(Page::Files);
+        true
     }
 
     fn files_page(&mut self, ui: &mut egui::Ui) {
@@ -777,40 +805,22 @@ impl Launcher {
         ui.add_space(16.0);
         card(ui, |ui| {
             let release = velora_update::is_release_build();
-            ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing.y = 4.0;
-                    card_title(ui, s.auto_update);
-                    let note = if release { s.auto_update_text } else { s.auto_update_source_build };
-                    ui.label(RichText::new(note).color(WEAK));
-                });
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let mut on = self.settings.auto_update && release;
-                    if toggle(ui, &mut on, release).changed() {
-                        let mut next = self.settings.clone();
-                        next.auto_update = on;
-                        self.store(next);
-                    }
-                });
-            });
+            let note = if release { s.auto_update_text } else { s.auto_update_source_build };
+            let mut on = self.settings.auto_update && release;
+            if switch_setting(ui, s.auto_update, note, &mut on, release) {
+                let mut next = self.settings.clone();
+                next.auto_update = on;
+                self.store(next);
+            }
         });
         ui.add_space(16.0);
         card(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing.y = 4.0;
-                    card_title(ui, s.clipboard_title);
-                    ui.add(egui::Label::new(RichText::new(s.clipboard_text).color(WEAK)).wrap());
-                });
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let mut on = self.settings.share_clipboard;
-                    if toggle(ui, &mut on, true).changed() {
-                        let mut next = self.settings.clone();
-                        next.share_clipboard = on;
-                        self.store(next);
-                    }
-                });
-            });
+            let mut on = self.settings.share_clipboard;
+            if switch_setting(ui, s.clipboard_title, s.clipboard_text, &mut on, true) {
+                let mut next = self.settings.clone();
+                next.share_clipboard = on;
+                self.store(next);
+            }
         });
         ui.add_space(16.0);
         self.startup_card(ui);
@@ -835,17 +845,7 @@ impl Launcher {
             card_title(ui, s.startup_title);
             ui.add_space(6.0);
             let row = |ui: &mut egui::Ui, title: &str, note: &str, on: &mut bool, enabled: bool| {
-                ui.horizontal(|ui| {
-                    // Leave room for the switch so a long note wraps before it.
-                    let text_width = ui.available_width() - 64.0;
-                    ui.allocate_ui_with_layout(egui::vec2(text_width, 0.0), Layout::top_down(Align::Min), |ui| {
-                        ui.spacing_mut().item_spacing.y = 2.0;
-                        ui.label(RichText::new(title).font(font(14.0, medium())));
-                        ui.add(egui::Label::new(RichText::new(note).color(WEAK)).wrap());
-                    });
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| toggle(ui, on, enabled).changed()).inner
-                })
-                .inner
+                switch_row(ui, RichText::new(title).font(font(14.0, medium())), note, 2.0, on, enabled)
             };
             let tray = self.has_tray();
             let open_note = if tray { s.open_at_login_tray_text } else { s.open_at_login_text };
@@ -1188,6 +1188,60 @@ enum DeviceAction {
     Connect,
     Files,
     Forget,
+    Mode(ConnectMode),
+}
+
+/// The name of a connection mode, in the launcher's words.
+pub(crate) fn mode_name(mode: ConnectMode, s: &Strings) -> &'static str {
+    match mode {
+        ConnectMode::Auto => s.mode_auto,
+        ConnectMode::Lan => s.mode_lan,
+        ConnectMode::Vpn => s.mode_vpn,
+        ConnectMode::Velora => s.mode_velora,
+    }
+}
+
+fn mode_hint(mode: ConnectMode, s: &Strings) -> &'static str {
+    match mode {
+        ConnectMode::Auto => s.mode_auto_hint,
+        ConnectMode::Lan => s.mode_lan_hint,
+        ConnectMode::Vpn => s.mode_vpn_hint,
+        ConnectMode::Velora => s.mode_velora_hint,
+    }
+}
+
+/// A small chip with the connection mode of a computer; a click lists the modes, each with what it does. The mode picked,
+/// when it changed.
+fn mode_chip(ui: &mut egui::Ui, s: &Strings, current: ConnectMode) -> Option<ConnectMode> {
+    let text = format!("{} · {}", s.mode_label, mode_name(current, s));
+    let name = ui.painter().layout_no_wrap(text, font(12.0, medium()), WEAK);
+    let size = Vec2::new(10.0 + name.size().x + 22.0, 22.0);
+    let (rect, button) = ui.allocate_exact_size(size, Sense::click());
+    let hover = ui.ctx().animate_bool_with_time(button.id.with("hover"), button.hovered(), HOVER_SECONDS);
+    let painter = ui.painter();
+    let tint = if current.is_auto() { BORDER } else { ACCENT_TEXT.gamma_multiply(0.6) };
+    painter.rect(rect, RADIUS, HOVER.gamma_multiply(hover), egui::Stroke::new(1.0, tint), egui::StrokeKind::Inside);
+    let color = WEAK.lerp_to_gamma(TEXT, hover);
+    painter.galley(egui::pos2(rect.left() + 10.0, rect.center().y - name.size().y / 2.0), name, color);
+    let c = egui::pos2(rect.right() - 11.0, rect.center().y + 1.0);
+    let chevron = vec![c + Vec2::new(-3.5, -2.0), c + Vec2::new(0.0, 1.5), c + Vec2::new(3.5, -2.0)];
+    painter.add(egui::Shape::line(chevron, egui::Stroke::new(1.3, color)));
+    let button = button.on_hover_cursor(egui::CursorIcon::PointingHand);
+    let mut pick = None;
+    egui::Popup::menu(&button).show(|ui| {
+        ui.set_width(300.0);
+        for mode in ConnectMode::ALL {
+            let label =
+                ui.selectable_label(mode == current, RichText::new(mode_name(mode, s)).font(font(13.5, semibold())));
+            ui.add(egui::Label::new(RichText::new(mode_hint(mode, s)).font(font(12.0, medium())).color(WEAK)).wrap());
+            ui.add_space(4.0);
+            if label.clicked() {
+                pick = Some(mode);
+                ui.close();
+            }
+        }
+    });
+    pick.filter(|mode| *mode != current)
 }
 
 /// A button that removes something only when held: grey at rest, red under the pointer
@@ -1226,7 +1280,9 @@ fn hold_to_forget(ui: &mut egui::Ui, s: &Strings) -> bool {
     }
     let galley = if hover > 0.5 { hint } else { rest };
     let color = FAINT.lerp_to_gamma(ERROR, hover).lerp_to_gamma(TEXT, progress);
-    painter.galley(rect.center() - galley.size() / 2.0, galley, color);
+    // At rest the word lines up with the card's edge; held, the hint fills the button.
+    let at = egui::pos2(rect.left() + 12.0 * hover, rect.center().y - galley.size().y / 2.0);
+    painter.galley(at, galley, color);
     response.on_hover_cursor(egui::CursorIcon::PointingHand);
 
     if held {
@@ -1248,6 +1304,8 @@ struct DeviceCard<'a> {
     fresh: Option<f64>,
     now: f64,
     width: f32,
+    /// The launcher's `--config-dir`, for what a card does on its own (waking the computer).
+    config_dir: Option<&'a Path>,
 }
 
 impl DeviceCard<'_> {
@@ -1293,6 +1351,9 @@ impl DeviceCard<'_> {
                 ui.spacing_mut().item_spacing.y = 4.0;
                 ui.add(egui::Label::new(RichText::new(&self.host.name).font(font(15.0, semibold()))).truncate());
                 ui.label(RichText::new(&self.host.address).font(mono(12.5)).color(WEAK));
+                if let Some(mode) = mode_chip(ui, s, self.host.mode) {
+                    action = Some(DeviceAction::Mode(mode));
+                }
             });
         });
         if self.running {
@@ -1318,6 +1379,10 @@ impl DeviceCard<'_> {
         }
         if secondary_button(&mut buttons, s.files).clicked() {
             action = Some(DeviceAction::Files);
+        }
+        // No use for it while a session is open: the computer is awake.
+        if !self.running {
+            reach::wake_button(&mut buttons, s, self.host, rect, self.config_dir);
         }
         buttons.with_layout(Layout::left_to_right(Align::Center), |ui| {
             if hold_to_forget(ui, s) {

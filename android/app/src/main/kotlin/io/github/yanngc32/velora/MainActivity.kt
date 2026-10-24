@@ -1,5 +1,6 @@
 package io.github.yanngc32.velora
 
+import android.Manifest
 import android.os.Bundle
 import android.widget.Toast
 import androidx.activity.ComponentActivity
@@ -8,6 +9,7 @@ import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -27,6 +29,8 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.RadioButton
+import androidx.compose.material3.RadioButtonDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -49,6 +53,7 @@ import com.google.mlkit.vision.barcode.common.Barcode
 import com.google.mlkit.vision.codescanner.GmsBarcodeScannerOptions
 import com.google.mlkit.vision.codescanner.GmsBarcodeScanning
 import kotlin.concurrent.thread
+import uniffi.velora_mobile.ConnectionMode
 import uniffi.velora_mobile.HostEntry
 
 class MainActivity : ComponentActivity() {
@@ -68,7 +73,10 @@ class MainActivity : ComponentActivity() {
                     HostsScreen(
                         hosts = hosts,
                         onConnect = { SessionActivity.connect(this@MainActivity, it.name) },
+                        onFiles = { FilesActivity.open(this@MainActivity, it.name) },
                         onForget = { forget(it) },
+                        modeOf = { host -> runCatching { client.connectionMode(host.name) }.getOrDefault(ConnectionMode.AUTO) },
+                        onMode = { host, mode -> runCatching { client.setConnectionMode(host.name, mode) }.onFailure { toast(it.message) } },
                         onScan = ::scan,
                         onManual = { pairing = PairingLink("", "") },
                         update = update,
@@ -89,6 +97,11 @@ class MainActivity : ComponentActivity() {
             }
         }
         if (savedInstanceState == null) checkForUpdate()
+        // Android 8-9: received and downloaded files go to the public Downloads folder only
+        // with this permission (without it, to the app's own folder on the shared storage).
+        if (savedInstanceState == null && Transfers.needsLegacyPermission(this)) {
+            requestPermissions(arrayOf(Manifest.permission.WRITE_EXTERNAL_STORAGE), 1)
+        }
     }
 
     private fun checkForUpdate() {
@@ -143,7 +156,10 @@ class MainActivity : ComponentActivity() {
 private fun HostsScreen(
     hosts: List<HostEntry>,
     onConnect: (HostEntry) -> Unit,
+    onFiles: (HostEntry) -> Unit,
     onForget: (HostEntry) -> Unit,
+    modeOf: (HostEntry) -> ConnectionMode,
+    onMode: (HostEntry, ConnectionMode) -> Unit,
     onScan: () -> Unit,
     onManual: () -> Unit,
     update: Updater.Update?,
@@ -151,6 +167,8 @@ private fun HostsScreen(
     onUpdate: () -> Unit,
 ) {
     var confirmForget by remember { mutableStateOf<HostEntry?>(null) }
+    /** The computer whose options (connection mode, forget) are shown, after a long press. */
+    var options by remember { mutableStateOf<HostEntry?>(null) }
     Column(Modifier.fillMaxSize().safeDrawingPadding().padding(horizontal = 20.dp, vertical = 16.dp)) {
         Brand()
         Spacer(Modifier.height(28.dp))
@@ -162,12 +180,23 @@ private fun HostsScreen(
         PageHeader(stringResource(R.string.devices_label), stringResource(R.string.devices_title), count)
         Spacer(Modifier.height(20.dp))
         Box(Modifier.weight(1f)) {
-            if (hosts.isEmpty()) EmptyDevices(onScan) else DeviceList(hosts, onConnect, onLongPress = { confirmForget = it })
+            if (hosts.isEmpty()) EmptyDevices(onScan) else DeviceList(hosts, onConnect, onFiles, onLongPress = { options = it })
         }
         Spacer(Modifier.height(16.dp))
         PrimaryButton(stringResource(R.string.scan_qr), onScan, Modifier.fillMaxWidth(), icon = R.drawable.ic_scan_qr_code)
         Spacer(Modifier.height(10.dp))
         SecondaryButton(stringResource(R.string.enter_code), onManual, Modifier.fillMaxWidth(), icon = R.drawable.ic_keyboard)
+    }
+    options?.let { host ->
+        // Read once per opening, not on every redraw: it is a file.
+        val initial = remember(host) { modeOf(host) }
+        HostOptions(
+            host = host,
+            initial = initial,
+            onMode = { onMode(host, it) },
+            onForget = { options = null; confirmForget = host },
+            onDismiss = { options = null },
+        )
     }
     confirmForget?.let { host ->
         VeloraDialog(onDismiss = { confirmForget = null }) {
@@ -179,6 +208,54 @@ private fun HostsScreen(
                 SecondaryButton(stringResource(R.string.cancel), { confirmForget = null }, Modifier.weight(1f))
                 PrimaryButton(stringResource(R.string.forget), { onForget(host); confirmForget = null }, Modifier.weight(1f))
             }
+        }
+    }
+}
+
+/** What a long press on a computer offers: how to reach it, and forgetting it. */
+@Composable
+private fun HostOptions(
+    host: HostEntry,
+    initial: ConnectionMode,
+    onMode: (ConnectionMode) -> Unit,
+    onForget: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    var mode by remember { mutableStateOf(initial) }
+    VeloraDialog(onDismiss) {
+        Text(host.name, style = MaterialTheme.typography.titleMedium.copy(fontSize = 17.sp))
+        Spacer(Modifier.height(4.dp))
+        Text(stringResource(R.string.connection_mode), style = MaterialTheme.typography.bodyMedium, color = Velora.Weak)
+        Spacer(Modifier.height(12.dp))
+        for ((choice, name, hint) in listOf(
+            Triple(ConnectionMode.AUTO, R.string.mode_auto, R.string.mode_auto_hint),
+            Triple(ConnectionMode.LAN, R.string.mode_lan, R.string.mode_lan_hint),
+            Triple(ConnectionMode.VPN, R.string.mode_vpn, R.string.mode_vpn_hint),
+            Triple(ConnectionMode.VELORA, R.string.mode_velora, R.string.mode_velora_hint),
+        )) {
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(8.dp))
+                    .clickable { mode = choice; onMode(choice) }
+                    .padding(vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                RadioButton(
+                    selected = mode == choice,
+                    onClick = { mode = choice; onMode(choice) },
+                    colors = RadioButtonDefaults.colors(selectedColor = Velora.AccentText),
+                )
+                Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    Text(stringResource(name), style = MaterialTheme.typography.titleSmall.copy(fontSize = 15.sp))
+                    Text(stringResource(hint), style = MaterialTheme.typography.bodySmall, color = Velora.Weak)
+                }
+            }
+        }
+        Spacer(Modifier.height(16.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            SecondaryButton(stringResource(R.string.forget), onForget, Modifier.weight(1f))
+            PrimaryButton(stringResource(R.string.done), onDismiss, Modifier.weight(1f))
         }
     }
 }
@@ -199,7 +276,12 @@ private fun Brand() {
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun DeviceList(hosts: List<HostEntry>, onConnect: (HostEntry) -> Unit, onLongPress: (HostEntry) -> Unit) {
+private fun DeviceList(
+    hosts: List<HostEntry>,
+    onConnect: (HostEntry) -> Unit,
+    onFiles: (HostEntry) -> Unit,
+    onLongPress: (HostEntry) -> Unit,
+) {
     VeloraCard(padding = androidx.compose.foundation.layout.PaddingValues(0.dp)) {
         LazyColumn {
             itemsIndexed(hosts, key = { _, h -> h.name }) { i, host ->
@@ -217,6 +299,8 @@ private fun DeviceList(hosts: List<HostEntry>, onConnect: (HostEntry) -> Unit, o
                         Text(host.name, style = MaterialTheme.typography.titleSmall.copy(fontSize = 15.sp))
                         Text(host.address, style = TextStyle(fontFamily = Velora.Mono, fontSize = 12.sp, color = Velora.Weak))
                     }
+                    Spacer(Modifier.width(8.dp))
+                    SecondaryButton(stringResource(R.string.files), { onFiles(host) })
                     Spacer(Modifier.width(8.dp))
                     PrimaryButton(stringResource(R.string.connect), { onConnect(host) })
                 }

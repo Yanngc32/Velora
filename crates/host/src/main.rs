@@ -7,6 +7,8 @@ mod encode;
 mod input;
 mod password;
 mod rate;
+mod reach;
+mod refine;
 mod server;
 #[cfg(windows)]
 mod service;
@@ -14,14 +16,16 @@ mod transfer;
 #[cfg(windows)]
 mod win;
 
-use std::{net::SocketAddr, path::PathBuf};
+use std::{
+    net::{Ipv6Addr, SocketAddr},
+    path::PathBuf,
+};
 
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 use encode::EncoderChoice;
 use velora_protocol::{
     identity::{AuthorizedClient, StateDir},
-    pairing::PairingCode,
     tls::Fingerprint,
     wire::DEFAULT_PORT,
 };
@@ -43,7 +47,9 @@ struct Cli {
 enum Command {
     /// Run the host.
     Run {
-        #[arg(long, default_value_t = SocketAddr::from(([0, 0, 0, 0], DEFAULT_PORT)))]
+        /// Address and UDP port to listen on. The default accepts IPv4 and IPv6; give 0.0.0.0:PORT
+        /// for IPv4 only.
+        #[arg(long, default_value_t = SocketAddr::from((Ipv6Addr::UNSPECIFIED, DEFAULT_PORT)))]
         bind: SocketAddr,
         /// Name shown to clients.
         #[arg(long)]
@@ -64,6 +70,11 @@ enum Command {
         /// nvenc, qsv, amf, vaapi, or ffmpeg:<name> for any FFmpeg encoder.
         #[arg(long, default_value = "auto")]
         encoder: EncoderChoice,
+        /// Serve relays for other paired devices and nothing else: no screen is captured and no
+        /// session starts. For a machine with no screen to share, such as a VPS, that the user's
+        /// other devices connect through.
+        #[arg(long)]
+        relay_only: bool,
         /// Started by the Windows service (set by the service itself).
         #[arg(long, hide = true)]
         service: bool,
@@ -138,7 +149,7 @@ async fn main() -> Result<()> {
     let state = || StateDir::open(cli.config_dir.clone(), "host");
 
     match cli.command {
-        Command::Run { bind, name, fps, bitrate, fixed_bitrate, pair, encoder, service, log_file: _ } => {
+        Command::Run { bind, name, fps, bitrate, fixed_bitrate, pair, encoder, relay_only, service, log_file: _ } => {
             let options = server::HostOptions {
                 bind,
                 name: name.unwrap_or_else(hostname),
@@ -147,6 +158,7 @@ async fn main() -> Result<()> {
                 encoder,
                 service,
                 adaptive_bitrate: !fixed_bitrate,
+                relay_only,
             };
             let auto_update = velora_update::auto_update_enabled(cli.no_update);
             let updated = server::run(options, state()?, pair, auto_update).await?;
@@ -234,10 +246,26 @@ fn service_command(action: ServiceAction, config_dir: Option<PathBuf>) -> Result
     result
 }
 
+/// What the log shows: `RUST_LOG`, else info. The DHT library (`mainline`) is kept to its errors
+/// unless `RUST_LOG` names it: on Windows it logs a warning about 17 times a second while idle,
+/// which is over a million lines a day in `host.log`.
+fn log_filter() -> tracing_subscriber::EnvFilter {
+    log_filter_for(std::env::var("RUST_LOG").ok().as_deref())
+}
+
+fn log_filter_for(rust_log: Option<&str>) -> tracing_subscriber::EnvFilter {
+    use tracing_subscriber::EnvFilter;
+    let spec = rust_log.map(str::trim).filter(|spec| !spec.is_empty());
+    let filter = spec.and_then(|spec| EnvFilter::try_new(spec).ok()).unwrap_or_else(|| "info".into());
+    match "mainline=error".parse() {
+        Ok(directive) if !spec.is_some_and(|spec| spec.contains("mainline")) => filter.add_directive(directive),
+        _ => filter,
+    }
+}
+
 /// Logs to stderr, or to a file for processes without a console: the service, and the host it
 /// starts (`--log-file`).
 fn init_logging(cli: &Cli) -> Result<()> {
-    let filter = || tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
     let file = match &cli.command {
         Command::Run { log_file: Some(path), .. } => Some(path.clone()),
         #[cfg(windows)]
@@ -251,24 +279,25 @@ fn init_logging(cli: &Cli) -> Result<()> {
             }
             let file = std::fs::File::create(&path)?;
             tracing_subscriber::fmt()
-                .with_env_filter(filter())
+                .with_env_filter(log_filter())
                 .with_ansi(false)
                 .with_writer(std::sync::Mutex::new(file))
                 .init();
         }
-        None => tracing_subscriber::fmt().with_env_filter(filter()).with_writer(std::io::stderr).init(),
+        None => tracing_subscriber::fmt().with_env_filter(log_filter()).with_writer(std::io::stderr).init(),
     }
     Ok(())
 }
 
-fn print_pairing(code: &PairingCode, addr: &str, also: &[String]) {
+fn print_pairing(pairing: &server::PendingPairing) {
+    let (code, addr) = (&pairing.code, &pairing.address);
     println!();
     println!("Pairing code (single use, valid for 10 minutes):");
     println!();
     println!("    {}", code.encode());
     println!();
     println!("On a phone, scan this with the Velora app:");
-    let link = velora_protocol::pairing::pairing_uri_with(addr, also, code);
+    let link = pairing.uri();
     match qrcode::QrCode::new(link.as_bytes()) {
         // Light modules drawn as blocks: reads correctly on the usual dark terminal background.
         Ok(qr) => println!(
@@ -295,4 +324,36 @@ fn hostname() -> String {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "host".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run(args: &[&str]) -> (SocketAddr, bool) {
+        let cli = Cli::try_parse_from(["velora-host", "run"].into_iter().chain(args.iter().copied())).unwrap();
+        let Command::Run { bind, relay_only, .. } = cli.command else { panic!("run") };
+        (bind, relay_only)
+    }
+
+    #[test]
+    fn the_host_listens_on_ipv4_and_ipv6_unless_told_otherwise_and_relay_only_is_a_flag() {
+        assert_eq!(run(&[]), ("[::]:7420".parse().unwrap(), false));
+        assert_eq!(run(&["--relay-only"]), ("[::]:7420".parse().unwrap(), true));
+        assert_eq!(run(&["--bind", "0.0.0.0:7420"]).0, "0.0.0.0:7420".parse().unwrap());
+    }
+
+    #[test]
+    fn the_dht_library_is_kept_to_errors_unless_the_user_names_it() {
+        let shown = |rust_log: Option<&str>| log_filter_for(rust_log).to_string();
+        assert!(shown(None).contains("mainline=error"));
+        assert!(shown(Some("")).contains("mainline=error"));
+        assert!(shown(Some("debug")).contains("mainline=error"));
+        assert!(shown(Some("velora_host=debug")).contains("mainline=error"));
+        // Not a filter at all: the default, which is not allowed to be noisy either.
+        assert!(shown(Some("=== not a filter")).contains("mainline=error"));
+        // Someone debugging the DHT gets what they asked for.
+        assert!(!shown(Some("mainline=debug")).contains("mainline=error"));
+        assert!(shown(Some("info,mainline=trace")).contains("mainline=trace"));
+    }
 }

@@ -28,3 +28,4 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 openh264.workspace = true
+quinn.workspace = true

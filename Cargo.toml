@@ -1,9 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["crates/protocol", "crates/clipboard", "crates/audio", "crates/host", "crates/client-core", "crates/client", "crates/update", "crates/release", "crates/mobile", "crates/uniffi-bindgen"]
+members = ["crates/protocol", "crates/clipboard", "crates/audio", "crates/nat", "crates/dht", "crates/relay", "crates/host", "crates/client-core", "crates/client", "crates/update", "crates/release", "crates/mobile", "crates/uniffi-bindgen"]
 
 [workspace.package]
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/Yanngc32/Velora"
@@ -15,6 +15,9 @@ velora-client-core = { path = "crates/client-core", default-features = false }
 velora-update = { path = "crates/update" }
 velora-clipboard = { path = "crates/clipboard" }
 velora-audio = { path = "crates/audio" }
+velora-nat = { path = "crates/nat" }
+velora-dht = { path = "crates/dht" }
+velora-relay = { path = "crates/relay" }
 anyhow = "1"
 thiserror = "2"
 tracing = "0.1"
@@ -31,6 +34,16 @@ directories = "6"
 clap = { version = "4", features = ["derive"] }
 uniffi = { version = "0.32", default-features = false }
 openh264 = "0.9"
+bytes = "1"
+# Standalone reach (docs/nat-traversal.md): router mappings, interface lists, the Mainline DHT.
+natpmp = "0.5"
+igd-next = { version = "0.18", default-features = false, features = ["aio_tokio"] }
+stunclient = { version = "0.4", default-features = false }
+netdev = "0.31"
+# mainline signs with ed25519-dalek 3; Cargo.lock holds both at the versions tested together.
+mainline = "=8.0.1"
+ed25519-dalek = { version = "3", default-features = false }
+postcard = { version = "1", default-features = false, features = ["use-std"] }
 
 [profile.release]
 lto = "thin"
