@@ -1,7 +1,7 @@
 # G2 launcher relay and wake UI: hand-over for G3, H1 and I3 (and the review)
 
-Branch `reach-g2-relay-wake-ui` (from `integration-wave2`, 8539011). Commits: `c7706db` (the Wake chip and the card), `9cd3844` (the address
-under the QR code), `55e55bb` (the administrator message), `8ade60f` (a shorter label) and the commit of this note. Files:
+Branch `reach-g2-relay-wake-ui` (from `integration-wave2`, 8539011, which `standalone-reach` has since taken in). Commits: `c7706db` (the Wake chip and the card), `9cd3844` (the address
+under the QR code), `55e55bb` (the administrator message), `8ade60f` (a shorter label), `2f31ec3` (this note) and `3fbe8ff` (a test fixture that tolerates new fields). Files:
 `crates/client/src/gui/{reach,strings,this_pc}.rs`. fmt, `clippy -p velora --all-targets -D warnings` and `cargo test -p velora` green on
 Windows (33 pass, 8 more than G1 left). Linux was not compiled here. **No real host and no window were run**: the launcher was driven with fake
 statuses in headless egui frames, and drawn to PNG with the throwaway rasterizer of G1 (pictures in `G2-screens/` of the shared notes folder).
@@ -66,6 +66,12 @@ with the launcher alone; nothing here sends traffic but `hosts::wake` and the `S
    frozen `this_pc.rs`/`mod.rs`) and `Status` fields that do not exist. The paragraph above is what could be done in `reach.rs`.
 5. **A relay under the Windows service does not see the PCs paired in the launcher** (E4 "Limits to know"): H1 must say that a service relay needs the
    host's fingerprint added by hand for now.
+6. **T1 (relay management)** was merged into `integration-wave3` after this branch was cut, so none of it is used here: `ReachStatus.relays` (each
+   relay this host is set to register with, `registered` or not, and the `reason` when it is not) and `relay_hosts` (the computers allowed to register
+   here), with `AddRelay`, `RemoveRelay`, `AllowRelayHost` and `RemoveRelayHost`. A launcher ticket for it would replace the one line **Reachable
+   through** in `standalone_details` with a line per relay (`status_line` already draws a dot, a sentence and a detail that wraps: the reason is the
+   detail) and add the lists and the buttons; `labelled` and `switch_row` are reusable. The test fixture `reach()` ends with `..Default::default()` so that
+   the two new fields do not break it.
 
 ## Decisions to review
 
