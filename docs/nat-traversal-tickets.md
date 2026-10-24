@@ -1,17 +1,23 @@
 # Standalone reach: implementation tickets
 
-Companion to [nat-traversal.md](nat-traversal.md) (revision 2). Status: in progress.
+Companion to [nat-traversal.md](nat-traversal.md) (revision 2). Status: **implemented**; the field
+tests and the release remain. Kept as the record of how the work was split; the guide for users
+is [standalone-reach.md](standalone-reach.md).
 
 | Wave | Tickets | State |
 |---|---|---|
 | 0 | W0 | done, 2026-10-23 |
-| 1 | T0 S0 B1 B2 B3 C1 D1 | built and merged into `standalone-reach`, 2026-10-23 (S0: only a run from another network is pending) |
-| 2 | E1 F1 G1 C2 C3 D2 | built and merged into `standalone-reach`, 2026-10-23 |
-| 3 | E2-E6 F2-F5 G2 G3 | in progress: E5 and F3 built; E4, F2 and G2 under way; E6 is folded into E4 and F5 into F3 |
-| 4 | I1-I4 H1 H2 | not started |
+| 1 | T0 S0 B1 B2 B3 C1 D1 | done: built and merged, 2026-10-23 (S0: only a run from another network is pending) |
+| 2 | E1 F1 G1 C2 C3 D2 | done: built and merged, 2026-10-23 |
+| 3 | E2-E5 F2-F5 G2 G3, and T1 and E4b | done: built and merged. T1 and E4b (the relay lists, edited from the app) were added during the work, and E6 (the adapter address) was built with them |
+| follow-up | P1 P2 P3 | three small tickets (hardening, client polish, the punch signature); in progress when this was written |
+| 4 | H1 | done: the README section and [standalone-reach.md](standalone-reach.md) |
+| 4 | I1-I4 | **not run yet**: the field tests on real networks |
+| 4 | H2 | not started |
 
-What the finished tickets handed over is in `docs/reach-handover/`; §14 of the plan lists what
-wave 1 changed.
+What the finished tickets handed over is now in [standalone-reach.md](standalone-reach.md) (the
+section "How it is built", the files, the limits and the status); §14 and §15 of the plan list
+what the work changed.
 
 ## 0. Rules that make the tickets conflict-free
 
@@ -139,7 +145,7 @@ Owns `docs/dht-spike.md`.
   put/get latency cold and warm, measures start time with and without a saved routing table,
   and checks after 1 h, 2 h, 3 h whether the item is still there.
 - Done when: `docs/dht-spike.md` records the numbers and any surprise (e.g. the observed port
-  under this router), and C2's design is confirmed or amended.
+  under the test router), and C2's design is confirmed or amended.
 
 ### B1 — Router port mapping
 velora-nat · wave 1 · 2 d · after W0 · parallel with T0, B2, B3, C1, D1.
@@ -150,7 +156,7 @@ Owns `src/mapping.rs`.
   discovery
   (default route on Windows and Linux).
 - Done when: unit tests with a mocked gateway for the conflict and renewal paths; a manual
-  run on this network logs a mapping and removes it; both OSes compile.
+  run on a real network logs a mapping and removes it; both OSes compile.
 - Risk: router quirks; keep every failure as a logged `Err`, never a panic.
 
 ### B2 — Public addresses and endpoint observation
@@ -252,7 +258,7 @@ Owns `src/reach/mapping.rs`.
   shared → not advertised, logged as CGNAT/double NAT), compare with the observed address
   when one is known, select global v6 addresses, write `Public`/`V6` entries and the
   mapping status into `ReachState`; remove the mapping on shutdown.
-- Done when: on this network the host logs `reachable at pub:…`; an integration test with
+- Done when: on a real network the host logs `reachable at pub:…`; an integration test with
   a fake mapping result shows the right addresses in `Reach` and in `Status`.
 
 ### E3 — Host: DHT record and device secrets
@@ -375,9 +381,9 @@ Owns `crates/client/src/main.rs`.
 
 ### I1 — Field test: phase 1 on real routers
 wave 4 · 1 d · after E2, F1, G1.
-- Three routers (one that does NAT-PMP, one that does UPnP, and this one, which answers
-  neither and sits behind CGNAT), the client on 4G/5G: record which address kind reached,
-  log lines, and the CGNAT detection on this line.
+- Three routers (one that does NAT-PMP, one that does UPnP, and one that answers neither
+  and sits behind CGNAT), the client on 4G/5G: record which address kind reached,
+  log lines, and the CGNAT detection on that line.
 
 ### I2 — Field test: DHT across networks
 wave 4 · 1 d · after E3, F2.
@@ -400,6 +406,9 @@ Owns `README.md`, `docs/*.md`.
 - README section "Reaching this PC from anywhere" with the three options (Tailscale, standalone,
   relay PC), the switches, what each needs from the router and from Windows, the Wake
   requirements; the plan documents marked as implemented.
+- Done: the README section and the long form, [standalone-reach.md](standalone-reach.md) (setup
+  per scenario, headless and VPS hosts, troubleshooting, security and privacy, limits, status).
+  Its "Status" section is the one to update when the field tests I1-I4 have been run.
 
 ### H2 — Release
 wave 4 · 0.5 d · after everything.

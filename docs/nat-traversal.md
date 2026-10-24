@@ -1,8 +1,13 @@
 # Reaching a PC from anywhere without a server: plan and feasibility study
 
-Status: proposal, revision 2, October 2026. Nothing here is implemented. Revision 2 went
-through the first draft line by line against the code and the crates; §13 lists what it
-changed.
+Status: **implemented** (October 2026), kept as the design record. This is revision 2 of the
+plan: it went through the first draft line by line against the code and the crates (§13 lists
+what it changed), the first waves of the implementation then found more (§14), and §15 lists
+where the built system differs from this text. §3 describes the code as it was before the work.
+The user guide is [standalone-reach.md](standalone-reach.md). The code is covered by automated
+tests; the field tests on real networks (routers, the DHT after an IP change, a relay across
+networks, hole punching) are still to be done. Where the code and this text disagree, the code
+wins.
 
 ## 1. Goal
 
@@ -156,7 +161,7 @@ the welcome keeps its 8 addresses (§8). Ships in the next release.
 
 ### Phase 2: finding the host when its address changed, without a server
 
-Spike first (1 day): confirm with `mainline` 8 on this network the observed address and port
+Spike first (1 day): confirm with `mainline` 8 on a real network the observed address and port
 (`Dht::info().public_address()`), put/get latency warm and cold, and how long items survive.
 
 What: the host publishes a signed, encrypted record in the Mainline DHT (BEP 44 mutable
@@ -188,8 +193,8 @@ needs and the rest arrives in `HostMsg::Reach`)
 or, for devices paired before this version, from `HostMsg::Reach` on their next connection.
 On connect, the client fetches the record (about a second warm, a few seconds cold) and
 adds its addresses to the race. The host republishes every 30 minutes (the spike found an item
-still there an hour after one publish; the longer rows are in `docs/dht-spike.md`) and
-whenever an address changes.
+still there 4.5 hours after one publish, `docs/dht-spike.md` §6) and whenever an address
+changes.
 
 Why a new key: BEP 44 signs with Ed25519 and the TLS identity is ECDSA P-256. Changing the
 certificate's key would change every fingerprint and break every pairing, so the Ed25519 key
@@ -323,7 +328,7 @@ it finds no direct path. NAT mappings stay open by the 2 s keepalive already in 
 client's own network changes (Wi-Fi to 4G) are handled by QUIC migration, as today.
 
 **Picture quality.** Unchanged on direct paths. Through a relay the ceiling is the relaying
-PC's link: residential fibre in Brazil carries 1080p at 12 Mbit/s easily; a laptop on weak
+PC's link: residential fibre should carry 1080p at 12 Mbit/s easily; a laptop on weak
 Wi-Fi relays at a few Mbit/s and the adaptive bitrate settles there, softer picture, nothing
 broken.
 
@@ -456,7 +461,8 @@ All of it stays in the local logs; the user reads it under This PC and in `host.
 
 Waves 0 and 1 (the scaffold, the protocol, router mapping, addresses, Wake-on-LAN, the record
 and its sealing, relay framing, the DHT spike) were built and measured on 2026-10-23. Their
-hand-over notes are in `docs/reach-handover/`. What they changed:
+hand-over notes were folded into [standalone-reach.md](standalone-reach.md#how-it-is-built). What
+they changed:
 
 1. **The welcome keeps 8 addresses.** `MAX_ADDRESSES` is 16 for `HostMsg::Reach` only
    (`MAX_WELCOME_ADDRESSES = 8`): a client from before reads exactly 8 and rejects trailing
@@ -474,11 +480,11 @@ hand-over notes are in `docs/reach-handover/`. What they changed:
    while idle (the tracing filter needs `mainline=error`).
 5. **UPnP asks for the wanted port first** (`AddPortMapping`): `AddAnyPortMapping` only
    suggests a random port, which would change the advertised one at every restart.
-6. **The author's line is CGNAT in front of a cone NAT that keeps the source port.** The
-   router answers neither NAT-PMP nor UPnP, private hops follow it, and every DHT node and
-   STUN server sees the PC at one public address with the source port unchanged. Phase 1
-   cannot map a port there; the DHT record, hole punching (the NAT is endpoint-independent)
-   and the relay are what is left, which is the case the later phases are for.
+6. **A line can be CGNAT in front of a cone NAT that keeps the source port.** The router
+   answers neither NAT-PMP nor UPnP, private hops follow it, and every DHT node and STUN server
+   sees the PC at one public address with the source port unchanged. Phase 1 cannot map a port
+   there; the DHT record, hole punching (the NAT is endpoint-independent) and the relay are
+   what is left, which is the case the later phases are for.
 7. **A DHT lookup is cheap to start and dear to repeat** (spike). The first value of a resolve
    arrives after about 0.5 s from a saved table (1.2 s cold); a cold start sometimes asks only
    the bootstrap addresses and finds nothing, so a resolve retries once on the same node; a
@@ -491,3 +497,42 @@ hand-over notes are in `docs/reach-handover/`. What they changed:
 9. **`mainline` may turn a node into a server.** After 15 minutes it switches to server mode if
    it believes it is reachable, and 8.0.1 cannot switch that off: on an open network a Velora
    node would then answer DHT queries and store other people's items.
+
+## 15. Where the built system differs from this plan
+
+The code is the truth; this is a reading guide for the sections above. The description for users
+is [standalone-reach.md](standalone-reach.md).
+
+1. **Relays trust computers, not only paired devices.** A registering host dials with its *host*
+   certificate, the one clients pin, which is not in the relay's list of paired clients. The relay
+   lets in a link from a paired client or from a computer in its `relay_hosts.json` or its own
+   client-side `known_hosts.json`; the second kind may register and nothing else. The app edits the
+   lists with `AddRelay`, `RemoveRelay`, `AllowRelayHost` and `RemoveRelayHost`, so a relay run as the
+   Windows service needs no hand-written file.
+2. **Links.** A relay request travels on a *link*: a hello with `files_only` and `reach` (and any
+   connection to a `--relay-only` host). A link starts no session and sends nobody away, and a
+   known device's link is not asked for the access password.
+3. **One client per host per relay.** The 3-byte frame header carries no flow id, so a host's
+   registration serves one client; a newer `RelayTo` takes the older over. Connections through the
+   tunnel stop MTU discovery at 1350 bytes so that a full packet fits one relay datagram.
+4. **Punching.** The request reaches the host on a unidirectional stream of its registration with
+   the relay. With no relay the host polls the DHT every 45 s per device (every 8 s for 3 minutes
+   after the last disconnect), not every 30 to 60 s, and the device waits up to 10 s after a relay
+   delivered the request and up to 60 s after the DHT item. The host's endpoint is listed as a
+   `Public` address of the record when its NAT is a cone and no mapping is advertised, and a DHT ping
+   every 20 s from the QUIC socket keeps that NAT mapping open (not foreseen above). A symmetric NAT on
+   either side rules a punch out, and STUN is a fallback of the client only.
+5. **Sizes.** A record lists at most 1 LAN, 2 VPN, 1 public and 2 IPv6 addresses and 1 relay with 1
+   address; 11 paired devices have a secret of their own (the plan said about 12), more share one.
+6. **The DHT node never serves.** `mainline` cannot be kept from becoming a server (§14.9), so every
+   node carries a request filter that answers nobody.
+7. **Wake.** A relay remembers the adapter address and last address of every host that registered
+   (`relay_known.json`), so it can wake one that is asleep, even after the relay itself rebooted;
+   the host refreshes its adapter address every 5 minutes. A device on the sleeping PC's own LAN
+   sends the packet itself, a phone that hides its adapters' MAC addresses included.
+8. **Retry** applies while the host relays for others (`--relay-only` included), not only with the
+   standalone switch, and not to connections that come through a relay tunnel.
+9. **Binding.** The default is `[::]:7420`, dual-stack, falling back to `0.0.0.0` where the machine
+   cannot; `--bind` with one address maps nothing and lists no IPv6 address.
+10. **Switches** are off by default, kept in `reach.json`, and need an administrator under the
+    Windows service, like the relay lists.
