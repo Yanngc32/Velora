@@ -40,7 +40,10 @@ image quality.
 > [!NOTE]
 > **Status: early MVP.** Desktop host (Windows, Linux/X11), desktop client and Android app:
 > pairing (QR code on phones), encrypted streaming, keyboard/mouse/touch, hardware encoding
-> and decoding, signed auto-updates. iOS and NAT traversal are next (see [Roadmap](#roadmap)).
+> and decoding, signed auto-updates, and ways to reach a PC from other networks without a VPN
+> (built and covered by automated tests, not yet tried on a range of real networks: see
+> [Reaching this PC from anywhere](#reaching-this-pc-from-anywhere)). iOS is next (see
+> [Roadmap](#roadmap)).
 
 ## Features
 
@@ -81,8 +84,9 @@ image quality.
   <tr>
     <td valign="top">
       <b>🌍 Anywhere</b><br>
-      With Tailscale or Netbird, nothing else is needed: the LAN and VPN addresses race, and
-      the first to answer wins.
+      With Tailscale or Netbird nothing else is needed. Without a VPN, Velora can open a router
+      port, publish its address in the BitTorrent DHT or go through
+      <a href="#reaching-this-pc-from-anywhere">another PC of yours</a>.
     </td>
     <td valign="top">
       <b>🔒 Lock screen access</b><br>
@@ -190,9 +194,10 @@ sharing on here), the other computer pairs back by itself, so each can reach the
 Paired computers are listed under **Devices** as cards, one click away; each session opens in
 its own window.
 
-**This PC** also shows which devices are paired and connected, removes them, and sets the
-access password. **Settings → Start with Windows** opens the app and/or turns sharing on at
-sign-in.
+**This PC** also shows which devices are paired and connected, removes them, sets the access
+password and holds the switches for [reaching it from other
+networks](#reaching-this-pc-from-anywhere). **Settings → Start with Windows** opens the app
+and/or turns sharing on at sign-in.
 
 On Windows, Velora also has an icon next to the clock. It shows whether this PC is shared and
 who is connected, opens the app, and its menu turns sharing on and off or quits. Closing the
@@ -229,7 +234,8 @@ exact command to run on the other device:
 
 ```sh
 velora pair 192.168.0.10:7420 VL1-...      # first time: pairs, saves the host and connects
-velora connect <host-name>                 # afterwards
+velora connect <host-name>                 # afterwards; says which way in it took
+velora wake <host-name>                    # wake a sleeping paired PC (Wake-on-LAN)
 velora list                                # paired hosts
 velora bench <host-name> --seconds 10      # headless throughput/latency check
 ```
@@ -240,7 +246,8 @@ Host management:
 velora-host clients                 # paired devices
 velora-host revoke <name|fingerprint>
 velora-host password [--clear]      # password paired devices must also type to connect
-velora-host run --fps 60 --bitrate 12000 --bind 0.0.0.0:7420 --encoder auto
+velora-host run --fps 60 --bitrate 12000 --bind "[::]:7420" --encoder auto   # 0.0.0.0:7420: IPv4 only
+velora-host run --relay-only        # no screen: only relays other devices (a VPS, say)
 ```
 
 ### Sound
@@ -261,7 +268,8 @@ session. The host then follows the lock screen, UAC prompts and the logon screen
 from boot. Installing also adds a Windows Firewall rule, "Velora (service)", that lets the host
 receive UDP on port 7420 on any network, Public ones included: a service never gets Windows'
 "allow access" prompt. `velora-host service uninstall` removes the service and the rule. Under
-the service, only administrators can pair or remove devices and change the password.
+the service, only administrators can pair or remove devices, change the password, turn the
+[reach switches](#reaching-this-pc-from-anywhere) on or off and edit the relay lists.
 
 ### Shared clipboard
 
@@ -325,18 +333,97 @@ confirm. Paired computers are kept. Debug builds, such as the `velora-debug-apk`
 **Android** workflow, are signed with another key: they never update, and switching between
 them and a release means reinstalling (and pairing again).
 
-### Access over the internet
+### Reaching this PC from anywhere
 
-With a mesh VPN such as **Tailscale** or **Netbird** on both computers, nothing else is
-needed. The host finds its addresses on the mesh (100.64.0.0/10, and Tailscale's
-fd7a:115c:a1e0::/48), shows them under **This PC**, puts them in the pairing link, and tells
-every client that connects. The client keeps them with the computer and, on the next
-connection, tries them along with the usual address (that one first, each other one 250 ms
-later): at home the LAN answers, away the VPN does, with no address to change. Only the
-secure handshake races; the session opens on the address that answered first.
+From another network a device needs an address that leads to this PC's UDP port. There are three
+ways to get one, and they combine: a device keeps every address it knows for a PC and tries them
+together (the usual one first, each other one 250 ms later), and the session opens on the first
+that answers. All are optional, none needs an account, and none uses a server run by anyone.
 
-Without a mesh VPN, forward **UDP** port 7420 on the host's router. Every connection is
-authenticated and encrypted either way. Built-in NAT traversal is not implemented.
+| | Right when | It needs |
+|---|---|---|
+| **A mesh VPN** (Tailscale, Netbird) | You already use one: still the easiest | The VPN on both sides. The host lists its mesh addresses (100.64.0.0/10, `fd7a:115c:a1e0::/48`) and tells every client |
+| **Standalone reach** | No VPN, and this PC can be reached some way: a router port, IPv6 or a hole through the NATs | UPnP or NAT-PMP on the router, a public IPv6 address, or NATs that allow a punch |
+| **A relay PC** | This PC is behind CGNAT or two routers | Another PC of yours, on and reachable: both ends connect out to it and it passes the packets along |
+
+Standalone reach is three switches on **This PC → Reach from other networks** (sharing on), all
+off until you turn them on:
+
+| Switch | What it does |
+|---|---|
+| **Reach this PC from other networks without a VPN** | Asks the router to forward UDP 7420 (NAT-PMP, then UPnP) and tells your devices this PC's public and IPv6 addresses. Also lets it open a hole when a device asks and register with a relay PC. |
+| **Find this PC when its address changes** | Publishes where it is in the BitTorrent Mainline DHT, sealed so that only your paired devices can read it. |
+| **Let my other PCs connect through this one** | Makes this PC a relay. A session through it takes about 6 to 12 Mbit/s of its internet, both ways. |
+
+A device learns the addresses, the DHT key and the relays when it connects (both ends need a
+version with these features; older ones keep using the addresses they have), so after changing a
+switch connect once from each device while it can still reach the PC.
+
+**The router** must answer UPnP or NAT-PMP, often a setting; the card then says *Port open on the
+router*. If its own address is private or in 100.64.0.0/10, your provider shares one address
+between customers (CGNAT) or a second router sits in front: no port can be opened, Velora
+advertises nothing dead, and the DHT, a punch or a relay PC are what is left. A public IPv6
+address is advertised too, but your router's IPv6 firewall must let UDP 7420 in: Velora cannot
+open it. Forwarding the port by hand still works, as it always did.
+
+**Windows.** The installer's firewall rule ("Velora", UDP 7420, any network) already covers the
+port. As the lock screen service, changing a switch or a relay list needs administrator rights
+(open Velora as administrator), and the service keeps its own settings in
+`C:\ProgramData\Velora`: look at **This PC** after installing it.
+
+**A relay PC, in three steps** (**This PC → Relay PCs**, on both PCs):
+
+1. Pair your phone or laptop with the relay PC, as usual.
+2. On this PC, paste the relay PC's pairing link under *Relays this PC uses* and click *Use as
+   my relay*. On the relay PC, paste this PC's link under *Computers allowed to use this PC as a
+   relay*, click *Let it use this PC* and turn on *Let my other PCs connect through this one*. A
+   PC shows its link under *Show QR code* → *Copy link*.
+3. Pair your phone or laptop with this PC, as usual (a device paired earlier connects once from
+   home to learn the relay).
+
+The relay PC must itself be reachable (a port open on its router, or a VPS) and on, and this PC
+needs the first switch on.
+
+**Waking a sleeping PC.** The **Wake** button on a PC's card, or `velora wake <name>`, sends a
+Wake-on-LAN packet. It needs, and Velora cannot check:
+
+- Wake on LAN on in the firmware (and, for a PC that is off rather than asleep, the "deep sleep"
+  or ErP power saving off);
+- in Windows, the adapter allowed to wake the PC on a magic packet and fast startup off, on a
+  wired link (Wi-Fi wake depends on the adapter);
+- a connection made once while the PC was on, so your device knows its adapter address;
+- a sender on the PC's own network: your device itself when it is on that LAN (the laptop or
+  phone on the home Wi-Fi), or a relay PC there that is on and has this PC registered. A router
+  drops a magic packet that comes in from the internet.
+
+*Sent* only says the packet left. From outside the home network the sender has to be a relay PC at
+home that can itself be reached (a VPS is not on that network). The Android app has no Wake button
+yet.
+
+**Command line and headless hosts.** `velora connect` prints the way in it took (*through the
+public address (…)*); `velora-host run --relay-only` serves relays and nothing else. A host with
+no app keeps its settings in files in its state folder (`~/.config/velora/host`,
+`%APPDATA%\velora\config\host`, or `C:\ProgramData\Velora\host` for the service): `reach.json`
+(the three switches, read at start), `relays.json` and `relay_hosts.json`. Their format, a VPS
+walk-through and the log lines to look for are in the [full guide](docs/standalone-reach.md).
+
+**Limits.**
+
+- The PC must be reachable some way: a mapped or forwarded port, IPv6, a punch, or a relay PC of
+  yours.
+- A punch needs NATs that keep one port per socket: a symmetric NAT on either end needs a relay.
+- The DHT is IPv4 only and needs outbound UDP. The first connection through it can take a few
+  seconds.
+- A relay carries one device per PC at a time and all of the picture: as much upload as the
+  bitrate. Its access password protects its own screen and is not asked of relay links.
+- A removed device can still read the last DHT record for hours. It cannot connect.
+
+> [!NOTE]
+> **Status.** Automated tests cover the mapping (fake routers), NAT behaviour (a simulator), the
+> DHT record, the relay (a whole session through it, with packet loss) and the app. Not yet
+> confirmed on real networks: routers with and without UPnP, a real IP change, a relay between
+> networks, hole punching, Android on mobile data. See
+> [Status](docs/standalone-reach.md#status).
 
 ## How it works
 
@@ -386,6 +473,9 @@ project yet (no GPU in CI).
 | `crates/uniffi-bindgen` | Generates the Kotlin (later Swift) bindings for `velora-mobile` |
 | `android/` | Android app (Kotlin): MediaCodec hardware decoding, trackpad, soft and physical keyboards |
 | `crates/audio` (`velora-audio`) | The host's sound: WASAPI loopback capture and playback, Opus through FFmpeg |
+| `crates/nat` (`velora-nat`) | Standalone reach: router port mapping (NAT-PMP, UPnP), public and IPv6 addresses, the endpoint a NAT shows, Wake-on-LAN |
+| `crates/dht` (`velora-dht`) | The host's sealed record in the Mainline DHT, punch requests, and the DHT node that publishes and resolves them |
+| `crates/relay` (`velora-relay`) | Relay framing and the core that copies QUIC packets between two connections |
 | `crates/update` | Self-updates from GitHub Releases |
 | `crates/release` (`velora-release`) | Release tooling used by CI: packaging and the update manifest |
 
@@ -486,6 +576,24 @@ the Rust core and generates its Kotlin bindings.
   can be written outside the chosen folder (no `..`, absolute paths, drive letters, alternate
   data streams or device names).
 
+With [standalone reach](#reaching-this-pc-from-anywhere) on, what changes:
+
+- **An exposed port.** The host accepts UDP from the internet on its port, as with a port you
+  forward by hand. QUIC drops anything that is not a valid handshake for the host's certificate
+  before Velora sees it, and while the host is exposed (standalone reach on, or relaying for
+  others) each new address must also prove it can receive packets (QUIC Retry), so a forged first
+  packet cannot make the host send more than it got. By default the host also listens on IPv6.
+- **The DHT record** is signed with a key of its own, beside the TLS identity, and sealed
+  separately for each paired device, so nobody else can read the addresses and a removed device is
+  left out at the next publish. The DHT sees that an IP published under a key, when, and roughly
+  how many devices can read it; no address, name or fingerprint.
+- **A relay PC** copies encrypted QUIC packets between two authenticated connections. It cannot
+  read or change a session, and forwards only for devices on its paired list.
+- The DHT's public bootstrap nodes (and, only as a fallback when a device hole-punches, public
+  STUN servers) see your IP address, as with any BitTorrent client. Nothing else leaves the
+  computer and there is no telemetry. More in the
+  [full guide](docs/standalone-reach.md#security-and-privacy).
+
 > [!WARNING]
 > On Windows, without the service, input can't reach elevated windows unless `velora-host`
 > runs elevated, nor the secure desktop (UAC prompts, lock screen).
@@ -498,7 +606,10 @@ the Rust core and generates its Kotlin bindings.
    GPU; VA-API still copies them back. Next: import the VA-API surface into EGL (dma-buf).
 3. **Mobile:** an iOS app (Swift + VideoToolbox) on the same `velora-mobile` core. On Android:
    pinch to zoom, a direct-touch mode, and Play Store publishing.
-4. **NAT traversal.** A self-hostable rendezvous server, UDP hole punching, and a relay fallback.
+4. **Standalone reach in the field.** It is built and tested against simulated routers and NATs;
+   next come real routers and carriers (see
+   [Status](docs/standalone-reach.md#status)). Known gaps: no Wake button in the Android app, no
+   PCP or IPv6 pinholes, and a relay serves one device per PC at a time.
 5. Wayland capture (xdg-desktop-portal + PipeWire), display selection on Linux, cursor shape sync,
    sound on Linux and Android, relative mouse mode for games.
 6. A systemd user service; installers.
