@@ -14,6 +14,7 @@ mod settings;
 
 use std::{
     collections::BTreeMap,
+    fs::TryLockError,
     num::NonZeroU32,
     path::PathBuf,
     rc::Rc,
@@ -24,13 +25,17 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
+use gui::strings::{fill, Strings};
 use settings::Settings;
-use velora_client_core::{hosts, FrameSlot, InputSender, OfferEvent, Session, VideoFrame, VideoOutput};
+use velora_client_core::{
+    hosts, FrameSlot, InputSender, OfferEvent, Route, Session, VideoFrame, VideoOutput, WakeOutcome,
+};
 use velora_protocol::{
-    identity::StateDir,
-    wire::{DisplayList, KeyState, MouseButton},
+    identity::{KnownHost, StateDir},
+    tls::Fingerprint,
+    wire::{AddressKind, DisplayList, KeyState, MouseButton},
 };
 use winit::{
     application::ApplicationHandler,
@@ -87,8 +92,11 @@ enum Command {
         #[arg(long)]
         also: Vec<String>,
     },
-    /// Connect to a paired host by name or address.
+    /// Connect to a paired host by name or address, and say which way in it took.
     Connect { host: String },
+    /// Wake a sleeping paired host by Wake-on-LAN: from this computer's own network when it is the host's, else through a
+    /// relay on the host's network. Exits with 0 only when the signal was sent.
+    Wake { host: String },
     /// List paired hosts.
     List,
     /// Connect without a window and report streaming statistics.
@@ -120,10 +128,7 @@ fn main() -> Result<()> {
 fn run() -> Result<()> {
     #[cfg(windows)]
     attach_console();
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
-        .with_writer(std::io::stderr)
-        .init();
+    tracing_subscriber::fmt().with_env_filter(log_filter()).with_writer(std::io::stderr).init();
 
     let cli = Cli::parse();
     let state = StateDir::open(cli.config_dir.clone(), "client")?;
@@ -188,12 +193,22 @@ fn run() -> Result<()> {
             }
             Ok(())
         }
+        Command::Wake { host } => {
+            println!("{}", runtime.block_on(wake(&state, &host, gui::strings::current()))?);
+            Ok(())
+        }
         Command::Pair { address, code, name, offer, also } => {
             let (proxy, event_loop) = new_event_loop()?;
             let slot = Arc::new(FrameSlot::default());
             let output = VideoOutput::Decoded { slot: slot.clone(), on_frame: redraw_callback(proxy) };
             let name = name.unwrap_or(device_name);
             let session = runtime.block_on(hosts::pair(&state, &address, &also, &code, &name, password, output))?;
+            if shows_nothing(session.width, session.height) {
+                // Paired all the same: the point of pairing with a relay is that this device can use it.
+                session.close();
+                println!("Paired with '{}'. {ONLY_RELAYS}", session.host_name);
+                return Ok(());
+            }
             println!("Paired with '{}'. Next time: velora connect {}", session.host_name, session.host_name);
             if let Some(link) = offer {
                 session.input.offer_pairing(&link);
@@ -201,13 +216,19 @@ fn run() -> Result<()> {
             run_window(&runtime, event_loop, session, slot, share_clipboard)
         }
         Command::Connect { host } => {
+            let paired = free_relay(&state, &host)?;
             let (proxy, event_loop) = new_event_loop()?;
             let slot = Arc::new(FrameSlot::default());
             let output = VideoOutput::Decoded { slot: slot.clone(), on_frame: redraw_callback(proxy) };
             let session = runtime.block_on(hosts::connect(&state, &host, &device_name, password, output))?;
+            require_screen(&session)?;
+            println!("Connected to '{}' through {}.", session.host_name, way_in(&state, &session));
+            // Held for as long as the window lives: the operating system frees it when the process ends, however it does.
+            let _claim = hold_relay(&state, paired.as_deref(), session.route());
             run_window(&runtime, event_loop, session, slot, share_clipboard)
         }
         Command::Bench { host, seconds } => runtime.block_on(async {
+            let paired = free_relay(&state, &host)?;
             let frames = Arc::new(AtomicU32::new(0));
             let counter = frames.clone();
             let on_frame = Arc::new(move || {
@@ -215,7 +236,15 @@ fn run() -> Result<()> {
             });
             let output = VideoOutput::Decoded { slot: Arc::new(FrameSlot::default()), on_frame };
             let session = hosts::connect(&state, &host, &device_name, password, output).await?;
-            println!("connected to '{}' ({}x{})", session.host_name, session.width, session.height);
+            require_screen(&session)?;
+            let _claim = hold_relay(&state, paired.as_deref(), session.route());
+            println!(
+                "connected to '{}' ({}x{}) through {}",
+                session.host_name,
+                session.width,
+                session.height,
+                way_in(&state, &session)
+            );
             tokio::time::sleep(Duration::from_secs(seconds)).await;
             let n = frames.load(Ordering::Relaxed);
             println!(
@@ -234,6 +263,150 @@ fn read_password() -> Result<String> {
     let mut line = String::new();
     std::io::stdin().read_line(&mut line)?;
     Ok(line.trim_end_matches(['\r', '\n']).to_string())
+}
+
+/// What the log shows: `RUST_LOG`, else info. The DHT library (`mainline`) is kept to its errors unless `RUST_LOG` names
+/// it: on Windows it logs a warning about 17 times a second while idle (docs/dht-spike.md, 9.2), which buries the rest.
+fn log_filter() -> tracing_subscriber::EnvFilter {
+    log_filter_for(std::env::var("RUST_LOG").ok().as_deref())
+}
+
+fn log_filter_for(rust_log: Option<&str>) -> tracing_subscriber::EnvFilter {
+    use tracing_subscriber::EnvFilter;
+    let spec = rust_log.map(str::trim).filter(|spec| !spec.is_empty());
+    let filter = spec.and_then(|spec| EnvFilter::try_new(spec).ok()).unwrap_or_else(|| "info".into());
+    match "mainline=error".parse() {
+        Ok(directive) if !spec.is_some_and(|spec| spec.contains("mainline")) => filter.add_directive(directive),
+        _ => filter,
+    }
+}
+
+/// `velora wake`: what to print when the signal went out, else an error that says why not.
+async fn wake(state: &StateDir, host: &str, s: &Strings) -> Result<String> {
+    wake_report(hosts::wake(state, host).await, s)
+}
+
+/// What `velora wake` says, in the launcher's words (`wake_*` in `strings.rs`). Only a sent signal is a success: the
+/// other outcomes are errors, so that the exit status tells a script whether the signal went out.
+fn wake_report(outcome: Result<WakeOutcome>, s: &Strings) -> Result<String> {
+    match outcome {
+        Ok(WakeOutcome::Sent) => Ok(s.wake_sent.to_string()),
+        Ok(WakeOutcome::NoRelay) => bail!(fill(s.wake_no_relay, &[s.reach_relay])),
+        Ok(WakeOutcome::Unsupported) => bail!(s.wake_unsupported),
+        Err(e) => bail!(fill(s.wake_failed, &[&format!("{e:#}")])),
+    }
+}
+
+/// Which way in a connection took, for the line `velora connect` prints. The words are the launcher's (`reach_kind_*`
+/// in `strings.rs`) in running text, in English like the rest of this program's lines: `strings.rs` is the launcher's.
+/// A connection made by hole punching is a direct one to the host's public endpoint, and the route cannot tell it from
+/// one to an address the router maps: both are the public address here.
+fn route_words(route: &Route, known: &[KnownHost]) -> String {
+    let address = &route.address;
+    match &route.kind {
+        AddressKind::Lan => format!("the local network ({address})"),
+        AddressKind::Vpn => format!("the VPN ({address})"),
+        AddressKind::Public => format!("the public address ({address})"),
+        AddressKind::V6 => format!("its IPv6 address ({address})"),
+        AddressKind::Relay(fingerprint) => {
+            format!("another PC of yours (relay) {} at {address}", relay_name(fingerprint, known))
+        }
+        AddressKind::Other(_) => format!("another route ({address})"),
+    }
+}
+
+/// The name of the paired computer that is the relay with `fingerprint`, else its short form: a relay is a computer of the
+/// user's, but not always one this device has paired with.
+fn relay_name(fingerprint: &str, known: &[KnownHost]) -> String {
+    match known.iter().find(|h| h.fingerprint == fingerprint) {
+        Some(host) => format!("'{}'", host.name),
+        None => Fingerprint::from_base64(fingerprint).map_or_else(|_| fingerprint.to_string(), |f| f.short()),
+    }
+}
+
+/// How `session` reached its host, in words (see [`route_words`]).
+fn way_in(state: &StateDir, session: &Session) -> String {
+    route_words(session.route(), &hosts::list(state).unwrap_or_default())
+}
+
+/// What the user is told when a host only relays (`velora-host --relay-only`): it welcomes a session with no screen at all,
+/// and a window for it would stay empty.
+const ONLY_RELAYS: &str = "This PC only relays connections: there is no screen to show.";
+
+/// Whether a welcome of this size has nothing to show.
+fn shows_nothing(width: u16, height: u16) -> bool {
+    width == 0 || height == 0
+}
+
+/// Ends a session that has no screen, with [`ONLY_RELAYS`]: the launcher shows the last error line of a failed session.
+fn require_screen(session: &Session) -> Result<()> {
+    if shows_nothing(session.width, session.height) {
+        session.close();
+        bail!(ONLY_RELAYS);
+    }
+    Ok(())
+}
+
+// A relay carries one connection to a host from this device at a time: a second one takes the first over (D2, F3). A window
+// that reached its host through a relay therefore holds a lock on a file in the state directory for as long as it lives,
+// and any other window of this computer looks at that file before it connects. The operating system owns the lock, so a
+// window that crashes or is killed frees it too. The file is left behind, empty.
+
+/// The lock held by a window that reached its host through a relay; it ends with this value.
+struct RelayClaim {
+    _lock: std::fs::File,
+}
+
+/// The lock file of the host with `fingerprint` (base64url, so it is already a name that files can have).
+fn claim_path(state: &StateDir, fingerprint: &str) -> PathBuf {
+    let name: String = fingerprint.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_')).collect();
+    state.dir().join(format!("relay-{name}.lock"))
+}
+
+/// Takes the relay to the host with `fingerprint`, or `None` when another window already holds it (or the file cannot be
+/// used: a lock that cannot be taken is no reason to stop anyone).
+fn claim_relay(state: &StateDir, fingerprint: &str) -> Option<RelayClaim> {
+    let path = claim_path(state, fingerprint);
+    let file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path);
+    match file.map_err(TryLockError::Error).and_then(|file| file.try_lock().map(|()| file)) {
+        Ok(file) => Some(RelayClaim { _lock: file }),
+        Err(TryLockError::WouldBlock) => {
+            tracing::warn!("another window of this computer held the relay to this host; this connection took it over");
+            None
+        }
+        Err(TryLockError::Error(e)) => {
+            tracing::debug!("cannot claim the relay ({}): {e}", path.display());
+            None
+        }
+    }
+}
+
+/// Whether a window holds the relay to the host with `fingerprint`.
+fn relay_busy(state: &StateDir, fingerprint: &str) -> bool {
+    let Ok(file) = std::fs::File::open(claim_path(state, fingerprint)) else { return false };
+    matches!(file.try_lock_shared(), Err(TryLockError::WouldBlock))
+}
+
+/// The fingerprint of the paired host called `host` (a name or an address, as `hosts::connect` takes it) once no other
+/// window of this computer holds a relay to it, else an error saying so. Before the connection: afterwards the relay would
+/// already have dropped the other window. A host that is not paired is left for `hosts::connect` to complain about.
+fn free_relay(state: &StateDir, host: &str) -> Result<Option<String>> {
+    let known = hosts::list(state).unwrap_or_default();
+    let Some(paired) = known.iter().find(|h| h.name == host || h.address == host) else { return Ok(None) };
+    if relay_busy(state, &paired.fingerprint) {
+        bail!(
+            "'{}' is already open on this computer through a relay, which carries one connection to a host at a time: \
+             close that window first.",
+            paired.name
+        );
+    }
+    Ok(Some(paired.fingerprint.clone()))
+}
+
+/// Takes the relay for a session that came through one (`route`), else nothing.
+fn hold_relay(state: &StateDir, paired: Option<&str>, route: &Route) -> Option<RelayClaim> {
+    let fingerprint = paired.filter(|_| matches!(route.kind, AddressKind::Relay(_)))?;
+    claim_relay(state, fingerprint)
 }
 
 /// A GUI-subsystem program has no console; reuse the terminal it was started from, if any,
@@ -704,5 +877,272 @@ impl ApplicationHandler for App {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use anyhow::anyhow;
+    use clap::CommandFactory;
+
+    use super::*;
+    use crate::gui::strings;
+
+    /// A scratch folder for the client's state, removed when dropped.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("velora-g3-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            Self(dir)
+        }
+
+        fn state(&self) -> StateDir {
+            StateDir::open(Some(self.0.clone()), "client").unwrap()
+        }
+
+        /// Pairs `hosts`: they go into the known hosts, as pairing writes them.
+        fn pair(&self, hosts: &[KnownHost]) {
+            self.state().save(StateDir::KNOWN_HOSTS, &hosts.to_vec()).unwrap();
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A paired computer. Addresses are documentation ones (RFC 5737, RFC 3849) and fingerprints are made up: nothing
+    /// here is anyone's network.
+    fn host(name: &str, address: &str, tag: u8) -> KnownHost {
+        KnownHost {
+            name: name.into(),
+            address: address.into(),
+            fingerprint: Fingerprint([tag; 32]).to_base64(),
+            ..Default::default()
+        }
+    }
+
+    fn route(kind: AddressKind, address: &str) -> Route {
+        Route { kind, address: address.into() }
+    }
+
+    fn relay(tag: u8) -> AddressKind {
+        AddressKind::Relay(Fingerprint([tag; 32]).to_base64())
+    }
+
+    fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
+        Cli::try_parse_from(std::iter::once("velora").chain(args.iter().copied()))
+    }
+
+    #[test]
+    fn the_command_line_is_well_formed() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn wake_takes_one_host() {
+        let Some(Command::Wake { host }) = parse(&["wake", "Office PC"]).unwrap().command else { panic!("not wake") };
+        assert_eq!(host, "Office PC");
+        // By address too, and with the global options before or after, as for the other commands.
+        let cli = parse(&["--config-dir", "state", "wake", "192.0.2.10:7420", "--no-update"]).unwrap();
+        assert_eq!(cli.config_dir, Some(PathBuf::from("state")));
+        assert!(cli.no_update);
+        assert!(matches!(cli.command, Some(Command::Wake { host }) if host == "192.0.2.10:7420"));
+        assert!(parse(&["wake"]).is_err(), "which host?");
+        assert!(parse(&["wake", "Office PC", "Laptop"]).is_err(), "one at a time");
+        // The others are as they were.
+        assert!(matches!(parse(&["connect", "x"]).unwrap().command, Some(Command::Connect { .. })));
+        assert!(matches!(
+            parse(&["bench", "x", "--seconds", "3"]).unwrap().command,
+            Some(Command::Bench { seconds: 3, .. })
+        ));
+    }
+
+    #[test]
+    fn wake_says_each_outcome_in_the_launchers_words_and_succeeds_only_when_it_sent() {
+        for s in strings::all() {
+            assert_eq!(wake_report(Ok(WakeOutcome::Sent), s).unwrap(), s.wake_sent);
+            let refused = |outcome| wake_report(outcome, s).unwrap_err().to_string();
+            assert_eq!(refused(Ok(WakeOutcome::NoRelay)), fill(s.wake_no_relay, &[s.reach_relay]));
+            assert_eq!(refused(Ok(WakeOutcome::Unsupported)), s.wake_unsupported);
+            // A failure shows what went wrong, all of it.
+            let failed = Err(anyhow!("no route").context("cannot ask the relay"));
+            assert_eq!(refused(failed), fill(s.wake_failed, &["cannot ask the relay: no route"]));
+        }
+    }
+
+    /// The real `hosts::wake` against paired computers that cannot be woken, so that no packet leaves this PC.
+    #[test]
+    fn wake_asks_the_paired_computers_and_tells_what_came_of_it() {
+        // A made-up MAC address of the locally administered kind.
+        const MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 0x01];
+        let scratch = Scratch::new("wake");
+        // The first never told its MAC address. The second is on a network that no adapter of this PC has, and has no
+        // relay stored.
+        let silent = host("Silent", "192.0.2.10:7420", 1);
+        let away = KnownHost {
+            mac: Some(MAC),
+            kinds: vec![(AddressKind::Lan, "203.0.113.9:7420".into())],
+            ..host("Away", "198.51.100.10:7420", 2)
+        };
+        scratch.pair(&[silent, away]);
+        let state = scratch.state();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        for s in strings::all() {
+            let told = |name: &str| runtime.block_on(wake(&state, name, s)).unwrap_err().to_string();
+            assert_eq!(told("Silent"), s.wake_unsupported);
+            assert_eq!(told("Away"), fill(s.wake_no_relay, &[s.reach_relay]));
+            // By address, as `connect` takes it.
+            assert_eq!(told("192.0.2.10:7420"), s.wake_unsupported);
+            let unknown = told("Nowhere");
+            assert!(unknown.starts_with(&fill(s.wake_failed, &[""])), "{unknown}");
+            assert!(unknown.contains("'Nowhere' is not paired yet"), "{unknown}");
+        }
+    }
+
+    #[test]
+    fn the_route_is_told_in_the_launchers_words() {
+        let laptop = host("Laptop", "192.0.2.20:7420", 9);
+        let known = [host("Office PC", "192.0.2.10:7420", 1), laptop];
+        let words = |kind, address| route_words(&route(kind, address), &known);
+        assert_eq!(words(AddressKind::Lan, "192.0.2.10:7420"), "the local network (192.0.2.10:7420)");
+        assert_eq!(words(AddressKind::Vpn, "198.51.100.5:7420"), "the VPN (198.51.100.5:7420)");
+        assert_eq!(words(AddressKind::Public, "203.0.113.5:7420"), "the public address (203.0.113.5:7420)");
+        assert_eq!(words(AddressKind::V6, "[2001:db8::5]:7420"), "its IPv6 address ([2001:db8::5]:7420)");
+        assert_eq!(words(AddressKind::Other(7), "192.0.2.77:7420"), "another route (192.0.2.77:7420)");
+        // A relay is named when this device has paired with it, and else by its fingerprint.
+        assert_eq!(words(relay(9), "198.51.100.4:7420"), "another PC of yours (relay) 'Laptop' at 198.51.100.4:7420");
+        let stranger = format!("another PC of yours (relay) {} at 198.51.100.4:7420", Fingerprint([5; 32]).short());
+        assert_eq!(words(relay(5), "198.51.100.4:7420"), stranger);
+        // A relay that is not even a fingerprint is shown as it came.
+        let garbled = words(AddressKind::Relay("not a fingerprint".into()), "198.51.100.4:7420");
+        assert_eq!(garbled, "another PC of yours (relay) not a fingerprint at 198.51.100.4:7420");
+    }
+
+    /// The launcher words its routes (`reach_kind_*`); the command line says the same things in running text. If one of
+    /// them is reworded there, this says to reword it here.
+    #[test]
+    fn the_route_words_are_the_launchers_english_ones() {
+        let en = strings::all()[1];
+        assert_eq!(en.reach_kind_lan, "Local network", "strings::all() lists Portuguese first, then English");
+        for (kind, label) in [
+            (AddressKind::Lan, en.reach_kind_lan),
+            (AddressKind::Vpn, en.reach_kind_vpn),
+            (AddressKind::Public, en.reach_public),
+            (AddressKind::V6, en.reach_v6),
+            (relay(1), en.reach_kind_relay),
+            (AddressKind::Other(7), en.reach_kind_other),
+        ] {
+            let said = route_words(&route(kind.clone(), "192.0.2.1:7420"), &[]);
+            assert!(said.to_lowercase().contains(&label.to_lowercase()), "{kind:?}: {said:?} does not say {label:?}");
+        }
+    }
+
+    #[test]
+    fn a_host_with_no_screen_is_one_that_only_relays() {
+        assert!(shows_nothing(0, 0));
+        // Either side being nothing leaves nothing to draw.
+        assert!(shows_nothing(0, 1080) && shows_nothing(1920, 0));
+        assert!(!shows_nothing(1920, 1080) && !shows_nothing(1, 1));
+        assert_eq!(ONLY_RELAYS, "This PC only relays connections: there is no screen to show.");
+    }
+
+    #[test]
+    fn the_claim_file_is_in_the_state_directory_whatever_the_fingerprint_looks_like() {
+        let scratch = Scratch::new("path");
+        let state = scratch.state();
+        let real = claim_path(&state, &Fingerprint([3; 32]).to_base64());
+        assert_eq!(real.parent(), Some(state.dir()));
+        assert!(real.file_name().unwrap().to_str().unwrap().starts_with("relay-"));
+        // What a hand-edited known-hosts file may hold must not lead out of the folder.
+        let odd = claim_path(&state, "../../x\\y/z");
+        assert_eq!(odd.parent(), Some(state.dir()));
+        assert_eq!(odd.file_name().unwrap(), "relay-xyz.lock");
+    }
+
+    #[test]
+    fn a_relay_is_held_by_one_window_at_a_time() {
+        let scratch = Scratch::new("claim");
+        let state = scratch.state();
+        let (office, desk) = (Fingerprint([1; 32]).to_base64(), Fingerprint([2; 32]).to_base64());
+        assert!(!relay_busy(&state, &office), "nothing was claimed yet");
+        let claim = claim_relay(&state, &office).expect("the first window takes it");
+        assert!(relay_busy(&state, &office));
+        assert!(claim_relay(&state, &office).is_none(), "a second one cannot");
+        assert!(!relay_busy(&state, &desk), "another host is another connection through the relay");
+        let other = claim_relay(&state, &desk);
+        assert!(other.is_some() && relay_busy(&state, &desk));
+        // Closing the window frees it.
+        drop(claim);
+        assert!(!relay_busy(&state, &office) && relay_busy(&state, &desk));
+        assert!(claim_relay(&state, &office).is_some());
+    }
+
+    #[test]
+    fn a_claim_that_cannot_be_made_stops_nobody() {
+        let scratch = Scratch::new("nofile");
+        let state = scratch.state();
+        std::fs::remove_dir_all(state.dir()).unwrap();
+        let office = Fingerprint([1; 32]).to_base64();
+        assert!(claim_relay(&state, &office).is_none(), "the file cannot be made");
+        assert!(!relay_busy(&state, &office), "and without it nothing is held");
+    }
+
+    #[test]
+    fn a_second_window_through_the_same_relay_is_refused_before_it_connects() {
+        let scratch = Scratch::new("free");
+        let office = host("Office PC", "192.0.2.10:7420", 1);
+        scratch.pair(&[office.clone(), host("Laptop", "192.0.2.20:7420", 9)]);
+        let state = scratch.state();
+        let relayed = route(relay(9), "198.51.100.4:7420");
+        // Nothing is held: it may connect, by name or by address.
+        for name in ["Office PC", "192.0.2.10:7420"] {
+            assert_eq!(free_relay(&state, name).unwrap().as_deref(), Some(office.fingerprint.as_str()));
+        }
+        // A host that is not paired is left for the connection to complain about.
+        assert_eq!(free_relay(&state, "Nowhere").unwrap(), None);
+        // The first window came through a relay and holds it.
+        let first = hold_relay(&state, Some(&office.fingerprint), &relayed).expect("a relayed session claims");
+        for name in ["Office PC", "192.0.2.10:7420"] {
+            let refused = free_relay(&state, name).unwrap_err().to_string();
+            assert!(refused.starts_with("'Office PC' is already open on this computer through a relay"), "{refused}");
+            assert!(refused.ends_with("close that window first."), "{refused}");
+        }
+        // Another computer is not in the way.
+        assert!(free_relay(&state, "Laptop").is_ok());
+        // Once that window is closed, the next one may.
+        drop(first);
+        assert!(free_relay(&state, "Office PC").is_ok());
+    }
+
+    #[test]
+    fn only_a_session_that_came_through_a_relay_holds_one() {
+        let scratch = Scratch::new("hold");
+        let state = scratch.state();
+        let office = Fingerprint([1; 32]).to_base64();
+        for kind in [AddressKind::Lan, AddressKind::Vpn, AddressKind::Public, AddressKind::V6, AddressKind::Other(4)] {
+            let direct = route(kind, "192.0.2.10:7420");
+            assert!(hold_relay(&state, Some(&office), &direct).is_none() && !relay_busy(&state, &office));
+        }
+        // A host that is not paired has no fingerprint to hold it under.
+        assert!(hold_relay(&state, None, &route(relay(9), "198.51.100.4:7420")).is_none());
+        assert!(hold_relay(&state, Some(&office), &route(relay(9), "198.51.100.4:7420")).is_some());
+    }
+
+    #[test]
+    fn the_dht_library_is_kept_to_errors_unless_the_user_names_it() {
+        let shown = |rust_log: Option<&str>| log_filter_for(rust_log).to_string();
+        assert!(shown(None).contains("mainline=error") && shown(None).contains("info"));
+        assert!(shown(Some("")).contains("mainline=error"));
+        assert!(shown(Some("debug")).contains("mainline=error") && shown(Some("debug")).contains("debug"));
+        assert!(shown(Some("velora_client=debug")).contains("mainline=error"));
+        // Not a filter at all: the default, which is not allowed to be noisy either.
+        assert!(shown(Some("=== not a filter")).contains("mainline=error"));
+        // Someone debugging the DHT gets what they asked for.
+        assert!(!shown(Some("mainline=debug")).contains("mainline=error"));
+        assert!(shown(Some("info,mainline=trace")).contains("mainline=trace"));
     }
 }
