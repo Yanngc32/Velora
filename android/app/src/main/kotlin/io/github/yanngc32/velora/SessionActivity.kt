@@ -36,7 +36,10 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -48,7 +51,11 @@ import androidx.compose.ui.platform.ComposeView
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import androidx.core.content.res.ResourcesCompat
+import kotlinx.coroutines.delay
+import uniffi.velora_mobile.LinkListener
+import uniffi.velora_mobile.LinkStatus
 import uniffi.velora_mobile.MobileException
+import uniffi.velora_mobile.Way
 import uniffi.velora_mobile.Session
 import uniffi.velora_mobile.SessionListener
 import uniffi.velora_mobile.VideoFrame
@@ -65,6 +72,8 @@ class SessionActivity : ComponentActivity(), SessionListener, SurfaceHolder.Call
 
     /** "Connecting…" over the video area until the session starts. */
     private var connecting by mutableStateOf(true)
+    /** How the connection stands once the session started: the way it took, or that it is being regained. */
+    private var link by mutableStateOf<LinkStatus?>(null)
     /** Asking for the computer's password (`true`: the last one was wrong). */
     private var passwordPrompt by mutableStateOf<Boolean?>(null)
 
@@ -160,7 +169,50 @@ class SessionActivity : ComponentActivity(), SessionListener, SurfaceHolder.Call
                 }
             }
         }
+        when (val now = link) {
+            is LinkStatus.Reconnecting -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Row(
+                    Modifier.background(Velora.Card, RoundedCornerShape(20.dp)).padding(horizontal = 18.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    CircularProgressIndicator(Modifier.size(18.dp), color = Velora.AccentText, strokeWidth = 2.dp)
+                    Text(stringResource(R.string.reconnecting), style = MaterialTheme.typography.bodyLarge, color = Velora.Text)
+                }
+            }
+            is LinkStatus.Up -> WayNotice(now)
+            null -> {}
+        }
         passwordPrompt?.let { wrong -> PasswordDialog(wrong) }
+    }
+
+    /** The way the connection took, at the top for a few seconds after it starts or changes. */
+    @Composable
+    private fun WayNotice(up: LinkStatus.Up) {
+        var shown by remember(up) { mutableStateOf(true) }
+        LaunchedEffect(up) {
+            delay(4000)
+            shown = false
+        }
+        if (!shown) return
+        Box(Modifier.fillMaxSize().padding(top = 16.dp), contentAlignment = Alignment.TopCenter) {
+            Text(
+                stringResource(wayName(up.way)),
+                Modifier.background(Velora.Card, RoundedCornerShape(16.dp)).padding(horizontal = 14.dp, vertical = 6.dp),
+                style = MaterialTheme.typography.bodyMedium,
+                color = Velora.Weak,
+            )
+        }
+    }
+
+    private fun wayName(way: Way): Int = when (way) {
+        Way.LAN -> R.string.way_lan
+        Way.VPN -> R.string.way_vpn
+        Way.PUBLIC -> R.string.way_public
+        Way.V6 -> R.string.way_v6
+        Way.PUNCH -> R.string.way_punch
+        Way.RELAY -> R.string.way_relay
+        Way.OTHER -> R.string.way_other
     }
 
     /** The computer has an access password: ask for it and connect again. Never stored. */
@@ -264,6 +316,12 @@ class SessionActivity : ComponentActivity(), SessionListener, SurfaceHolder.Call
                     // What the computer sends meanwhile (Send To there) goes to Downloads.
                     val incoming = IncomingFiles(this, s.hostName())
                     s.receiveFiles(incoming.dir.absolutePath, incoming)
+                    // Lost connections come back on their own, and a better way (home Wi-Fi) is taken when it answers.
+                    s.watchLink(object : LinkListener {
+                        override fun onLink(status: LinkStatus) {
+                            runOnUiThread { link = status }
+                        }
+                    })
                 }
             } catch (e: MobileException.PasswordRequired) {
                 runOnUiThread { if (!finished) passwordPrompt = false }

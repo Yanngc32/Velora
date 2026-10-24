@@ -66,4 +66,21 @@
         <item quantity="one">%1$d item</item>
         <item quantity="other">%1$d items</item>
     </plurals>
+    <string name="connection_mode">How to connect</string>
+    <string name="mode_auto">Automatic</string>
+    <string name="mode_auto_hint">The fastest way that answers; switches on its own when a better one appears.</string>
+    <string name="mode_lan">Local network</string>
+    <string name="mode_lan_hint">Only over the local network (same Wi-Fi).</string>
+    <string name="mode_vpn">Tailscale / VPN</string>
+    <string name="mode_vpn_hint">Only over the VPN address (Tailscale, Netbird).</string>
+    <string name="mode_velora">Velora</string>
+    <string name="mode_velora_hint">Only Velora\'s own ways from any network: public address, NAT hole punching or another PC of yours.</string>
+    <string name="reconnecting">Reconnecting…</string>
+    <string name="way_lan">Local network</string>
+    <string name="way_vpn">VPN</string>
+    <string name="way_public">Public address</string>
+    <string name="way_v6">IPv6</string>
+    <string name="way_punch">Direct through the NAT</string>
+    <string name="way_relay">Through another PC of yours</string>
+    <string name="way_other">Another route</string>
 </resources>
