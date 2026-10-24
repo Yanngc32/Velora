@@ -91,9 +91,10 @@ const STOP_GRACE: Duration = Duration::from_secs(4);
 const ABORT_WAIT: Duration = Duration::from_secs(1);
 /// How often the host looks at its own LAN and VPN addresses again.
 const HOUSEKEEPING_INTERVAL: Duration = Duration::from_secs(30);
-/// How often it looks for its MAC address again once it has one. While it has none it asks after
-/// `MAC_RETRY`, then twice as long each time, up to this.
-const MAC_REFRESH: Duration = Duration::from_secs(30 * 60);
+/// How often it looks for its MAC address again once it has one (a laptop that moves to another
+/// adapter has another). While it has none it asks after `MAC_RETRY`, then twice as long each time,
+/// up to this.
+const MAC_REFRESH: Duration = Duration::from_secs(5 * 60);
 const MAC_RETRY: Duration = Duration::from_secs(30);
 /// The kind code for an address this version cannot place (`AddressKind::Other`).
 const UNKNOWN_KIND: u8 = 255;

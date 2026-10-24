@@ -21,7 +21,7 @@ hook that is not there, look at `ReachContext::ext::<YourState>()` first (one va
 | E3 | `dht.rs`, `secrets.rs` | `dht::run(ctx)`, `dht::reach_message(ctx, fp)`, `secrets::{get, all, on_paired, on_revoked}` | task while `dht` is on; the rest called by the host |
 | E4 | `relay.rs` | `serve(ctx)`, `register_with(ctx)`, `handle_message(ctx, from, msg)`, `on_revoked(ctx, fp)`, `busy(ctx)` | tasks; the rest called by the host |
 | E5 | `punch.rs`, `poll.rs` | `punch::run(ctx)`, `punch::respond(ctx, request)`, `poll::run(ctx)` | tasks while `standalone` is on; `respond` is called by E4 and by `poll` |
-| E6 | `wake.rs` | `local_mac()` | called by the host (every 30 min); D2 already does the LAN check for a relayed wake |
+| E6 | `wake.rs` | `local_mac()` | called by the host (every 5 min; was 30 until E6); D2 already does the LAN check for a relayed wake |
 
 Contracts are in the doc comments of each stub. Tasks end by **returning** after `ctx.stop` fires (`ctx.stop.stopped().await`,
 `ctx.stop.sleep(d).await -> bool`); the host waits 4 s for them, then aborts. An `Err` is logged and the task is not restarted until its
