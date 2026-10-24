@@ -460,9 +460,9 @@ All of it stays in the local logs; the user reads it under This PC and in `host.
 ## 14. What the first implementation wave found
 
 Waves 0 and 1 (the scaffold, the protocol, router mapping, addresses, Wake-on-LAN, the record
-and its sealing, relay framing, the DHT spike) were built and measured on 2026-10-23. Their
-hand-over notes were folded into [standalone-reach.md](standalone-reach.md#how-it-is-built). What
-they changed:
+and its sealing, relay framing, the DHT spike) were built and measured on 2026-10-23. The notes
+their builders wrote were folded into [standalone-reach.md](standalone-reach.md#how-it-is-built)
+and removed. What they changed:
 
 1. **The welcome keeps 8 addresses.** `MAX_ADDRESSES` is 16 for `HostMsg::Reach` only
    (`MAX_WELCOME_ADDRESSES = 8`): a client from before reads exactly 8 and rejects trailing
@@ -521,8 +521,11 @@ is [standalone-reach.md](standalone-reach.md).
    after the last disconnect), not every 30 to 60 s, and the device waits up to 10 s after a relay
    delivered the request and up to 60 s after the DHT item. The host's endpoint is listed as a
    `Public` address of the record when its NAT is a cone and no mapping is advertised, and a DHT ping
-   every 20 s from the QUIC socket keeps that NAT mapping open (not foreseen above). A symmetric NAT on
-   either side rules a punch out, and STUN is a fallback of the client only.
+   every 20 s from the QUIC socket keeps that NAT mapping open (not foreseen above); the ping's
+   answer, compared with the endpoint measured, tells the host that the NAT now maps the socket
+   elsewhere, and it measures again (at most once a minute, the gap doubling while that keeps
+   happening). A symmetric NAT on either side rules a punch out, and STUN is a fallback of the
+   client only.
 5. **Sizes.** A record lists at most 1 LAN, 2 VPN, 1 public and 2 IPv6 addresses and 1 relay with 1
    address; 11 paired devices have a secret of their own (the plan said about 12), more share one.
 6. **The DHT node never serves.** `mainline` cannot be kept from becoming a server (§14.9), so every

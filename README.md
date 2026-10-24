@@ -399,9 +399,14 @@ Wake-on-LAN packet. It needs, and Velora cannot check:
   phone on the home Wi-Fi), or a relay PC there that is on and has this PC registered. A router
   drops a magic packet that comes in from the internet.
 
-*Wake-up signal sent* only says the packet left. From outside the home network the sender has to be a relay PC at
-home that can itself be reached (a VPS is not on that network). The Android app has no Wake button
-yet.
+*Wake-up signal sent* only says the packet left.
+
+> [!IMPORTANT]
+> Waking a PC from outside the home network needs **another PC at home that stays on and can be
+> reached from outside** (a port, IPv6 or a VPN address), registered as a relay. A VPS cannot do
+> it: it is not on that network. A home with none cannot wake its PC from afar.
+
+The Android app has no Wake button yet.
 
 **Command line and headless hosts.** `velora connect` prints the way in it took (*through:
 Public address · …*); `velora-host run --relay-only` serves relays and nothing else. A host with
@@ -585,17 +590,20 @@ With [standalone reach](#reaching-this-pc-from-anywhere) on, what changes:
   forward by hand. QUIC drops anything that is not a valid handshake for the host's certificate
   before Velora sees it, and while the host is exposed (standalone reach on, or relaying for
   others) each new address must also prove it can receive packets (QUIC Retry), so a forged first
-  packet cannot make the host send more than it got. By default the host also listens on IPv6.
+  packet cannot make the host send more than it got. By default the host also listens on IPv6, so
+  if your router lets IPv6 in, the port is open that way even with every switch off.
 - **The DHT record** is signed with a key of its own, beside the TLS identity, and sealed
   separately for each paired device, so nobody else can read the addresses and a removed device is
   left out at the next publish. The DHT sees that an IP published under a key, when, and roughly
   how many devices can read it; no address, name or fingerprint.
 - **A relay PC** copies encrypted QUIC packets between two authenticated connections. It cannot
   read or change a session, and forwards only for devices on its paired list.
-- The DHT's public bootstrap nodes (and, only as a fallback when a device hole-punches, public
-  STUN servers) see your IP address, as with any BitTorrent client. Nothing else leaves the
-  computer and there is no telemetry. More in the
-  [full guide](docs/standalone-reach.md#security-and-privacy).
+- The DHT's public bootstrap nodes (`router.bittorrent.com`, `dht.transmissionbt.com`,
+  `dht.libtorrent.org`, `relay.pkarr.org`) and the nodes they lead to see your IP address, as with
+  any BitTorrent client; so do the public STUN servers (`stun.l.google.com`,
+  `stun.cloudflare.com`), which a device asks only as a fallback when it hole-punches and fewer
+  than two DHT nodes answer. Nothing else leaves the computer and there is no telemetry. More in
+  the [full guide](docs/standalone-reach.md#security-and-privacy).
 
 > [!WARNING]
 > On Windows, without the service, input can't reach elevated windows unless `velora-host`

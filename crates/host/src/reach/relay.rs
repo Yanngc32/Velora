@@ -5,7 +5,7 @@
 //! keeps the connection; a client that wants the host dials out to the same PC. Both connections
 //! are *links*: a hello with `files_only` and `reach`, which the host answers with a welcome of no
 //! screen, `Reach`, and then control messages only, so nothing is captured and no desktop session
-//! is taken over (`docs/reach-handover/E1-host-plumbing.md`). The relay copies the datagrams of
+//! is taken over (`docs/standalone-reach.md`, "How it is built"). The relay copies the datagrams of
 //! one connection to the other (`velora_relay::forward`, ticket D2) and sees ciphertext only: the
 //! two ends run the ordinary Velora handshake through it.
 //!
@@ -41,7 +41,7 @@
 //! certificate. That is not one of the client identities in the relay's `authorized_clients.json`,
 //! so the relay's `authorize` (`server.rs`) also lets in a *link* hello from a host that the
 //! relay's own user paired with, one in `known_hosts.json` of the client side of the relay's
-//! computer ([`trusts`]): a link and nothing else. `docs/reach-handover/E4-host-relay.md` says
+//! computer ([`trusts`]): a link and nothing else. `docs/standalone-reach.md` ("A relay PC") says
 //! which pairings a relayed connection needs.
 
 use std::{
