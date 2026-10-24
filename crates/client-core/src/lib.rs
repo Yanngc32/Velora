@@ -35,7 +35,7 @@ use velora_protocol::{
 };
 
 pub use files::{OfferEvent, RemoteFiles};
-pub use reach::{ReachInfo, Route, WakeOutcome};
+pub use reach::{ReachInfo, Route, RouteKind, WakeOutcome};
 
 #[cfg(feature = "decode")]
 pub use video::{Chroma, FrameSlot, GpuPicture, VideoFrame};
@@ -376,6 +376,7 @@ pub struct FilesSession {
     /// Where else the host answers (see `HostMsg::Welcome`).
     pub addresses: Vec<String>,
     pub files: RemoteFiles,
+    route: Route,
     conn: quinn::Connection,
     _endpoint: quinn::Endpoint,
 }
@@ -383,6 +384,12 @@ pub struct FilesSession {
 impl FilesSession {
     pub fn close(&self) {
         self.conn.close(0u32.into(), b"client closed");
+    }
+
+    /// How this connection was made, as for [`Session::route`]. A relay carries one connection to a host from a device at
+    /// a time, so a caller that sees a relay here has taken the place of any other connection through it.
+    pub fn route(&self) -> &Route {
+        &self.route
     }
 }
 
@@ -404,12 +411,19 @@ pub async fn connect_files(params: ConnectParams) -> Result<FilesSession> {
         bail!(TOO_OLD);
     }
     // Nothing more is said on the control stream; keep it open for the connection's lifetime.
-    let Handshake { endpoint, conn, send, recv, host_name, addresses, .. } = hs;
+    let Handshake { endpoint, conn, send, recv, host_name, addresses, route, .. } = hs;
     tokio::spawn(async move {
         let _keep = (send, recv);
         std::future::pending::<()>().await
     });
-    Ok(FilesSession { host_name, addresses, files: RemoteFiles { conn: conn.clone() }, conn, _endpoint: endpoint })
+    Ok(FilesSession {
+        host_name,
+        addresses,
+        files: RemoteFiles { conn: conn.clone() },
+        route,
+        conn,
+        _endpoint: endpoint,
+    })
 }
 
 /// Connects, authenticates and starts delivering video to `output`.
@@ -882,7 +896,7 @@ mod tests {
         assert!(within("hello", host.hellos.recv()).await.unwrap().unwrap().reach);
         assert_eq!(session.host_name, "fake-pc");
         assert_eq!(session.addresses, vec!["192.0.2.10:7420".to_string()]);
-        assert_eq!(session.route(), &Route { kind: AddressKind::Lan, address: host.addr.to_string() });
+        assert_eq!(session.route(), &Route { kind: AddressKind::Lan.into(), address: host.addr.to_string() });
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(session.reach(), None);
 
@@ -972,9 +986,19 @@ mod tests {
         let began = std::time::Instant::now();
         let stale = Arc::new(params(&host, silent.local_addr().unwrap()));
         let established = within("race", establish_with(stale, Some(lookup))).await.unwrap();
-        assert_eq!(established.route, Route { kind: AddressKind::Public, address: host.addr.to_string() });
+        assert_eq!(established.route, Route { kind: AddressKind::Public.into(), address: host.addr.to_string() });
         assert!(began.elapsed() >= reach::LOOKUP_DELAY, "the DHT is not asked before its delay");
         established.conn.close(0u32.into(), b"");
+    }
+
+    #[tokio::test]
+    async fn a_files_connection_says_how_it_was_made_like_a_session() {
+        let mut host = FakeHost::start(Script::default());
+        let files = within("connect", connect_files(params(&host, host.addr))).await.unwrap();
+        // The hello is the files-only one, and the route is that of the address dialed.
+        assert!(within("hello", host.hellos.recv()).await.unwrap().unwrap().files_only);
+        assert_eq!(files.route(), &Route { kind: AddressKind::Lan.into(), address: host.addr.to_string() });
+        assert_eq!(files.host_name, "fake-pc");
     }
 
     /// Never called: it only has to compile. Callers spawn these futures on a multi-threaded runtime, and the hooks of

@@ -8,7 +8,8 @@
 //!   about the host, and [`resolve_record`] adds more while the race runs.
 //! - `race`: starts the candidates on a schedule (the constants below), the first TLS handshake wins and the rest are
 //!   dropped.
-//! - [`ReachInfo`], [`ReachParams`], [`Route`]: what the host said, what the race may use, how a connection was made.
+//! - [`ReachInfo`], [`ReachParams`], [`Route`] and [`RouteKind`]: what the host said, what the race may use, how a
+//!   connection was made.
 //! - [`wake`]: Wake-on-LAN, from this device's network or through a relay.
 //!
 //! The feature tickets fill in the hooks in files of their own and edit nothing here. Each hook says, where it is
@@ -104,12 +105,12 @@ impl Candidate {
     /// How a connection made through this candidate is reported: see [`Route`].
     pub fn route(&self) -> Route {
         match self {
-            Self::Direct(addr, kind) => Route { kind: kind.clone(), address: addr.to_string() },
-            Self::Relay { relay_addr, relay_fingerprint, .. } => {
-                Route { kind: AddressKind::Relay(relay_fingerprint.to_base64()), address: relay_addr.to_string() }
-            }
-            // A punched connection is a direct one to the host's public endpoint.
-            Self::Punch { endpoint, .. } => Route { kind: AddressKind::Public, address: endpoint.to_string() },
+            Self::Direct(addr, kind) => Route { kind: kind.clone().into(), address: addr.to_string() },
+            Self::Relay { relay_addr, relay_fingerprint, .. } => Route {
+                kind: AddressKind::Relay(relay_fingerprint.to_base64()).into(),
+                address: relay_addr.to_string(),
+            },
+            Self::Punch { endpoint, .. } => Route { kind: RouteKind::Punch, address: endpoint.to_string() },
         }
     }
 
@@ -152,18 +153,46 @@ pub fn kind_label(kind: &AddressKind) -> &'static str {
     }
 }
 
-/// How a connection was made: the kind of the address that won the race and that address as it was dialed (for a relay,
-/// the relay's own). It is what `ClientMsg::Reached` tells the host, so the host's "last reached" can say which way in
-/// worked, and what `velora connect` can print.
+/// How a connection was made: the way in that won the race and the address as it was dialed (for a relay, the relay's
+/// own). What `velora connect` prints. The host is told the address only (`ClientMsg::Reached`), so that its "last
+/// reached" can say which of its entries worked.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Route {
-    pub kind: AddressKind,
+    pub kind: RouteKind,
     pub address: String,
+}
+
+/// The way a connection came in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RouteKind {
+    /// An address dialed as it is, of the kind the host listed it under or the kind guessed from the address. A relay is
+    /// one: [`AddressKind::Relay`] holds its fingerprint, and the address next to it is the relay's own.
+    Address(AddressKind),
+    /// A hole punched toward the host's public endpoint ([`Candidate::Punch`]). It ends in a direct connection to that
+    /// endpoint, as one to a [`AddressKind::Public`] address does, and the host cannot tell the two apart (it hears the
+    /// address and no more): only this end knows how the connection was set up.
+    Punch,
+}
+
+impl From<AddressKind> for RouteKind {
+    fn from(kind: AddressKind) -> Self {
+        Self::Address(kind)
+    }
+}
+
+impl RouteKind {
+    /// A word for logs and messages: [`kind_label`] of an address kind, or `punch`.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Address(kind) => kind_label(kind),
+            Self::Punch => "punch",
+        }
+    }
 }
 
 impl fmt::Display for Route {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} {}", kind_label(&self.kind), self.address)
+        write!(f, "{} {}", self.kind.label(), self.address)
     }
 }
 
@@ -1023,13 +1052,51 @@ mod tests {
 
     #[test]
     fn the_routes_of_candidates_name_the_address_dialed() {
-        assert_eq!(direct(1).route(), Route { kind: AddressKind::Lan, address: "192.0.2.1:7420".into() });
+        assert_eq!(direct(1).route(), Route { kind: AddressKind::Lan.into(), address: "192.0.2.1:7420".into() });
         assert_eq!(
             relay(2).route(),
-            Route { kind: AddressKind::Relay(Fingerprint([2; 32]).to_base64()), address: "192.0.2.2:7420".into() }
+            Route {
+                kind: AddressKind::Relay(Fingerprint([2; 32]).to_base64()).into(),
+                address: "192.0.2.2:7420".into()
+            }
         );
-        assert_eq!(punch(3).route(), Route { kind: AddressKind::Public, address: "192.0.2.3:7420".into() });
+        assert_eq!(punch(3).route(), Route { kind: RouteKind::Punch, address: "192.0.2.3:7420".into() });
         assert_eq!(direct(1).route().to_string(), "lan 192.0.2.1:7420");
+    }
+
+    /// A punched connection is a direct one to the host's public endpoint, but it is not the connection to the address
+    /// the router maps: the route tells them apart.
+    #[test]
+    fn a_hole_punch_is_not_the_public_address() {
+        let public = Candidate::Direct(addr(3), AddressKind::Public);
+        assert_eq!(public.route().address, punch(3).route().address);
+        assert_ne!(public.route(), punch(3).route());
+        assert_eq!(public.route().kind, RouteKind::Address(AddressKind::Public));
+        assert_eq!(punch(3).route().to_string(), "punch 192.0.2.3:7420");
+        for (kind, label) in [
+            (RouteKind::from(AddressKind::Lan), "lan"),
+            (AddressKind::Vpn.into(), "vpn"),
+            (AddressKind::Public.into(), "public"),
+            (AddressKind::V6.into(), "v6"),
+            (AddressKind::Relay("fingerprint".into()).into(), "relay"),
+            (AddressKind::Other(9).into(), "other"),
+            (RouteKind::Punch, "punch"),
+        ] {
+            assert_eq!(kind.label(), label);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_hole_punch_that_wins_the_race_is_reported_as_one() {
+        // The stored address never answers; the lookup proposes a punch, and the punch connects.
+        let lookup = lookup_after(ms(100), Ok(vec![punch(8)]));
+        let run = run(vec![direct(1)], Some(lookup), |c| match c {
+            Candidate::Punch { .. } => Answer::Connects(ms(50)),
+            _ => Answer::Hangs,
+        })
+        .await;
+        let (won, _) = run.result.unwrap();
+        assert_eq!(won.route(), Route { kind: RouteKind::Punch, address: "192.0.2.8:7420".into() });
     }
 
     #[test]
