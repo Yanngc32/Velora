@@ -4795,6 +4795,7 @@ dependencies = [
  "anyhow",
  "openh264",
  "paranoid-android",
+ "quinn",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
