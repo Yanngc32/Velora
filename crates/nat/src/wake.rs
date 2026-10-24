@@ -4,11 +4,11 @@
 //! PC or the phone on the home Wi-Fi, never from the internet (a router drops a forwarded magic
 //! packet once it forgets the sleeping PC's ARP entry, and most refuse broadcast forwarding).
 
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 
 use anyhow::{bail, Context, Result};
 
-use crate::addresses::{local_macs, Ipv4Network};
+use crate::addresses::{classify, local_macs, AddressClass, Ipv4Network};
 
 /// A hardware (MAC) address.
 pub type Mac = [u8; 6];
@@ -50,16 +50,30 @@ pub fn format_mac(mac: &Mac) -> String {
 
 /// The IPv4 networks of this PC a broadcast can reach: those of its adapters that are up, have a
 /// usable MAC and a real address (see [`local_macs`], which lists real adapters before virtual
-/// ones). Blocking: async callers should use `spawn_blocking`.
+/// ones). A phone hides its adapters' MAC addresses from apps, which would leave that list empty
+/// although a magic packet needs only the network and not the sender's MAC: then every adapter
+/// that is up and has a real address counts. Blocking: async callers should use `spawn_blocking`.
 pub fn wake_networks() -> Vec<Ipv4Network> {
-    let mut networks: Vec<Ipv4Network> = Vec::new();
-    for network in local_macs().into_iter().flat_map(|adapter| adapter.networks) {
-        // /31 and /32 have no broadcast address.
-        if network.prefix_len < 31 && !networks.contains(&network) {
-            networks.push(network);
+    let with_mac = usable(local_macs().into_iter().flat_map(|adapter| adapter.networks));
+    if !with_mac.is_empty() {
+        return with_mac;
+    }
+    let adapters = netdev::get_interfaces().into_iter().filter(|i| i.is_up() && !i.is_loopback());
+    usable(adapters.flat_map(|i| i.ipv4).map(|net| Ipv4Network { addr: net.addr(), prefix_len: net.prefix_len() }))
+}
+
+/// Keeps what can carry a broadcast: no /31 or /32 (they have no broadcast address), nothing that is
+/// not an address of a real network (link-local, loopback, fake-IP ranges), and no repeats.
+fn usable(networks: impl IntoIterator<Item = Ipv4Network>) -> Vec<Ipv4Network> {
+    let mut list: Vec<Ipv4Network> = Vec::new();
+    for network in networks {
+        let class = classify(IpAddr::V4(network.addr));
+        let real = matches!(class, AddressClass::Private | AddressClass::Public | AddressClass::Shared);
+        if network.prefix_len < 31 && real && !list.contains(&network) {
+            list.push(network);
         }
     }
-    networks
+    list
 }
 
 /// The network `host` is on, among `networks`.
@@ -173,6 +187,20 @@ mod tests {
         assert_eq!(network_of(&networks, Ipv4Addr::new(172, 16, 0, 1)), None);
         assert_eq!(wifi.broadcast(), Ipv4Addr::new(192, 168, 1, 255));
         assert!(wake_lan_of(&MAC, Ipv4Addr::new(203, 0, 113, 5)).is_err());
+    }
+
+    #[test]
+    fn only_networks_that_can_carry_a_broadcast_are_kept() {
+        let kept = usable([
+            network(192, 168, 1, 20, 24),
+            network(192, 168, 1, 20, 24),
+            network(10, 0, 0, 5, 32),
+            network(10, 0, 0, 6, 31),
+            network(169, 254, 3, 4, 16),
+            network(127, 0, 0, 1, 8),
+            network(100, 64, 0, 9, 10),
+        ]);
+        assert_eq!(kept, [network(192, 168, 1, 20, 24), network(100, 64, 0, 9, 10)]);
     }
 
     #[test]
