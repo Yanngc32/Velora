@@ -80,11 +80,11 @@ use super::{
 };
 
 /// What the forwarder remembers for waking hosts, in the host's state directory.
-const KNOWN_FILE: &str = "relay_known.json";
+pub(super) const KNOWN_FILE: &str = "relay_known.json";
 /// Relays to register with whether or not the host has a public address, shaped like `known_hosts.json`.
-const RELAYS_FILE: &str = "relays.json";
+pub(super) const RELAYS_FILE: &str = "relays.json";
 /// Computers allowed to register here though they are not paired devices (`AllowRelayHost`).
-const HOSTS_FILE: &str = "relay_hosts.json";
+pub(super) const HOSTS_FILE: &str = "relay_hosts.json";
 /// Most relays a host is set to register with, and most computers allowed to register with it.
 pub const MAX_LISTED_RELAYS: usize = 16;
 pub const MAX_ALLOWED_HOSTS: usize = 64;

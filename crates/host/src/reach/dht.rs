@@ -422,9 +422,34 @@ fn slept(monotonic: Duration, wall: u64) -> bool {
 /// returned only when the key file is not a key; a file system that fails for the moment and everything the network
 /// does are waited out.
 pub async fn run(ctx: ReachContext) -> Result<()> {
+    let config = node_config(&ctx);
+    run_with(ctx, config, Timing::default()).await
+}
+
+/// How the host's node is set up in production: the public DHT, on every interface, with its table kept beside the key.
+fn public_config(ctx: &ReachContext) -> Config {
     let mut config = Config::new(Mode::Host);
     config.cache_path = Some(ctx.state_dir.path(CACHE_FILE));
-    run_with(ctx, config, Timing::default()).await
+    config
+}
+
+/// What [`run`] opens. In a test build it is [`offline`]: the unit tests of the host switch the DHT on through the
+/// runtime, which starts this task, and a unit test must never reach the public DHT.
+fn node_config(ctx: &ReachContext) -> Config {
+    let config = public_config(ctx);
+    #[cfg(test)]
+    let config = offline(config);
+    config
+}
+
+/// `config` with a node whose only way into the DHT is an address nobody answers at, and that listens on the loopback
+/// only: nothing it sends leaves the machine, and nothing from outside reaches it.
+#[cfg(test)]
+fn offline(mut config: Config) -> Config {
+    let nobody = std::net::SocketAddrV4::new(std::net::Ipv4Addr::new(192, 0, 2, 1), 6881);
+    config.default_nodes = velora_dht::node::DefaultNodes::fixed(vec![nobody]);
+    config.bind_address = Some(std::net::Ipv4Addr::LOCALHOST);
+    config
 }
 
 /// What [`run`] has set up and must take down again, however the task ends (aborted included). It clears the key and
@@ -1449,16 +1474,41 @@ mod tests {
         (ReachContext { stop: Stop::new(stopped), ..ctx }, scratch, stop)
     }
 
-    /// A node whose only way into the DHT is an address nobody answers at.
+    /// A node whose only way into the DHT is an address nobody answers at, with short waits.
     fn lonely_node(ctx: &ReachContext) -> Config {
-        let mut config = Config::new(Mode::Host);
-        config.cache_path = Some(ctx.state_dir.path(CACHE_FILE));
-        config.default_nodes = DefaultNodes::fixed(vec![SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), 6881)]);
-        config.bind_address = Some(Ipv4Addr::LOCALHOST);
+        let mut config = offline(public_config(ctx));
         config.request_timeout = Some(ms(200));
         config.publish_deadline = secs(1);
         config.resolve_deadline = secs(1);
         config
+    }
+
+    #[tokio::test]
+    async fn the_node_the_runtime_opens_reaches_the_public_dht_in_production_and_nobody_in_a_test() {
+        let (ctx, _scratch) = testing::context("e3-config");
+        // In production: the public DHT, on every interface, with the table beside the key.
+        let public = public_config(&ctx);
+        assert!(matches!(public.default_nodes, DefaultNodes::Public));
+        assert_eq!(public.bind_address, None);
+        assert_eq!(public.cache_path, Some(ctx.state_dir.path(CACHE_FILE)));
+
+        // What `run` opens in this build: nobody to ask, and the loopback only.
+        let config = node_config(&ctx);
+        let DefaultNodes::With(nodes) = &config.default_nodes else { panic!("the public DHT, in a test") };
+        assert_eq!(nodes.as_ref()(), [SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), 6881)]);
+        assert_eq!(config.bind_address, Some(Ipv4Addr::LOCALHOST));
+        assert_eq!(config.cache_path, public.cache_path, "and the table is still kept beside the key");
+    }
+
+    #[tokio::test]
+    async fn the_task_the_runtime_starts_works_offline_and_ends_when_told_to() {
+        let (ctx, _scratch, stop) = stoppable_host("e3-offline");
+        let task = tokio::spawn(run(ctx.clone()));
+        eventually("the key", || ctx.reach.read().dht_key.is_some()).await;
+        assert!(!task.is_finished());
+        stop.send(true).unwrap();
+        tokio::time::timeout(secs(5), task).await.expect("it ends when told to").unwrap().unwrap();
+        assert_eq!(ctx.reach.read().dht_key, None);
     }
 
     async fn eventually(what: &str, mut done: impl FnMut() -> bool) {

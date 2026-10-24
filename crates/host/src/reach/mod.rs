@@ -85,6 +85,19 @@ use socket::Multiplexer;
 
 /// File in the host's state directory that holds the three switches.
 const SWITCHES_FILE: &str = "reach.json";
+/// Every file the reach code keeps in the host's state directory, by name. The Windows service brings these over from
+/// the user's host when it takes the state over (`service.rs`): without them it starts with a new DHT key and new
+/// device secrets, and every paired device holds a secret that opens nothing. A file the reach code starts to keep is
+/// named once, in its own module, and listed here.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub const STATE_FILES: [&str; 6] = [
+    velora_dht::keys::FILE_NAME,
+    secrets::FILE,
+    SWITCHES_FILE,
+    relay::KNOWN_FILE,
+    relay::RELAYS_FILE,
+    relay::HOSTS_FILE,
+];
 /// How long a task gets to clean up after it is told to stop (the router mapping is removed there).
 const STOP_GRACE: Duration = Duration::from_secs(4);
 /// How long an aborted task is waited for: it is dropped at its next yield, which is at once.
@@ -1433,6 +1446,28 @@ mod tests {
         assert_eq!(wanted(&state), [Task::Housekeeping, Task::Mapping, Task::Punch, Task::Poll, Task::RelayServe]);
     }
 
+    #[test]
+    fn the_state_files_are_file_names_of_the_state_directory_and_none_is_listed_twice() {
+        let mut seen = std::collections::HashSet::new();
+        for file in STATE_FILES {
+            assert!(seen.insert(file), "{file} is listed twice");
+            assert!(!file.is_empty() && !file.contains(['/', '\\']), "{file} is not a file of the state directory");
+        }
+        // Each file the reach code names for itself is in the list.
+        let named = [
+            velora_dht::keys::FILE_NAME,
+            secrets::FILE,
+            SWITCHES_FILE,
+            relay::KNOWN_FILE,
+            relay::RELAYS_FILE,
+            relay::HOSTS_FILE,
+        ];
+        for file in named {
+            assert!(STATE_FILES.contains(&file), "{file} is not in STATE_FILES");
+        }
+        assert_eq!(named.len(), STATE_FILES.len());
+    }
+
     #[tokio::test]
     async fn setting_the_switches_saves_them_and_starts_the_tasks() {
         let (ctx, _scratch) = testing::context("runtime");
@@ -1442,7 +1477,7 @@ mod tests {
         runtime.set_switches(on).unwrap();
         assert_eq!(ctx.reach.read().switches, on);
         assert_eq!(Switches::load(&ctx.state_dir), on, "saved for the next start");
-        // The hooks are still stubs: tasks that end at once are not started over and over.
+        // The tasks are the real ones now and keep running: applying the switches again finds them and starts nothing.
         tokio::time::sleep(Duration::from_millis(50)).await;
         runtime.apply();
         runtime.stop().await;
