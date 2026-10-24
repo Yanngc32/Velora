@@ -235,10 +235,13 @@ pub struct Strings {
     pub relay_down_why: &'static str,
     pub relay_failed: &'static str,
     pub relay_too_old: &'static str,
+    pub relay_only: &'static str,
+    pub relay_busy: &'static str,
     pub reach_last: &'static str,
     pub reach_kind_lan: &'static str,
     pub reach_kind_vpn: &'static str,
     pub reach_kind_relay: &'static str,
+    pub reach_kind_punch: &'static str,
     pub reach_kind_other: &'static str,
     pub wake: &'static str,
     pub wake_tip: &'static str,
@@ -247,6 +250,8 @@ pub struct Strings {
     pub wake_no_relay: &'static str,
     pub wake_unsupported: &'static str,
     pub wake_failed: &'static str,
+    pub cli_paired: &'static str,
+    pub cli_connected: &'static str,
 }
 
 const PT: Strings = Strings {
@@ -472,10 +477,13 @@ const PT: Strings = Strings {
     relay_down_why: "Não registrado: {}",
     relay_failed: "Não foi possível: {}",
     relay_too_old: "O Velora deste PC é antigo demais para isso. Atualize-o (o programa que compartilha este PC) e tente de novo.",
+    relay_only: "Este PC só retransmite conexões: não há tela para mostrar.",
+    relay_busy: "'{}' já está aberto neste computador por um retransmissor, que leva uma só conexão por vez até um PC: feche a outra janela primeiro.",
     reach_last: "A última conexão chegou por",
     reach_kind_lan: "Rede local",
     reach_kind_vpn: "VPN",
     reach_kind_relay: "Outro PC seu (retransmissão)",
+    reach_kind_punch: "Direta pelos roteadores (hole punch)",
     reach_kind_other: "Outro caminho",
     wake: "Acordar",
     wake_tip: "Envia um sinal para acordar este PC, desta rede ou por meio de outro PC seu que esteja na rede dele.",
@@ -484,6 +492,8 @@ const PT: Strings = Strings {
     wake_no_relay: "Você não está na rede deste PC e nenhum PC seu lá conseguiu enviar o sinal. Um PC seu que fique ligado lá consegue, se “{}” estiver ligado.",
     wake_unsupported: "Este PC ainda não informou ao Velora como acordá-lo. Conecte nele uma vez enquanto estiver ligado, com um Velora recente nos dois lados.",
     wake_failed: "Não foi possível enviar o sinal para acordar: {}",
+    cli_paired: "Pareado com '{}'.",
+    cli_connected: "Conectado a '{}' por: {}",
 };
 
 const EN: Strings = Strings {
@@ -709,10 +719,13 @@ const EN: Strings = Strings {
     relay_down_why: "Not registered: {}",
     relay_failed: "Could not do that: {}",
     relay_too_old: "This PC's Velora is too old for this. Update it (the program that shares this PC) and try again.",
+    relay_only: "This PC only relays connections: there is no screen to show.",
+    relay_busy: "'{}' is already open on this computer through a relay, which carries one connection to a host at a time: close the other window first.",
     reach_last: "The last connection came in through",
     reach_kind_lan: "Local network",
     reach_kind_vpn: "VPN",
     reach_kind_relay: "Another PC of yours (relay)",
+    reach_kind_punch: "Direct through the routers (hole punch)",
     reach_kind_other: "Another route",
     wake: "Wake",
     wake_tip: "Sends a signal to wake this PC, from this network or through another PC of yours on its network.",
@@ -721,6 +734,8 @@ const EN: Strings = Strings {
     wake_no_relay: "You are not on this PC's network, and none of your PCs there could send the signal. A PC of yours that stays on there can, if “{}” is on.",
     wake_unsupported: "This PC has not told Velora how to wake it. Connect to it once while it is on, with a recent Velora on both sides.",
     wake_failed: "Could not send the wake-up signal: {}",
+    cli_paired: "Paired with '{}'.",
+    cli_connected: "Connected to '{}' through: {}",
 };
 
 pub fn current() -> &'static Strings {
@@ -808,10 +823,13 @@ mod tests {
             relay_down_why,
             relay_failed,
             relay_too_old,
+            relay_only,
+            relay_busy,
             reach_last,
             reach_kind_lan,
             reach_kind_vpn,
             reach_kind_relay,
+            reach_kind_punch,
             reach_kind_other,
             wake,
             wake_tip,
@@ -820,6 +838,8 @@ mod tests {
             wake_no_relay,
             wake_unsupported,
             wake_failed,
+            cli_paired,
+            cli_connected,
         ];
         for (name, pt, en) in texts {
             assert!(!pt.trim().is_empty() && !en.trim().is_empty(), "{name} is empty in one language");

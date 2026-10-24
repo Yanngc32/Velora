@@ -224,6 +224,8 @@ impl FileManager {
         self.runtime.spawn(async move {
             let result = async {
                 let state = StateDir::open(config_dir, "client")?;
+                // A session of this computer through a relay to `host` keeps it: this connection would take it over.
+                crate::free_relay(&state, &host, super::strings::current())?;
                 hosts::connect_files(&state, &host, &name, password.as_deref()).await
             }
             .await;
@@ -1078,6 +1080,46 @@ pub fn human_size(bytes: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
+    use velora_protocol::{identity::KnownHost, tls::Fingerprint};
+
+    use super::*;
+
+    /// Whichever way a pane asks for a computer (opening, switching, Retry), a session that holds the relay to it is
+    /// not displaced: the pane says so in the user's language and nothing is dialed (the address is a documentation one).
+    #[test]
+    fn a_pane_for_a_computer_that_a_session_holds_the_relay_to_says_so_and_dials_nothing() {
+        let dir = std::env::temp_dir().join(format!("velora-p2-files-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let state = StateDir::open(Some(dir.clone()), "client").unwrap();
+        let office = KnownHost {
+            name: "Office PC".into(),
+            address: "192.0.2.10:7420".into(),
+            fingerprint: Fingerprint([1; 32]).to_base64(),
+            ..Default::default()
+        };
+        state.save(StateDir::KNOWN_HOSTS, &vec![office.clone()]).unwrap();
+        let _session = crate::claim_relay(&state, &office.fingerprint).expect("a session takes the relay");
+
+        let manager =
+            FileManager::open("Office PC".into(), Some(dir.clone()), "Test PC".into(), &egui::Context::default())
+                .unwrap();
+        let expected = fill(super::super::strings::current().relay_busy, &["Office PC"]);
+        let began = Instant::now();
+        let shown = loop {
+            let link = manager.links.get("Office PC").unwrap().clone();
+            if let Link::Failed(error) = &*link.lock().unwrap() {
+                break error.clone();
+            }
+            assert!(began.elapsed() < Duration::from_secs(10), "the pane never said why it did not connect");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(shown, expected);
+        drop(manager);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn sizes_read_like_a_file_manager() {
         assert_eq!(super::human_size(0), "0 B");

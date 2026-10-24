@@ -30,7 +30,7 @@ use clap::{Parser, Subcommand};
 use gui::strings::{fill, Strings};
 use settings::Settings;
 use velora_client_core::{
-    hosts, FrameSlot, InputSender, OfferEvent, Route, Session, VideoFrame, VideoOutput, WakeOutcome,
+    hosts, FrameSlot, InputSender, OfferEvent, Route, RouteKind, Session, VideoFrame, VideoOutput, WakeOutcome,
 };
 use velora_protocol::{
     identity::{KnownHost, StateDir},
@@ -174,6 +174,7 @@ fn run() -> Result<()> {
     let device_name = settings.device_name;
     let password = if cli.password_stdin { Some(read_password()?).filter(|p| !p.is_empty()) } else { None };
     let password = password.as_deref();
+    let s = gui::strings::current();
     match command {
         Command::Send { .. } => unreachable!("handled above"),
         Command::Update => {
@@ -194,7 +195,7 @@ fn run() -> Result<()> {
             Ok(())
         }
         Command::Wake { host } => {
-            println!("{}", runtime.block_on(wake(&state, &host, gui::strings::current()))?);
+            println!("{}", runtime.block_on(wake(&state, &host, s))?);
             Ok(())
         }
         Command::Pair { address, code, name, offer, also } => {
@@ -206,7 +207,7 @@ fn run() -> Result<()> {
             if shows_nothing(session.width, session.height) {
                 // Paired all the same: the point of pairing with a relay is that this device can use it.
                 session.close();
-                println!("Paired with '{}'. {ONLY_RELAYS}", session.host_name);
+                println!("{}", paired_without_screen(s, &session.host_name));
                 return Ok(());
             }
             println!("Paired with '{}'. Next time: velora connect {}", session.host_name, session.host_name);
@@ -216,19 +217,19 @@ fn run() -> Result<()> {
             run_window(&runtime, event_loop, session, slot, share_clipboard)
         }
         Command::Connect { host } => {
-            let paired = free_relay(&state, &host)?;
+            let paired = free_relay(&state, &host, s)?;
             let (proxy, event_loop) = new_event_loop()?;
             let slot = Arc::new(FrameSlot::default());
             let output = VideoOutput::Decoded { slot: slot.clone(), on_frame: redraw_callback(proxy) };
             let session = runtime.block_on(hosts::connect(&state, &host, &device_name, password, output))?;
-            require_screen(&session)?;
-            println!("Connected to '{}' through {}.", session.host_name, way_in(&state, &session));
+            require_screen(&session, s)?;
+            println!("{}", connected_line(s, &session.host_name, &way_in(&state, &session, s)));
             // Held for as long as the window lives: the operating system frees it when the process ends, however it does.
             let _claim = hold_relay(&state, paired.as_deref(), session.route());
             run_window(&runtime, event_loop, session, slot, share_clipboard)
         }
         Command::Bench { host, seconds } => runtime.block_on(async {
-            let paired = free_relay(&state, &host)?;
+            let paired = free_relay(&state, &host, s)?;
             let frames = Arc::new(AtomicU32::new(0));
             let counter = frames.clone();
             let on_frame = Arc::new(move || {
@@ -236,14 +237,13 @@ fn run() -> Result<()> {
             });
             let output = VideoOutput::Decoded { slot: Arc::new(FrameSlot::default()), on_frame };
             let session = hosts::connect(&state, &host, &device_name, password, output).await?;
-            require_screen(&session)?;
+            require_screen(&session, s)?;
             let _claim = hold_relay(&state, paired.as_deref(), session.route());
             println!(
-                "connected to '{}' ({}x{}) through {}",
-                session.host_name,
+                "{} ({}x{})",
+                connected_line(s, &session.host_name, &way_in(&state, &session, s)),
                 session.width,
-                session.height,
-                way_in(&state, &session)
+                session.height
             );
             tokio::time::sleep(Duration::from_secs(seconds)).await;
             let n = frames.load(Ordering::Relaxed);
@@ -297,21 +297,23 @@ fn wake_report(outcome: Result<WakeOutcome>, s: &Strings) -> Result<String> {
     }
 }
 
-/// Which way in a connection took, for the line `velora connect` prints. The words are the launcher's (`reach_kind_*`
-/// in `strings.rs`) in running text, in English like the rest of this program's lines: `strings.rs` is the launcher's.
-/// A connection made by hole punching is a direct one to the host's public endpoint, and the route cannot tell it from
-/// one to an address the router maps: both are the public address here.
-fn route_words(route: &Route, known: &[KnownHost]) -> String {
-    let address = &route.address;
-    match &route.kind {
-        AddressKind::Lan => format!("the local network ({address})"),
-        AddressKind::Vpn => format!("the VPN ({address})"),
-        AddressKind::Public => format!("the public address ({address})"),
-        AddressKind::V6 => format!("its IPv6 address ({address})"),
-        AddressKind::Relay(fingerprint) => {
-            format!("another PC of yours (relay) {} at {address}", relay_name(fingerprint, known))
+/// Which way in a connection took, in the launcher's words (`reach_kind_*` and the like in `strings.rs`) and in its form
+/// (`last_reached_text` there): the label, a middle dot and the address, with the relay's name between them for a relay.
+fn route_words(route: &Route, known: &[KnownHost], s: &Strings) -> String {
+    let (label, relay) = match &route.kind {
+        RouteKind::Punch => (s.reach_kind_punch, None),
+        RouteKind::Address(AddressKind::Lan) => (s.reach_kind_lan, None),
+        RouteKind::Address(AddressKind::Vpn) => (s.reach_kind_vpn, None),
+        RouteKind::Address(AddressKind::Public) => (s.reach_public, None),
+        RouteKind::Address(AddressKind::V6) => (s.reach_v6, None),
+        RouteKind::Address(AddressKind::Relay(fingerprint)) => {
+            (s.reach_kind_relay, Some(relay_name(fingerprint, known)))
         }
-        AddressKind::Other(_) => format!("another route ({address})"),
+        RouteKind::Address(AddressKind::Other(_)) => (s.reach_kind_other, None),
+    };
+    match relay {
+        Some(name) => format!("{label} · {name} · {}", route.address),
+        None => format!("{label} · {}", route.address),
     }
 }
 
@@ -319,30 +321,38 @@ fn route_words(route: &Route, known: &[KnownHost]) -> String {
 /// user's, but not always one this device has paired with.
 fn relay_name(fingerprint: &str, known: &[KnownHost]) -> String {
     match known.iter().find(|h| h.fingerprint == fingerprint) {
-        Some(host) => format!("'{}'", host.name),
+        Some(host) => host.name.clone(),
         None => Fingerprint::from_base64(fingerprint).map_or_else(|_| fingerprint.to_string(), |f| f.short()),
     }
 }
 
 /// How `session` reached its host, in words (see [`route_words`]).
-fn way_in(state: &StateDir, session: &Session) -> String {
-    route_words(session.route(), &hosts::list(state).unwrap_or_default())
+fn way_in(state: &StateDir, session: &Session, s: &Strings) -> String {
+    route_words(session.route(), &hosts::list(state).unwrap_or_default(), s)
 }
 
-/// What the user is told when a host only relays (`velora-host --relay-only`): it welcomes a session with no screen at all,
-/// and a window for it would stay empty.
-const ONLY_RELAYS: &str = "This PC only relays connections: there is no screen to show.";
+/// The line `velora connect` prints once the session is up, and `velora bench` starts with.
+fn connected_line(s: &Strings, host: &str, way: &str) -> String {
+    fill(s.cli_connected, &[host, way])
+}
 
-/// Whether a welcome of this size has nothing to show.
+/// What `velora pair` says when the host only relays: it is paired, and there is nothing more to do with it here.
+fn paired_without_screen(s: &Strings, host: &str) -> String {
+    format!("{} {}", fill(s.cli_paired, &[host]), s.relay_only)
+}
+
+/// Whether a welcome of this size has nothing to show: what a host that only relays (`velora-host --relay-only`) sends,
+/// and a window for it would stay empty.
 fn shows_nothing(width: u16, height: u16) -> bool {
     width == 0 || height == 0
 }
 
-/// Ends a session that has no screen, with [`ONLY_RELAYS`]: the launcher shows the last error line of a failed session.
-fn require_screen(session: &Session) -> Result<()> {
+/// Ends a session that has no screen, with `relay_only` for the error: the launcher shows the last error line of a failed
+/// session.
+fn require_screen(session: &Session, s: &Strings) -> Result<()> {
     if shows_nothing(session.width, session.height) {
         session.close();
-        bail!(ONLY_RELAYS);
+        bail!(s.relay_only);
     }
     Ok(())
 }
@@ -390,22 +400,18 @@ fn relay_busy(state: &StateDir, fingerprint: &str) -> bool {
 /// The fingerprint of the paired host called `host` (a name or an address, as `hosts::connect` takes it) once no other
 /// window of this computer holds a relay to it, else an error saying so. Before the connection: afterwards the relay would
 /// already have dropped the other window. A host that is not paired is left for `hosts::connect` to complain about.
-fn free_relay(state: &StateDir, host: &str) -> Result<Option<String>> {
+fn free_relay(state: &StateDir, host: &str, s: &Strings) -> Result<Option<String>> {
     let known = hosts::list(state).unwrap_or_default();
     let Some(paired) = known.iter().find(|h| h.name == host || h.address == host) else { return Ok(None) };
     if relay_busy(state, &paired.fingerprint) {
-        bail!(
-            "'{}' is already open on this computer through a relay, which carries one connection to a host at a time: \
-             close that window first.",
-            paired.name
-        );
+        bail!(fill(s.relay_busy, &[&paired.name]));
     }
     Ok(Some(paired.fingerprint.clone()))
 }
 
 /// Takes the relay for a session that came through one (`route`), else nothing.
 fn hold_relay(state: &StateDir, paired: Option<&str>, route: &Route) -> Option<RelayClaim> {
-    let fingerprint = paired.filter(|_| matches!(route.kind, AddressKind::Relay(_)))?;
+    let fingerprint = paired.filter(|_| matches!(route.kind, RouteKind::Address(AddressKind::Relay(_))))?;
     claim_relay(state, fingerprint)
 }
 
@@ -925,8 +931,8 @@ mod tests {
         }
     }
 
-    fn route(kind: AddressKind, address: &str) -> Route {
-        Route { kind, address: address.into() }
+    fn route(kind: impl Into<RouteKind>, address: &str) -> Route {
+        Route { kind: kind.into(), address: address.into() }
     }
 
     fn relay(tag: u8) -> AddressKind {
@@ -1003,41 +1009,58 @@ mod tests {
         }
     }
 
+    /// The launcher words a route as its label, a middle dot and the address (`last_reached_text`): so does the command
+    /// line, in the same language, with the relay's name between the two for a relay.
     #[test]
     fn the_route_is_told_in_the_launchers_words() {
-        let laptop = host("Laptop", "192.0.2.20:7420", 9);
-        let known = [host("Office PC", "192.0.2.10:7420", 1), laptop];
-        let words = |kind, address| route_words(&route(kind, address), &known);
-        assert_eq!(words(AddressKind::Lan, "192.0.2.10:7420"), "the local network (192.0.2.10:7420)");
-        assert_eq!(words(AddressKind::Vpn, "198.51.100.5:7420"), "the VPN (198.51.100.5:7420)");
-        assert_eq!(words(AddressKind::Public, "203.0.113.5:7420"), "the public address (203.0.113.5:7420)");
-        assert_eq!(words(AddressKind::V6, "[2001:db8::5]:7420"), "its IPv6 address ([2001:db8::5]:7420)");
-        assert_eq!(words(AddressKind::Other(7), "192.0.2.77:7420"), "another route (192.0.2.77:7420)");
-        // A relay is named when this device has paired with it, and else by its fingerprint.
-        assert_eq!(words(relay(9), "198.51.100.4:7420"), "another PC of yours (relay) 'Laptop' at 198.51.100.4:7420");
-        let stranger = format!("another PC of yours (relay) {} at 198.51.100.4:7420", Fingerprint([5; 32]).short());
-        assert_eq!(words(relay(5), "198.51.100.4:7420"), stranger);
-        // A relay that is not even a fingerprint is shown as it came.
-        let garbled = words(AddressKind::Relay("not a fingerprint".into()), "198.51.100.4:7420");
-        assert_eq!(garbled, "another PC of yours (relay) not a fingerprint at 198.51.100.4:7420");
+        let known = [host("Office PC", "192.0.2.10:7420", 1), host("Laptop", "192.0.2.20:7420", 9)];
+        for s in strings::all() {
+            let words = |kind: RouteKind, address| route_words(&route(kind, address), &known, s);
+            for (kind, label, address) in [
+                (AddressKind::Lan, s.reach_kind_lan, "192.0.2.10:7420"),
+                (AddressKind::Vpn, s.reach_kind_vpn, "198.51.100.5:7420"),
+                (AddressKind::Public, s.reach_public, "203.0.113.5:7420"),
+                (AddressKind::V6, s.reach_v6, "[2001:db8::5]:7420"),
+                (AddressKind::Other(7), s.reach_kind_other, "192.0.2.77:7420"),
+            ] {
+                assert_eq!(words(kind.into(), address), format!("{label} · {address}"));
+            }
+            // A hole punch is told apart from the public address it ends at.
+            let punched = words(RouteKind::Punch, "203.0.113.5:7420");
+            assert_eq!(punched, format!("{} · 203.0.113.5:7420", s.reach_kind_punch));
+            assert_ne!(punched, words(AddressKind::Public.into(), "203.0.113.5:7420"));
+            // A relay is named when this device has paired with it, and else by its fingerprint.
+            let relayed = |name: &str| format!("{} · {name} · 198.51.100.4:7420", s.reach_kind_relay);
+            assert_eq!(words(relay(9).into(), "198.51.100.4:7420"), relayed("Laptop"));
+            assert_eq!(words(relay(5).into(), "198.51.100.4:7420"), relayed(&Fingerprint([5; 32]).short()));
+            // A relay that is not even a fingerprint is shown as it came.
+            let garbled = words(AddressKind::Relay("not a fingerprint".into()).into(), "198.51.100.4:7420");
+            assert_eq!(garbled, relayed("not a fingerprint"));
+        }
     }
 
-    /// The launcher words its routes (`reach_kind_*`); the command line says the same things in running text. If one of
-    /// them is reworded there, this says to reword it here.
     #[test]
-    fn the_route_words_are_the_launchers_english_ones() {
-        let en = strings::all()[1];
-        assert_eq!(en.reach_kind_lan, "Local network", "strings::all() lists Portuguese first, then English");
-        for (kind, label) in [
-            (AddressKind::Lan, en.reach_kind_lan),
-            (AddressKind::Vpn, en.reach_kind_vpn),
-            (AddressKind::Public, en.reach_public),
-            (AddressKind::V6, en.reach_v6),
-            (relay(1), en.reach_kind_relay),
-            (AddressKind::Other(7), en.reach_kind_other),
+    fn the_lines_of_the_command_line_come_from_the_strings_in_both_languages() {
+        for s in strings::all() {
+            let way = route_words(&route(AddressKind::Lan, "192.0.2.10:7420"), &[], s);
+            let line = connected_line(s, "Office PC", &way);
+            assert_eq!(line, fill(s.cli_connected, &["Office PC", &way]));
+            assert!(line.contains("Office PC") && line.ends_with(&way), "{line}");
+            // A host that only relays is paired, and told why there is nothing to see.
+            let paired = paired_without_screen(s, "Relay PC");
+            assert_eq!(paired, format!("{} {}", fill(s.cli_paired, &["Relay PC"]), s.relay_only));
+            assert!(paired.contains("Relay PC") && paired.ends_with(s.relay_only), "{paired}");
+        }
+        // Each language has its own words for them.
+        let [pt, en] = strings::all();
+        for (pt, en) in [
+            (pt.cli_connected, en.cli_connected),
+            (pt.cli_paired, en.cli_paired),
+            (pt.relay_only, en.relay_only),
+            (pt.relay_busy, en.relay_busy),
+            (pt.reach_kind_punch, en.reach_kind_punch),
         ] {
-            let said = route_words(&route(kind.clone(), "192.0.2.1:7420"), &[]);
-            assert!(said.to_lowercase().contains(&label.to_lowercase()), "{kind:?}: {said:?} does not say {label:?}");
+            assert_ne!(pt, en);
         }
     }
 
@@ -1047,7 +1070,6 @@ mod tests {
         // Either side being nothing leaves nothing to draw.
         assert!(shows_nothing(0, 1080) && shows_nothing(1920, 0));
         assert!(!shows_nothing(1920, 1080) && !shows_nothing(1, 1));
-        assert_eq!(ONLY_RELAYS, "This PC only relays connections: there is no screen to show.");
     }
 
     #[test]
@@ -1098,24 +1120,27 @@ mod tests {
         scratch.pair(&[office.clone(), host("Laptop", "192.0.2.20:7420", 9)]);
         let state = scratch.state();
         let relayed = route(relay(9), "198.51.100.4:7420");
-        // Nothing is held: it may connect, by name or by address.
-        for name in ["Office PC", "192.0.2.10:7420"] {
-            assert_eq!(free_relay(&state, name).unwrap().as_deref(), Some(office.fingerprint.as_str()));
+        for s in strings::all() {
+            // Nothing is held: it may connect, by name or by address.
+            for name in ["Office PC", "192.0.2.10:7420"] {
+                assert_eq!(free_relay(&state, name, s).unwrap().as_deref(), Some(office.fingerprint.as_str()));
+            }
+            // A host that is not paired is left for the connection to complain about.
+            assert_eq!(free_relay(&state, "Nowhere", s).unwrap(), None);
         }
-        // A host that is not paired is left for the connection to complain about.
-        assert_eq!(free_relay(&state, "Nowhere").unwrap(), None);
         // The first window came through a relay and holds it.
         let first = hold_relay(&state, Some(&office.fingerprint), &relayed).expect("a relayed session claims");
-        for name in ["Office PC", "192.0.2.10:7420"] {
-            let refused = free_relay(&state, name).unwrap_err().to_string();
-            assert!(refused.starts_with("'Office PC' is already open on this computer through a relay"), "{refused}");
-            assert!(refused.ends_with("close that window first."), "{refused}");
+        for s in strings::all() {
+            for name in ["Office PC", "192.0.2.10:7420"] {
+                let refused = free_relay(&state, name, s).unwrap_err().to_string();
+                assert_eq!(refused, fill(s.relay_busy, &["Office PC"]));
+            }
+            // Another computer is not in the way.
+            assert!(free_relay(&state, "Laptop", s).is_ok());
         }
-        // Another computer is not in the way.
-        assert!(free_relay(&state, "Laptop").is_ok());
         // Once that window is closed, the next one may.
         drop(first);
-        assert!(free_relay(&state, "Office PC").is_ok());
+        assert!(free_relay(&state, "Office PC", strings::current()).is_ok());
     }
 
     #[test]
@@ -1123,7 +1148,15 @@ mod tests {
         let scratch = Scratch::new("hold");
         let state = scratch.state();
         let office = Fingerprint([1; 32]).to_base64();
-        for kind in [AddressKind::Lan, AddressKind::Vpn, AddressKind::Public, AddressKind::V6, AddressKind::Other(4)] {
+        let direct: [RouteKind; 6] = [
+            AddressKind::Lan.into(),
+            AddressKind::Vpn.into(),
+            AddressKind::Public.into(),
+            AddressKind::V6.into(),
+            AddressKind::Other(4).into(),
+            RouteKind::Punch,
+        ];
+        for kind in direct {
             let direct = route(kind, "192.0.2.10:7420");
             assert!(hold_relay(&state, Some(&office), &direct).is_none() && !relay_busy(&state, &office));
         }
