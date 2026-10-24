@@ -144,10 +144,73 @@ fn advice_text(advice: &Advice, s: &Strings) -> String {
     }
 }
 
+/// What the host says to a change that only an administrator may make: it runs as the Windows
+/// service, and the launcher's user is no administrator.
+fn is_admin_refusal(error: &str) -> bool {
+    error.contains("only an administrator")
+}
+
+/// The words for an error from the host: plain for the one that a person can do something about,
+/// the host's own for the rest.
+pub(super) fn friendly_error(s: &Strings, error: &str) -> String {
+    if is_admin_refusal(error) {
+        s.reach_admin_needed.to_string()
+    } else {
+        error.to_string()
+    }
+}
+
+/// How soon after the card sent a request a refusal counts as the answer to it.
+const ASKED_SECONDS: f64 = 5.0;
+/// How long the card keeps saying that its change was refused. The launcher's own banner for an
+/// error goes with the next status, a second later.
+const REFUSED_SECONDS: f64 = 30.0;
+
+/// What the card remembers between frames, on egui's clock: when it last sent a request, and when
+/// the host last refused one of its requests.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct Asked {
+    sent: Option<f64>,
+    refused: Option<f64>,
+}
+
+impl Asked {
+    /// The memory after a frame at `now`, in which the card sent a request or not (`sent`) and the
+    /// host's last error was `error`. A refusal to a request that the card did not send, a
+    /// device removed by a user without rights, say, is not this card's to explain.
+    fn after(self, now: f64, sent: bool, error: Option<&str>) -> Self {
+        let sent = if sent { Some(now) } else { self.sent };
+        let answered = error.is_some_and(is_admin_refusal) && sent.is_some_and(|at| now - at <= ASKED_SECONDS);
+        Self { sent, refused: if answered { Some(now) } else { self.refused } }
+    }
+
+    fn refused(&self, now: f64) -> bool {
+        self.refused.is_some_and(|at| now - at < REFUSED_SECONDS)
+    }
+
+    /// Seconds from `now` until the card stops saying so.
+    fn next_change(&self, now: f64) -> Option<f64> {
+        self.refused.map(|at| REFUSED_SECONDS - (now - at)).filter(|left| *left > 0.0)
+    }
+}
+
+fn asked_id() -> egui::Id {
+    egui::Id::unique("reach-asked")
+}
+
 /// The card on This PC. A host that predates standalone reach (`None`) gets nothing, not even the
-/// space under it. A flipped switch comes back as the request to send.
-pub(super) fn reach_card(ui: &mut egui::Ui, s: &Strings, reach: Option<&ReachStatus>) -> Option<Request> {
+/// space under it. A flipped switch comes back as the request to send; `error` is the host's answer
+/// to the last request that failed, which the card explains when it is a refusal of its own.
+pub(super) fn reach_card(
+    ui: &mut egui::Ui,
+    s: &Strings,
+    reach: Option<&ReachStatus>,
+    error: Option<&str>,
+) -> Option<Request> {
     let reach = reach?;
+    let ctx = ui.ctx().clone();
+    let now = ui.input(|input| input.time);
+    let asked = ctx.data(|data| data.get_temp::<Asked>(asked_id())).unwrap_or_default().after(now, false, error);
     let current = Switches::of(reach);
     let mut next = current;
     card(ui, |ui| {
@@ -155,6 +218,10 @@ pub(super) fn reach_card(ui: &mut egui::Ui, s: &Strings, reach: Option<&ReachSta
         ui.add_space(4.0);
         ui.add(egui::Label::new(RichText::new(s.reach_text).color(WEAK)).wrap());
         ui.add_space(16.0);
+        if asked.refused(now) {
+            banner(ui, s.reach_admin_needed, ERROR);
+            ui.add_space(16.0);
+        }
 
         switch_row(ui, s.reach_standalone, s.reach_standalone_text, &mut next.standalone);
         if reach.standalone {
@@ -173,7 +240,13 @@ pub(super) fn reach_card(ui: &mut egui::Ui, s: &Strings, reach: Option<&ReachSta
         }
     });
     ui.add_space(16.0);
-    (next != current).then(|| next.request())
+    let request = (next != current).then(|| next.request());
+    let asked = asked.after(now, request.is_some(), None);
+    ctx.data_mut(|data| data.insert_temp(asked_id(), asked));
+    if let Some(left) = asked.next_change(now) {
+        ctx.request_repaint_after(Duration::from_secs_f64(left));
+    }
+    request
 }
 
 /// Under the QR code of This PC: where its link also reaches this computer from other networks,
@@ -763,7 +836,7 @@ mod tests {
             let mut frames = Frames::new();
             let painted = frames.run(Vec::new(), |ui| {
                 let top = ui.cursor().min;
-                assert_eq!(reach_card(ui, s, None), None);
+                assert_eq!(reach_card(ui, s, None, None), None);
                 // Not even the space the card leaves under it.
                 assert_eq!(ui.cursor().min, top);
             });
@@ -776,7 +849,7 @@ mod tests {
         for s in strings::all() {
             let mut frames = Frames::new();
             let status = reach();
-            let painted = frames.run(Vec::new(), |ui| assert_eq!(reach_card(ui, s, Some(&status)), None));
+            let painted = frames.run(Vec::new(), |ui| assert_eq!(reach_card(ui, s, Some(&status), None), None));
             for text in [
                 s.reach_title,
                 s.reach_text,
@@ -819,7 +892,7 @@ mod tests {
         {
             let mut frames = Frames::new();
             let painted = frames.run(Vec::new(), |ui| {
-                reach_card(ui, s, Some(&status));
+                reach_card(ui, s, Some(&status), None);
             });
             assert!(painted.has(s.reach_mapping_closed) && painted.has(s.reach_mapping_closed_detail));
             assert!(painted.has(&advice), "{advice:?} was not painted, only {:#?}", painted.texts);
@@ -833,7 +906,7 @@ mod tests {
         let mut frames = Frames::new();
         let status = ReachStatus { standalone: false, ..reach() };
         let painted = frames.run(Vec::new(), |ui| {
-            reach_card(ui, s, Some(&status));
+            reach_card(ui, s, Some(&status), None);
         });
         assert!(painted.has(s.reach_standalone) && painted.has(s.reach_dht) && painted.has(s.reach_relay));
         for gone in [s.reach_mapping_open, s.reach_public, s.reach_v6, s.reach_relays, "203.0.113.7:51820"] {
@@ -879,7 +952,7 @@ mod tests {
         let reported = Switches::of(&status);
         let mut frames = Frames::new();
         let first = frames.run(Vec::new(), |ui| {
-            reach_card(ui, s, Some(&status));
+            reach_card(ui, s, Some(&status), None);
         });
         // In the order they are drawn: standalone, DHT, relay for others.
         let flipped = [
@@ -890,13 +963,78 @@ mod tests {
         assert_eq!(first.switches.len(), flipped.len());
         for (track, want) in first.switches.iter().zip(flipped) {
             let mut sent = None;
-            frames.run(click(track.center()), |ui| sent = reach_card(ui, s, Some(&status)));
+            frames.run(click(track.center()), |ui| sent = reach_card(ui, s, Some(&status), None));
             assert_eq!(sent, Some(want.request()), "clicking the switch at {track:?}");
         }
         // A frame with no click asks for nothing.
         let mut sent = None;
-        frames.run(Vec::new(), |ui| sent = reach_card(ui, s, Some(&status)));
+        frames.run(Vec::new(), |ui| sent = reach_card(ui, s, Some(&status), None));
         assert_eq!(sent, None);
+    }
+
+    /// What the host answers a change that a user without rights makes under the service
+    /// (`Shared::control` in the host's `server.rs`).
+    const REFUSAL: &str = "only an administrator can change this computer's access";
+
+    #[test]
+    fn a_refusal_for_lack_of_rights_is_told_in_plain_words() {
+        assert!(is_admin_refusal(REFUSAL) && !is_admin_refusal("saving the standalone reach switches: disk full"));
+        for s in strings::all() {
+            assert_eq!(friendly_error(s, REFUSAL), s.reach_admin_needed);
+            // Any other error stays as the host worded it.
+            assert_eq!(friendly_error(s, "this device is not paired"), "this device is not paired");
+        }
+    }
+
+    #[test]
+    fn the_card_explains_a_refused_change_where_it_was_made() {
+        let s = strings::current();
+        let status = reach();
+        let mut frames = Frames::new();
+        let run = |frames: &mut Frames, events: Vec<Event>, error: Option<&str>| {
+            let mut sent = None;
+            let painted = frames.run(events, |ui| sent = reach_card(ui, s, Some(&status), error));
+            (painted.has(s.reach_admin_needed), sent)
+        };
+        let first = frames.run(Vec::new(), |ui| _ = reach_card(ui, s, Some(&status), None));
+        // A refusal of something else that the user did, such as removing a device, is not for this card.
+        assert!(!run(&mut frames, Vec::new(), Some(REFUSAL)).0);
+        // A switch is flipped, and the host refuses: the card says why, in the same frame the error
+        // arrives and for as long afterwards as the launcher's own banner is gone.
+        let (_, sent) = run(&mut frames, click(first.switches[1].center()), None);
+        assert!(sent.is_some());
+        assert!(run(&mut frames, Vec::new(), Some(REFUSAL)).0);
+        assert!(run(&mut frames, Vec::new(), None).0);
+        frames.advance(REFUSED_SECONDS - 1.0);
+        assert!(run(&mut frames, Vec::new(), None).0);
+        // Then it lets go.
+        frames.advance(2.0);
+        assert!(!run(&mut frames, Vec::new(), None).0);
+        // A refusal long after the card's last request is not an answer to it, and neither is
+        // another kind of error right after one.
+        run(&mut frames, click(first.switches[1].center()), None);
+        assert!(!run(&mut frames, Vec::new(), Some("this device is not paired")).0);
+        frames.advance(ASKED_SECONDS + 1.0);
+        assert!(!run(&mut frames, Vec::new(), Some(REFUSAL)).0);
+    }
+
+    #[test]
+    fn what_the_card_remembers_of_its_requests_follows_the_clock() {
+        let asked = Asked::default();
+        // A request, then the refusal in time: refused; a refusal alone: not.
+        assert_eq!(asked.after(10.0, false, Some(REFUSAL)).refused, None);
+        let sent = asked.after(10.0, true, None);
+        assert_eq!(sent, Asked { sent: Some(10.0), refused: None });
+        let refused = sent.after(12.0, false, Some(REFUSAL));
+        assert_eq!(refused, Asked { sent: Some(10.0), refused: Some(12.0) });
+        // Refused while it lasts, and its end is known.
+        assert!(refused.refused(12.0) && refused.refused(12.0 + REFUSED_SECONDS - 0.1));
+        assert!(!refused.refused(12.0 + REFUSED_SECONDS));
+        assert_eq!(refused.next_change(13.0), Some(REFUSED_SECONDS - 1.0));
+        assert_eq!(refused.next_change(12.0 + REFUSED_SECONDS), None);
+        assert_eq!(Asked::default().next_change(1.0), None);
+        // Too late to be an answer.
+        assert_eq!(sent.after(10.0 + ASKED_SECONDS + 0.1, false, Some(REFUSAL)).refused, None);
     }
 
     #[test]
@@ -1001,9 +1139,15 @@ mod tests {
                 statuses.push(ReachStatus { last_reached: Some((kind, "192.0.2.5:7420".into())), ..reach() });
             }
             for status in &statuses {
-                shown.extend(frames.run(Vec::new(), |ui| _ = reach_card(ui, s, Some(status))).texts);
+                shown.extend(frames.run(Vec::new(), |ui| _ = reach_card(ui, s, Some(status), None)).texts);
             }
             shown.extend(frames.run(Vec::new(), |ui| pair_note(ui, s, Some(&reach()))).texts);
+            // The refusal of a change by a user without rights: a switch is flipped, the host says no.
+            let status = reach();
+            let flip = frames.run(Vec::new(), |ui| _ = reach_card(ui, s, Some(&status), None)).switches[1].center();
+            frames.run(click(flip), |ui| _ = reach_card(ui, s, Some(&status), None));
+            let refused = |ui: &mut egui::Ui| _ = reach_card(ui, s, Some(&status), Some(REFUSAL));
+            shown.extend(frames.run(Vec::new(), refused).texts);
             // The button: under way, then each outcome, then at rest with a hover.
             let known = host(Some(MAC));
             let mut button = |ui: &mut egui::Ui| wake_button(ui, s, &known, card_area(), None);
@@ -1044,6 +1188,7 @@ mod tests {
                 ("reach_relays", s.reach_relays),
                 ("reach_relays_none", s.reach_relays_none),
                 ("reach_advice_blind", s.reach_advice_blind),
+                ("reach_admin_needed", s.reach_admin_needed),
                 ("reach_last", s.reach_last),
                 ("reach_kind_lan", s.reach_kind_lan),
                 ("reach_kind_vpn", s.reach_kind_vpn),

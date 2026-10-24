@@ -449,7 +449,7 @@ impl Launcher {
         };
         page_header(ui, s.share_label, s.this_pc_title, Some(&subtitle));
         if let Some(e) = &view.error {
-            banner(ui, e, ERROR);
+            banner(ui, &super::reach::friendly_error(s, e), ERROR);
             ui.add_space(12.0);
         }
 
@@ -512,7 +512,7 @@ impl Launcher {
                     ui.add_space(16.0);
                 }
                 // Nothing from a host that predates standalone reach.
-                if let Some(request) = super::reach::reach_card(ui, s, status.reach.as_ref()) {
+                if let Some(request) = super::reach::reach_card(ui, s, status.reach.as_ref(), view.error.as_deref()) {
                     self.host.send(request);
                 }
                 ui.horizontal(|ui| {
