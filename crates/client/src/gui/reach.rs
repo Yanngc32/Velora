@@ -13,8 +13,9 @@ use std::{
 use eframe::egui::{self, Align, Layout, RichText, Sense};
 use velora_client_core::WakeOutcome;
 use velora_protocol::{
-    control::{MappingStatus, ReachStatus, Request},
+    control::{MappingStatus, ReachStatus, RelayEntry, RelayHostEntry, Request},
     identity::{KnownHost, StateDir},
+    pairing::{parse_pairing_link, PairingCode},
     wire::AddressKind,
 };
 
@@ -150,47 +151,94 @@ fn is_admin_refusal(error: &str) -> bool {
     error.contains("only an administrator")
 }
 
-/// The words for an error from the host: plain for the one that a person can do something about,
+/// What a host says to a request it cannot read, such as those that manage relays when it is older
+/// than this launcher.
+fn is_old_host(error: &str) -> bool {
+    error.contains("malformed request")
+}
+
+/// The words for an error from the host: plain for the ones that a person can do something about,
 /// the host's own for the rest.
 pub(super) fn friendly_error(s: &Strings, error: &str) -> String {
     if is_admin_refusal(error) {
         s.reach_admin_needed.to_string()
+    } else if is_old_host(error) {
+        s.relay_too_old.to_string()
     } else {
         error.to_string()
     }
 }
 
-/// How soon after the card sent a request a refusal counts as the answer to it.
-const ASKED_SECONDS: f64 = 5.0;
-/// How long the card keeps saying that its change was refused. The launcher's own banner for an
-/// error goes with the next status, a second later.
-const REFUSED_SECONDS: f64 = 30.0;
+/// What the card says when the host answers one of its requests with an error.
+fn failure_text(s: &Strings, error: &str) -> String {
+    if is_admin_refusal(error) || is_old_host(error) {
+        friendly_error(s, error)
+    } else {
+        fill(s.relay_failed, &[error])
+    }
+}
 
-/// What the card remembers between frames, on egui's clock: when it last sent a request, and when
-/// the host last refused one of its requests.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+/// How soon after the card sent a request an error counts as the answer to it.
+const ASKED_SECONDS: f64 = 5.0;
+/// How long the card keeps saying what went wrong. The launcher's own banner for an error goes
+/// with the next status, a second later.
+const FAILED_SECONDS: f64 = 30.0;
+
+/// Which part of the card sent a request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Origin {
+    Switches,
+    /// "Use as my relay", and the Remove beside a relay.
+    UseRelay,
+    /// "Let it use this PC", and the Remove beside an allowed computer.
+    AllowHost,
+}
+
+/// An error the host answered to a request of the card, from where it was sent and when.
+#[derive(Debug, Clone, PartialEq)]
+struct Failure {
+    at: f64,
+    origin: Origin,
+    error: String,
+}
+
+/// What the card remembers between frames, on egui's clock: its last request, and the error the
+/// host answered to it, if it did.
+#[derive(Debug, Clone, Default, PartialEq)]
 struct Asked {
-    sent: Option<f64>,
-    refused: Option<f64>,
+    sent: Option<(f64, Origin)>,
+    /// The error on the screen when that request went out: it is not the answer to it.
+    stale: Option<String>,
+    failed: Option<Failure>,
 }
 
 impl Asked {
-    /// The memory after a frame at `now`, in which the card sent a request or not (`sent`) and the
-    /// host's last error was `error`. A refusal to a request that the card did not send, a
-    /// device removed by a user without rights, say, is not this card's to explain.
-    fn after(self, now: f64, sent: bool, error: Option<&str>) -> Self {
-        let sent = if sent { Some(now) } else { self.sent };
-        let answered = error.is_some_and(is_admin_refusal) && sent.is_some_and(|at| now - at <= ASKED_SECONDS);
-        Self { sent, refused: if answered { Some(now) } else { self.refused } }
+    /// A request goes out at `now`, with the host's last error `error` still showing. What failed
+    /// before is forgotten: this one starts over.
+    fn sent(self, now: f64, origin: Origin, error: Option<&str>) -> Self {
+        Self { sent: Some((now, origin)), stale: error.map(str::to_string), failed: None }
     }
 
-    fn refused(&self, now: f64) -> bool {
-        self.refused.is_some_and(|at| now - at < REFUSED_SECONDS)
+    /// The host's last error `error` seen at `now`. Soon after a request of the card, and not the
+    /// one that was showing when it went out, it is the answer. An error to a request the card did
+    /// not send, a device removed by a user without rights, say, is not its to explain.
+    fn answered(mut self, now: f64, error: Option<&str>) -> Self {
+        let (Some(error), Some((sent, origin))) = (error, self.sent) else { return self };
+        if now - sent <= ASKED_SECONDS && self.stale.as_deref() != Some(error) {
+            self.failed = Some(Failure { at: now, origin, error: error.to_string() });
+        }
+        self
     }
 
-    /// Seconds from `now` until the card stops saying so.
+    /// What to say about the last change made from `origin`, while it is not old news.
+    fn failure(&self, now: f64, origin: Origin) -> Option<&str> {
+        let failed = self.failed.as_ref().filter(|failed| failed.origin == origin);
+        failed.filter(|failed| now - failed.at < FAILED_SECONDS).map(|failed| failed.error.as_str())
+    }
+
+    /// Seconds from `now` until the card stops saying it.
     fn next_change(&self, now: f64) -> Option<f64> {
-        self.refused.map(|at| REFUSED_SECONDS - (now - at)).filter(|left| *left > 0.0)
+        self.failed.as_ref().map(|failed| FAILED_SECONDS - (now - failed.at)).filter(|left| *left > 0.0)
     }
 }
 
@@ -198,9 +246,10 @@ fn asked_id() -> egui::Id {
     egui::Id::unique("reach-asked")
 }
 
-/// The card on This PC. A host that predates standalone reach (`None`) gets nothing, not even the
-/// space under it. A flipped switch comes back as the request to send; `error` is the host's answer
-/// to the last request that failed, which the card explains when it is a refusal of its own.
+/// The cards on This PC: how it is reached from other networks, and the relays it uses or lends. A
+/// host that predates standalone reach (`None`) gets nothing, not even the space under them. What
+/// is clicked comes back as the request to send; `error` is the host's answer to the last request
+/// that failed, which the cards explain where it was made when it answers one of theirs.
 pub(super) fn reach_card(
     ui: &mut egui::Ui,
     s: &Strings,
@@ -210,7 +259,7 @@ pub(super) fn reach_card(
     let reach = reach?;
     let ctx = ui.ctx().clone();
     let now = ui.input(|input| input.time);
-    let asked = ctx.data(|data| data.get_temp::<Asked>(asked_id())).unwrap_or_default().after(now, false, error);
+    let asked = ctx.data(|data| data.get_temp::<Asked>(asked_id())).unwrap_or_default().answered(now, error);
     let current = Switches::of(reach);
     let mut next = current;
     card(ui, |ui| {
@@ -218,10 +267,7 @@ pub(super) fn reach_card(
         ui.add_space(4.0);
         ui.add(egui::Label::new(RichText::new(s.reach_text).color(WEAK)).wrap());
         ui.add_space(16.0);
-        if asked.refused(now) {
-            banner(ui, s.reach_admin_needed, ERROR);
-            ui.add_space(16.0);
-        }
+        failure_note(ui, s, asked.failure(now, Origin::Switches));
 
         switch_row(ui, s.reach_standalone, s.reach_standalone_text, &mut next.standalone);
         if reach.standalone {
@@ -232,7 +278,7 @@ pub(super) fn reach_card(
         section_break(ui);
         switch_row(ui, s.reach_relay, s.reach_relay_text, &mut next.relay_for_others);
         ui.add_space(10.0);
-        let help = fill(s.reach_relay_help, &[s.offer_back]);
+        let help = fill(s.reach_relay_help, &[s.relay_title]);
         ui.add(egui::Label::new(RichText::new(help).small().color(WEAK)).wrap());
         if let Some(last) = &reach.last_reached {
             section_break(ui);
@@ -240,13 +286,216 @@ pub(super) fn reach_card(
         }
     });
     ui.add_space(16.0);
-    let request = (next != current).then(|| next.request());
-    let asked = asked.after(now, request.is_some(), None);
-    ctx.data_mut(|data| data.insert_temp(asked_id(), asked));
+    let switches = (next != current).then(|| (next.request(), Origin::Switches));
+    let relays = relay_card(ui, s, reach, &asked, now);
+    let sent = switches.or(relays);
+    let asked = match &sent {
+        Some((_, origin)) => asked.sent(now, *origin, error),
+        None => asked,
+    };
+    ctx.data_mut(|data| data.insert_temp(asked_id(), asked.clone()));
     if let Some(left) = asked.next_change(now) {
         ctx.request_repaint_after(Duration::from_secs_f64(left));
     }
-    request
+    sent.map(|(request, _)| request)
+}
+
+/// What went wrong with the last change made here, in a banner, until it is old news.
+fn failure_note(ui: &mut egui::Ui, s: &Strings, error: Option<&str>) {
+    if let Some(error) = error {
+        banner(ui, &failure_text(s, error), ERROR);
+        ui.add_space(12.0);
+    }
+}
+
+/// The request that makes this PC register with the relay whose pairing link was pasted: the
+/// relay's addresses and its host fingerprint, which the link carries, and the name given. The
+/// one-time code and the secrets in the link stay here.
+fn use_request(link: &str, name: &str) -> Option<Request> {
+    let link = parse_pairing_link(link)?;
+    Some(Request::AddRelay {
+        name: short_name(name),
+        address: link.address,
+        also: link.also,
+        fingerprint: link.code.host.to_base64(),
+    })
+}
+
+/// The request that lets the computer whose pairing link (or code) was pasted register with this
+/// PC as its relay. Only its host fingerprint is taken: this PC never connects to it.
+fn allow_request(link: &str, name: &str) -> Option<Request> {
+    let host = parse_pairing_link(link)
+        .map(|link| link.code.host)
+        .or_else(|| PairingCode::parse(link).ok().map(|code| code.host))?;
+    Some(Request::AllowRelayHost { name: short_name(name), fingerprint: host.to_base64() })
+}
+
+/// A name as typed: trimmed, and not longer than anyone needs.
+fn short_name(name: &str) -> String {
+    name.trim().chars().take(64).collect()
+}
+
+/// A line for a relay this host is set to register with: whether it is, or why not.
+fn relay_line(entry: &RelayEntry, s: &Strings) -> Line {
+    let detail = match (entry.registered, entry.reason.as_deref().filter(|reason| !reason.is_empty())) {
+        (true, _) => s.relay_up_use.to_string(),
+        (false, Some(reason)) => fill(s.relay_down_why, &[reason]),
+        (false, None) => s.relay_down.to_string(),
+    };
+    Line { good: entry.registered, text: entry_name(&entry.name, &entry.fingerprint), detail }
+}
+
+/// A line for a computer allowed to register here.
+fn host_line(entry: &RelayHostEntry, s: &Strings) -> Line {
+    let detail = if entry.registered { s.relay_up_allow } else { s.relay_down };
+    Line { good: entry.registered, text: entry_name(&entry.name, &entry.fingerprint), detail: detail.to_string() }
+}
+
+/// What an entry is called, or the start of its fingerprint when it has no name.
+fn entry_name(name: &str, fingerprint: &str) -> String {
+    if name.is_empty() {
+        fingerprint.chars().take(8).collect()
+    } else {
+        name.to_string()
+    }
+}
+
+/// The second card of This PC: the relays this PC uses and the computers allowed to use it as one,
+/// each with a way to add and to remove. What is asked comes back with the part that asked.
+fn relay_card(
+    ui: &mut egui::Ui,
+    s: &Strings,
+    reach: &ReachStatus,
+    asked: &Asked,
+    now: f64,
+) -> Option<(Request, Origin)> {
+    let mut sent = None;
+    card(ui, |ui| {
+        card_title(ui, s.relay_title);
+        ui.add_space(4.0);
+        ui.add(egui::Label::new(RichText::new(s.relay_intro).color(WEAK)).wrap());
+        ui.add_space(14.0);
+        steps(ui, s);
+
+        section_break(ui);
+        section_heading(ui, s.relay_use_title, s.relay_use_text);
+        ui.add_space(10.0);
+        if reach.relays.is_empty() {
+            none_yet(ui, s);
+        }
+        for entry in &reach.relays {
+            if entry_row(ui, s, &relay_line(entry, s)) {
+                sent = Some((Request::RemoveRelay { fingerprint: entry.fingerprint.clone() }, Origin::UseRelay));
+            }
+            ui.add_space(8.0);
+        }
+        failure_note(ui, s, asked.failure(now, Origin::UseRelay));
+        if let Some(request) = relay_form(ui, s, "use", s.relay_use_button, use_request) {
+            sent = Some((request, Origin::UseRelay));
+        }
+
+        section_break(ui);
+        section_heading(ui, s.relay_allow_title, s.relay_allow_text);
+        ui.add_space(10.0);
+        if reach.relay_hosts.is_empty() {
+            none_yet(ui, s);
+        }
+        for entry in &reach.relay_hosts {
+            if entry_row(ui, s, &host_line(entry, s)) {
+                sent = Some((Request::RemoveRelayHost { fingerprint: entry.fingerprint.clone() }, Origin::AllowHost));
+            }
+            ui.add_space(8.0);
+        }
+        // Allowed, but this PC does not relay: nobody can use it yet.
+        if !reach.relay_hosts.is_empty() && !reach.relay_for_others {
+            let off = fill(s.relay_allow_off, &[s.reach_relay]);
+            ui.add(egui::Label::new(RichText::new(off).small().color(WEAK)).wrap());
+            ui.add_space(8.0);
+        }
+        failure_note(ui, s, asked.failure(now, Origin::AllowHost));
+        if let Some(request) = relay_form(ui, s, "allow", s.relay_allow_button, allow_request) {
+            sent = Some((request, Origin::AllowHost));
+        }
+    });
+    ui.add_space(16.0);
+    sent
+}
+
+/// The three steps of setting up a relay, numbered.
+fn steps(ui: &mut egui::Ui, s: &Strings) {
+    let second = fill(s.relay_step2, &[s.relay_use_title, s.relay_allow_title, s.show_qr, s.copy_link]);
+    for (number, text) in [(1, s.relay_step1.to_string()), (2, second), (3, s.relay_step3.to_string())] {
+        ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            ui.label(RichText::new(format!("{number}.")).font(font(13.0, semibold())).color(ACCENT_TEXT));
+            ui.add(egui::Label::new(RichText::new(text).color(WEAK)).wrap());
+        });
+        ui.add_space(4.0);
+    }
+}
+
+/// A title with a note under it, above a list.
+fn section_heading(ui: &mut egui::Ui, title: &str, note: &str) {
+    ui.label(RichText::new(title).font(font(14.0, medium())));
+    ui.add_space(2.0);
+    ui.add(egui::Label::new(RichText::new(note).color(WEAK)).wrap());
+}
+
+fn none_yet(ui: &mut egui::Ui, s: &Strings) {
+    ui.label(RichText::new(s.relay_none).color(FAINT));
+    ui.add_space(8.0);
+}
+
+/// A line of a list with a Remove chip at its right end: true once Remove is clicked.
+fn entry_row(ui: &mut egui::Ui, s: &Strings, line: &Line) -> bool {
+    let mut remove = false;
+    ui.horizontal_top(|ui| {
+        // Leave room for the chip so the detail wraps before it.
+        let text_width = ui.available_width() - 100.0;
+        ui.allocate_ui_with_layout(egui::vec2(text_width, 0.0), Layout::top_down(Align::Min), |ui| {
+            status_line(ui, line)
+        });
+        ui.with_layout(Layout::right_to_left(Align::Min), |ui| remove = small_button(ui, s.remove, true).clicked());
+    });
+    remove
+}
+
+/// A pasted pairing link, an optional name and the button that turns them into a request with
+/// `make`; the button waits for a link that `make` can read. What is typed stays in egui's memory
+/// while the card is on screen, and goes with the request.
+fn relay_form(
+    ui: &mut egui::Ui,
+    s: &Strings,
+    which: &str,
+    button: &str,
+    make: fn(&str, &str) -> Option<Request>,
+) -> Option<Request> {
+    let ctx = ui.ctx().clone();
+    let (link_id, name_id) = (egui::Id::unique(("relay-link", which)), egui::Id::unique(("relay-name", which)));
+    let mut link: String = ctx.data(|data| data.get_temp(link_id)).unwrap_or_default();
+    let mut name: String = ctx.data(|data| data.get_temp(name_id)).unwrap_or_default();
+    ui.add(field(&mut link, s.relay_link_hint, true).id(link_id));
+    let request = make(&link, &name);
+    if !link.trim().is_empty() && request.is_none() {
+        let text = fill(s.relay_bad_link, &[s.show_qr, s.copy_link]);
+        ui.add(egui::Label::new(RichText::new(text).small().color(ERROR)).wrap());
+    }
+    ui.add_space(6.0);
+    let mut clicked = false;
+    ui.horizontal(|ui| {
+        ui.add_sized([150.0, CONTROL_HEIGHT], field(&mut name, s.relay_name_hint, false).id(name_id));
+        clicked = primary_button(ui, button, ui.available_width(), request.is_some()).clicked();
+    });
+    ctx.data_mut(|data| {
+        if clicked {
+            data.remove::<String>(link_id);
+            data.remove::<String>(name_id);
+        } else {
+            data.insert_temp(link_id, link);
+            data.insert_temp(name_id, name);
+        }
+    });
+    request.filter(|_| clicked)
 }
 
 /// Under the QR code of This PC: where its link also reaches this computer from other networks,
@@ -527,7 +776,7 @@ fn small_button(ui: &mut egui::Ui, text: &str, enabled: bool) -> egui::Response 
 #[cfg(test)]
 mod tests {
     use eframe::egui::{epaint::Shape, vec2, Event, Modifiers, PointerButton, Pos2, Rect};
-    use velora_protocol::tls::Fingerprint;
+    use velora_protocol::{pairing::pairing_uri_with, tls::Fingerprint};
 
     use super::*;
     use crate::gui::{strings, theme};
@@ -577,6 +826,8 @@ mod tests {
         texts: Vec<String>,
         /// The track of every switch, which are the only 40 by 22 rectangles.
         switches: Vec<Rect>,
+        /// Where each text was painted.
+        rects: Vec<(String, Rect)>,
     }
 
     impl Painted {
@@ -586,6 +837,20 @@ mod tests {
 
         fn mentions(&self, part: &str) -> bool {
             self.texts.iter().any(|t| t.contains(part))
+        }
+
+        /// How many times `text` was painted.
+        fn count(&self, text: &str) -> usize {
+            self.texts.iter().filter(|t| *t == text).count()
+        }
+
+        /// Where `text` was painted, each time, in the order it was.
+        fn rects(&self, text: &str) -> Vec<Rect> {
+            self.rects.iter().filter(|(t, _)| t == text).map(|(_, rect)| *rect).collect()
+        }
+
+        fn rect(&self, text: &str) -> Option<Rect> {
+            self.rects(text).first().copied()
         }
     }
 
@@ -606,13 +871,13 @@ mod tests {
         fn run(&mut self, events: Vec<Event>, mut add: impl FnMut(&mut egui::Ui)) -> Painted {
             self.time += 0.1;
             let input = egui::RawInput {
-                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(440.0, 2400.0))),
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(440.0, 3600.0))),
                 time: Some(self.time),
                 events,
                 ..Default::default()
             };
             let output = self.ctx.run_ui(input, |ui| add(ui));
-            let mut painted = Painted { texts: Vec::new(), switches: Vec::new() };
+            let mut painted = Painted { texts: Vec::new(), switches: Vec::new(), rects: Vec::new() };
             for clipped in &output.shapes {
                 collect(&clipped.shape, &mut painted);
             }
@@ -642,7 +907,10 @@ mod tests {
     fn collect(shape: &Shape, painted: &mut Painted) {
         match shape {
             Shape::Vec(shapes) => shapes.iter().for_each(|shape| collect(shape, painted)),
-            Shape::Text(text) => painted.texts.push(text.galley.text().to_string()),
+            Shape::Text(text) => {
+                painted.texts.push(text.galley.text().to_string());
+                painted.rects.push((text.galley.text().to_string(), Rect::from_min_size(text.pos, text.galley.size())));
+            }
             Shape::Rect(rect) if rect.rect.size() == vec2(40.0, 22.0) => painted.switches.push(rect.rect),
             _ => {}
         }
@@ -878,7 +1146,7 @@ mod tests {
             assert_eq!(painted.switches.len(), 3);
             assert!(!painted.mentions(s.reach_mapping_closed));
             // Relaying costs bandwidth, and needs pairings that the card tells how to make.
-            assert!(painted.has(&fill(s.reach_relay_help, &[s.offer_back])));
+            assert!(painted.has(&fill(s.reach_relay_help, &[s.relay_title])));
             assert!(s.reach_relay_text.contains("6") && s.reach_relay_text.contains("12 Mbit/s"));
             // Registered relays make advice unnecessary.
             assert!(!painted.mentions(s.reach_advice_blind.split("{}").next().unwrap()));
@@ -966,8 +1234,10 @@ mod tests {
         assert_eq!(first.switches.len(), flipped.len());
         for (track, want) in first.switches.iter().zip(flipped) {
             let mut sent = None;
-            frames.run(click(track.center()), |ui| sent = reach_card(ui, s, Some(&status), None));
+            let painted = frames.run(click(track.center()), |ui| sent = reach_card(ui, s, Some(&status), None));
             assert_eq!(sent, Some(want.request()), "clicking the switch at {track:?}");
+            // The card of the relays is still there in the frame of the click, not skipped for it.
+            assert!(painted.has(s.relay_title));
         }
         // A frame with no click asks for nothing.
         let mut sent = None;
@@ -978,66 +1248,315 @@ mod tests {
     /// What the host answers a change that a user without rights makes under the service
     /// (`Shared::control` in the host's `server.rs`).
     const REFUSAL: &str = "only an administrator can change this computer's access";
+    /// What a host that predates the relay requests answers them (`handle` in the host's `control.rs`).
+    const OLD_HOST: &str = "malformed request: unknown variant `add_relay`, expected one of `status`, `start_pairing`";
 
     #[test]
-    fn a_refusal_for_lack_of_rights_is_told_in_plain_words() {
+    fn what_the_host_answers_is_told_in_plain_words() {
         assert!(is_admin_refusal(REFUSAL) && !is_admin_refusal("saving the standalone reach switches: disk full"));
+        assert!(is_old_host(OLD_HOST) && !is_old_host(REFUSAL));
+        let other = "a computer cannot be its own relay";
         for s in strings::all() {
             assert_eq!(friendly_error(s, REFUSAL), s.reach_admin_needed);
-            // Any other error stays as the host worded it.
-            assert_eq!(friendly_error(s, "this device is not paired"), "this device is not paired");
+            assert_eq!(friendly_error(s, OLD_HOST), s.relay_too_old);
+            // The banner leaves any other error as the host worded it; the cards put a sentence before it.
+            assert_eq!(friendly_error(s, other), other);
+            assert_eq!(failure_text(s, other), fill(s.relay_failed, &[other]));
+            assert_eq!(
+                (failure_text(s, REFUSAL), failure_text(s, OLD_HOST)),
+                (s.reach_admin_needed.into(), s.relay_too_old.into())
+            );
         }
     }
 
     #[test]
-    fn the_card_explains_a_refused_change_where_it_was_made() {
+    fn what_the_cards_remember_of_their_requests_follows_the_clock() {
+        // An error with no request of the cards before it is nobody's answer.
+        let asked = Asked::default().answered(10.0, Some(REFUSAL));
+        assert_eq!(asked.failure(10.0, Origin::Switches), None);
+        // A request, then an error in time: its answer, for the part that sent it only.
+        let sent = Asked::default().sent(10.0, Origin::UseRelay, None);
+        let failed = sent.clone().answered(12.0, Some("no"));
+        assert_eq!(failed.failure(12.0, Origin::UseRelay), Some("no"));
+        assert_eq!((failed.failure(12.0, Origin::Switches), failed.failure(12.0, Origin::AllowHost)), (None, None));
+        // It lasts, and its end is known.
+        assert_eq!(failed.failure(12.0 + FAILED_SECONDS - 0.1, Origin::UseRelay), Some("no"));
+        assert_eq!(failed.failure(12.0 + FAILED_SECONDS, Origin::UseRelay), None);
+        assert_eq!(failed.next_change(13.0), Some(FAILED_SECONDS - 1.0));
+        assert_eq!((failed.next_change(12.0 + FAILED_SECONDS), Asked::default().next_change(1.0)), (None, None));
+        // Too late to be an answer, and the error that was showing when the request went out is not
+        // its answer either.
+        let late = sent.answered(10.0 + ASKED_SECONDS + 0.1, Some("no"));
+        assert_eq!(late.failure(10.0 + ASKED_SECONDS + 0.1, Origin::UseRelay), None);
+        let stale = Asked::default().sent(10.0, Origin::Switches, Some("old"));
+        assert_eq!(stale.clone().answered(10.5, Some("old")).failure(10.5, Origin::Switches), None);
+        assert_eq!(stale.answered(10.5, Some("new")).failure(10.5, Origin::Switches), Some("new"));
+        // The next request starts over.
+        assert_eq!(failed.sent(20.0, Origin::UseRelay, None).failure(20.0, Origin::UseRelay), None);
+    }
+
+    #[test]
+    fn the_cards_explain_a_failed_change_where_it_was_made() {
         let s = strings::current();
         let status = reach();
         let mut frames = Frames::new();
         let run = |frames: &mut Frames, events: Vec<Event>, error: Option<&str>| {
             let mut sent = None;
             let painted = frames.run(events, |ui| sent = reach_card(ui, s, Some(&status), error));
-            (painted.has(s.reach_admin_needed), sent)
+            (painted, sent)
         };
-        let first = frames.run(Vec::new(), |ui| _ = reach_card(ui, s, Some(&status), None));
-        // A refusal of something else that the user did, such as removing a device, is not for this card.
-        assert!(!run(&mut frames, Vec::new(), Some(REFUSAL)).0);
-        // A switch is flipped, and the host refuses: the card says why, in the same frame the error
-        // arrives and for as long afterwards as the launcher's own banner is gone.
+        let (first, _) = run(&mut frames, Vec::new(), None);
+        // A refusal of something else that the user did, such as removing a device, is not for the cards.
+        assert!(!run(&mut frames, Vec::new(), Some(REFUSAL)).0.has(s.reach_admin_needed));
+        // A switch is flipped, and the host refuses: the card says why, in the frame the error arrives
+        // and for as long afterwards as the launcher's own banner is gone, and only there.
         let (_, sent) = run(&mut frames, click(first.switches[1].center()), None);
         assert!(sent.is_some());
-        assert!(run(&mut frames, Vec::new(), Some(REFUSAL)).0);
-        assert!(run(&mut frames, Vec::new(), None).0);
-        frames.advance(REFUSED_SECONDS - 1.0);
-        assert!(run(&mut frames, Vec::new(), None).0);
+        let (painted, _) = run(&mut frames, Vec::new(), Some(REFUSAL));
+        assert_eq!(painted.count(s.reach_admin_needed), 1);
+        assert_eq!(run(&mut frames, Vec::new(), None).0.count(s.reach_admin_needed), 1);
+        frames.advance(FAILED_SECONDS - 1.0);
+        assert_eq!(run(&mut frames, Vec::new(), None).0.count(s.reach_admin_needed), 1);
         // Then it lets go.
         frames.advance(2.0);
-        assert!(!run(&mut frames, Vec::new(), None).0);
-        // A refusal long after the card's last request is not an answer to it, and neither is
-        // another kind of error right after one.
+        assert_eq!(run(&mut frames, Vec::new(), None).0.count(s.reach_admin_needed), 0);
+        // Another kind of error gets a sentence of its own.
         run(&mut frames, click(first.switches[1].center()), None);
-        assert!(!run(&mut frames, Vec::new(), Some("this device is not paired")).0);
-        frames.advance(ASKED_SECONDS + 1.0);
-        assert!(!run(&mut frames, Vec::new(), Some(REFUSAL)).0);
+        let other = "saving the standalone reach switches: disk full";
+        let (painted, _) = run(&mut frames, Vec::new(), Some(other));
+        assert!(painted.has(&fill(s.relay_failed, &[other])), "{:#?}", painted.texts);
+        // A refusal long after the last request is not an answer to it.
+        frames.advance(FAILED_SECONDS + ASKED_SECONDS);
+        assert!(!run(&mut frames, Vec::new(), Some(REFUSAL)).0.has(s.reach_admin_needed));
+    }
+
+    /// The pairing link of a made-up computer, with a code and secrets that must not travel on.
+    fn link(host: u8, address: &str, also: &[&str]) -> (String, PairingCode) {
+        let code = PairingCode::generate(Fingerprint([host; 32])).unwrap();
+        let also: Vec<String> = also.iter().map(|a| a.to_string()).collect();
+        (pairing_uri_with(address, &also, &code, Some(&[1; 32]), Some(&[2; 16])), code)
     }
 
     #[test]
-    fn what_the_card_remembers_of_its_requests_follows_the_clock() {
-        let asked = Asked::default();
-        // A request, then the refusal in time: refused; a refusal alone: not.
-        assert_eq!(asked.after(10.0, false, Some(REFUSAL)).refused, None);
-        let sent = asked.after(10.0, true, None);
-        assert_eq!(sent, Asked { sent: Some(10.0), refused: None });
-        let refused = sent.after(12.0, false, Some(REFUSAL));
-        assert_eq!(refused, Asked { sent: Some(10.0), refused: Some(12.0) });
-        // Refused while it lasts, and its end is known.
-        assert!(refused.refused(12.0) && refused.refused(12.0 + REFUSED_SECONDS - 0.1));
-        assert!(!refused.refused(12.0 + REFUSED_SECONDS));
-        assert_eq!(refused.next_change(13.0), Some(REFUSED_SECONDS - 1.0));
-        assert_eq!(refused.next_change(12.0 + REFUSED_SECONDS), None);
-        assert_eq!(Asked::default().next_change(1.0), None);
-        // Too late to be an answer.
-        assert_eq!(sent.after(10.0 + ASKED_SECONDS + 0.1, false, Some(REFUSAL)).refused, None);
+    fn a_pairing_link_gives_the_host_only_what_it_needs_of_it() {
+        let (text, code) = link(7, "203.0.113.10:7420", &["198.51.100.20:7420"]);
+        let fingerprint = Fingerprint([7; 32]).to_base64();
+        // A relay: its addresses and its host fingerprint, and the name as given, trimmed.
+        let want = Request::AddRelay {
+            name: "Office PC".into(),
+            address: "203.0.113.10:7420".into(),
+            also: vec!["198.51.100.20:7420".into()],
+            fingerprint: fingerprint.clone(),
+        };
+        assert_eq!(use_request(&format!("  {text}\n"), "  Office PC "), Some(want));
+        // The names are cut and the fingerprint is the host's, not the one-time code.
+        let Some(Request::AddRelay { name, fingerprint: sent, .. }) = use_request(&text, &"x".repeat(100)) else {
+            panic!("a link is a relay")
+        };
+        assert_eq!((name.len(), sent), (64, fingerprint.clone()));
+        assert!(!format!("{:?}", use_request(&text, "")).contains(&code.encode()));
+        // A relay needs an address, which a bare code lacks; a computer that may register needs only
+        // the fingerprint, so a link or a code will do.
+        assert_eq!(use_request(&code.encode(), ""), None);
+        let allowed = Request::AllowRelayHost { name: "Home PC".into(), fingerprint };
+        assert_eq!(allow_request(&text, "Home PC"), Some(allowed.clone()));
+        assert_eq!(allow_request(&code.encode(), " Home PC"), Some(allowed));
+        for nonsense in ["", "   ", "hello", "velora://pair?address=x", "VL1-short"] {
+            assert_eq!((use_request(nonsense, ""), allow_request(nonsense, "")), (None, None), "{nonsense:?}");
+        }
+    }
+
+    /// Fingerprints of made-up relays and computers.
+    fn fp(host: u8) -> String {
+        Fingerprint([host; 32]).to_base64()
+    }
+
+    /// A status with relays and allowed computers, one of each of both kinds of state.
+    fn relays() -> ReachStatus {
+        ReachStatus {
+            relays: vec![
+                RelayEntry {
+                    name: "Office PC".into(),
+                    fingerprint: fp(1),
+                    address: "203.0.113.10:7420".into(),
+                    registered: true,
+                    reason: None,
+                },
+                RelayEntry {
+                    name: String::new(),
+                    fingerprint: fp(2),
+                    address: "198.51.100.20:7420".into(),
+                    registered: false,
+                    reason: Some("it does not relay for other devices".into()),
+                },
+            ],
+            relay_hosts: vec![
+                RelayHostEntry { name: "Home PC".into(), fingerprint: fp(3), registered: true },
+                RelayHostEntry { name: "Studio".into(), fingerprint: fp(4), registered: false },
+            ],
+            ..reach()
+        }
+    }
+
+    #[test]
+    fn the_relay_card_lists_both_sides_with_their_state() {
+        for s in strings::all() {
+            let mut frames = Frames::new();
+            let status = relays();
+            let painted = frames.run(Vec::new(), |ui| _ = reach_card(ui, s, Some(&status), None));
+            let steps = fill(s.relay_step2, &[s.relay_use_title, s.relay_allow_title, s.show_qr, s.copy_link]);
+            let why = fill(s.relay_down_why, &["it does not relay for other devices"]);
+            for text in [
+                s.relay_title,
+                s.relay_intro,
+                s.relay_step1,
+                &steps,
+                s.relay_step3,
+                s.relay_use_title,
+                s.relay_use_text,
+                s.relay_allow_title,
+                s.relay_allow_text,
+                // A relay: its name and how it stands; one without a name is told by its fingerprint.
+                "Office PC",
+                s.relay_up_use,
+                &fp(2)[..8],
+                &why,
+                // An allowed computer.
+                "Home PC",
+                s.relay_up_allow,
+                "Studio",
+                s.relay_down,
+                s.relay_use_button,
+                s.relay_allow_button,
+            ] {
+                assert!(painted.has(text), "{text:?} was not painted, only {:#?}", painted.texts);
+            }
+            assert_eq!(painted.count(s.remove), 4);
+            assert!(!painted.has(s.relay_none));
+            // The computers may register, but this PC does not relay yet: nobody can use it.
+            let off = fill(s.relay_allow_off, &[s.reach_relay]);
+            assert!(painted.has(&off));
+            let on = ReachStatus { relay_for_others: true, ..relays() };
+            assert!(!frames.run(Vec::new(), |ui| _ = reach_card(ui, s, Some(&on), None)).has(&off));
+            // With none, each list says so, and the hint has nothing to say.
+            let none = ReachStatus { relays: Vec::new(), relay_hosts: Vec::new(), ..reach() };
+            let painted = frames.run(Vec::new(), |ui| _ = reach_card(ui, s, Some(&none), None));
+            assert_eq!((painted.count(s.relay_none), painted.count(s.remove)), (2, 0));
+            assert!(!painted.has(&off));
+        }
+    }
+
+    #[test]
+    fn remove_asks_the_host_to_forget_that_one_entry() {
+        let s = strings::current();
+        let status = relays();
+        let mut frames = Frames::new();
+        let first = frames.run(Vec::new(), |ui| _ = reach_card(ui, s, Some(&status), None));
+        // In the order they are drawn: the relays, then the computers.
+        let wanted = [
+            Request::RemoveRelay { fingerprint: fp(1) },
+            Request::RemoveRelay { fingerprint: fp(2) },
+            Request::RemoveRelayHost { fingerprint: fp(3) },
+            Request::RemoveRelayHost { fingerprint: fp(4) },
+        ];
+        let chips = first.rects(s.remove);
+        assert_eq!(chips.len(), wanted.len());
+        for (chip, want) in chips.iter().zip(wanted) {
+            let mut sent = None;
+            frames.run(click(chip.center()), |ui| sent = reach_card(ui, s, Some(&status), None));
+            assert_eq!(sent, Some(want), "clicking Remove at {chip:?}");
+        }
+    }
+
+    /// Types into a form of the relay card, as far as egui's memory is concerned.
+    fn type_into(ctx: &egui::Context, which: &str, link: &str, name: &str) {
+        ctx.data_mut(|data| {
+            data.insert_temp(egui::Id::unique(("relay-link", which)), link.to_string());
+            data.insert_temp(egui::Id::unique(("relay-name", which)), name.to_string());
+        });
+    }
+
+    #[test]
+    fn a_form_sends_what_was_pasted_when_it_is_a_link_and_forgets_it() {
+        let s = strings::current();
+        let status = reach();
+        let mut frames = Frames::new();
+        let (text, _) = link(7, "203.0.113.10:7420", &[]);
+        let run = |frames: &mut Frames, events: Vec<Event>| {
+            let mut sent = None;
+            let painted = frames.run(events, |ui| sent = reach_card(ui, s, Some(&status), None));
+            (painted, sent)
+        };
+        let bad = fill(s.relay_bad_link, &[s.show_qr, s.copy_link]);
+        // Nothing pasted: no complaint, and the button is deaf.
+        let (painted, _) = run(&mut frames, Vec::new());
+        assert!(!painted.has(&bad));
+        let button = painted.rect(s.relay_use_button).unwrap().center();
+        assert_eq!(run(&mut frames, click(button)).1, None);
+        // Something that is not a link: the card says what a link is, and the button stays deaf.
+        type_into(&frames.ctx, "use", "hello", "");
+        let (painted, _) = run(&mut frames, Vec::new());
+        assert!(painted.has(&bad));
+        assert_eq!(run(&mut frames, click(button)).1, None);
+        // A link: the complaint is gone and a click sends it, with the name typed beside it.
+        type_into(&frames.ctx, "use", &text, "Office PC");
+        let (painted, _) = run(&mut frames, Vec::new());
+        assert!(!painted.has(&bad));
+        let button = painted.rect(s.relay_use_button).unwrap().center();
+        let want = Request::AddRelay {
+            name: "Office PC".into(),
+            address: "203.0.113.10:7420".into(),
+            also: Vec::new(),
+            fingerprint: fp(7),
+        };
+        assert_eq!(run(&mut frames, click(button)).1, Some(want));
+        // What was typed goes with it.
+        let again = frames.ctx.data(|data| data.get_temp::<String>(egui::Id::unique(("relay-link", "use"))));
+        assert_eq!(again, None);
+        assert_eq!(run(&mut frames, click(button)).1, None);
+        // The other form takes a link too, and asks the host to let that computer register.
+        type_into(&frames.ctx, "allow", &text, "");
+        let (painted, _) = run(&mut frames, Vec::new());
+        let button = painted.rect(s.relay_allow_button).unwrap().center();
+        let want = Request::AllowRelayHost { name: String::new(), fingerprint: fp(7) };
+        assert_eq!(run(&mut frames, click(button)).1, Some(want));
+    }
+
+    #[test]
+    fn a_failed_relay_request_is_explained_under_its_own_form() {
+        let s = strings::current();
+        let status = reach();
+        let mut frames = Frames::new();
+        let (text, _) = link(7, "203.0.113.10:7420", &[]);
+        let run = |frames: &mut Frames, events: Vec<Event>, error: Option<&str>| {
+            let mut sent = None;
+            let painted = frames.run(events, |ui| sent = reach_card(ui, s, Some(&status), error));
+            (painted, sent)
+        };
+        // "Let it use this PC" is clicked, and the host says no.
+        type_into(&frames.ctx, "allow", &text, "");
+        let (painted, _) = run(&mut frames, Vec::new(), None);
+        let button = painted.rect(s.relay_allow_button).unwrap().center();
+        assert!(run(&mut frames, click(button), None).1.is_some());
+        let no = "a computer cannot register with itself";
+        let (painted, _) = run(&mut frames, Vec::new(), Some(no));
+        let said = fill(s.relay_failed, &[no]);
+        assert_eq!(painted.count(&said), 1);
+        // It sits above the form that sent the request, below the list of that part, not elsewhere.
+        let (said_at, allow_at, use_at) = (
+            painted.rect(&said).unwrap(),
+            painted.rect(s.relay_allow_button).unwrap(),
+            painted.rect(s.relay_use_button).unwrap(),
+        );
+        assert!(said_at.top() < allow_at.top() && said_at.top() > use_at.bottom());
+        // A host that is too old says so in plain words.
+        type_into(&frames.ctx, "use", &text, "");
+        run(&mut frames, Vec::new(), None);
+        frames.advance(ASKED_SECONDS);
+        let (painted, _) = run(&mut frames, Vec::new(), None);
+        let button = painted.rect(s.relay_use_button).unwrap().center();
+        assert!(run(&mut frames, click(button), None).1.is_some());
+        assert!(run(&mut frames, Vec::new(), Some(OLD_HOST)).0.has(s.relay_too_old));
     }
 
     #[test]
@@ -1151,6 +1670,18 @@ mod tests {
             frames.run(click(flip), |ui| _ = reach_card(ui, s, Some(&status), None));
             let refused = |ui: &mut egui::Ui| _ = reach_card(ui, s, Some(&status), Some(REFUSAL));
             shown.extend(frames.run(Vec::new(), refused).texts);
+            // The relay card: its lists, a link that is none, and what went wrong with a request.
+            let listed = relays();
+            shown.extend(frames.run(Vec::new(), |ui| _ = reach_card(ui, s, Some(&listed), None)).texts);
+            type_into(&frames.ctx, "use", "hello", "");
+            shown.extend(frames.run(Vec::new(), |ui| _ = reach_card(ui, s, Some(&listed), None)).texts);
+            for (origin, error) in
+                [(Origin::UseRelay, "a computer cannot be its own relay"), (Origin::AllowHost, OLD_HOST)]
+            {
+                let asked = Asked::default().sent(frames.time, origin, None).answered(frames.time, Some(error));
+                frames.ctx.data_mut(|data| data.insert_temp(asked_id(), asked));
+                shown.extend(frames.run(Vec::new(), |ui| _ = reach_card(ui, s, Some(&listed), None)).texts);
+            }
             // The button: under way, then each outcome, then at rest with a hover.
             let known = host(Some(MAC));
             let mut button = |ui: &mut egui::Ui| wake_button(ui, s, &known, card_area(), None);
@@ -1188,6 +1719,28 @@ mod tests {
                 ("reach_relay", s.reach_relay),
                 ("reach_relay_text", s.reach_relay_text),
                 ("reach_relay_help", s.reach_relay_help),
+                ("relay_title", s.relay_title),
+                ("relay_intro", s.relay_intro),
+                ("relay_step1", s.relay_step1),
+                ("relay_step2", s.relay_step2),
+                ("relay_step3", s.relay_step3),
+                ("relay_use_title", s.relay_use_title),
+                ("relay_use_text", s.relay_use_text),
+                ("relay_use_button", s.relay_use_button),
+                ("relay_allow_title", s.relay_allow_title),
+                ("relay_allow_text", s.relay_allow_text),
+                ("relay_allow_button", s.relay_allow_button),
+                ("relay_allow_off", s.relay_allow_off),
+                ("relay_link_hint", s.relay_link_hint),
+                ("relay_name_hint", s.relay_name_hint),
+                ("relay_bad_link", s.relay_bad_link),
+                ("relay_none", s.relay_none),
+                ("relay_up_use", s.relay_up_use),
+                ("relay_up_allow", s.relay_up_allow),
+                ("relay_down", s.relay_down),
+                ("relay_down_why", s.relay_down_why),
+                ("relay_failed", s.relay_failed),
+                ("relay_too_old", s.relay_too_old),
                 ("reach_relays", s.reach_relays),
                 ("reach_relays_none", s.reach_relays_none),
                 ("reach_advice_blind", s.reach_advice_blind),
