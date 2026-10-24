@@ -33,6 +33,12 @@
 //! UPnP does not report the lease it granted, so a UPnP [`Mapping`] carries the lease asked for.
 //! A router that keeps only permanent mappings gets lease 0 on the wire, and the caller should
 //! keep renewing as if it had a lease: that also puts the mapping back after a router restart.
+//!
+//! A UPnP removal reads what the router holds at the external port first, and deletes it only if it is this PC's (its
+//! address and its port): `DeletePortMapping` names the external port and nothing else, so on the router of another
+//! network it would delete a mapping some other computer holds at the same number. Where the router will not say, or
+//! holds something else there, nothing is deleted and the error says so; the mapping then ends with its lease.
+//! A mapping the router does not have at all counts as removed.
 
 use std::fmt;
 use std::future::Future;
@@ -43,8 +49,8 @@ use std::time::Duration;
 use igd_next::aio::tokio::{search_gateway, Tokio};
 use igd_next::aio::Gateway;
 use igd_next::{
-    AddAnyPortError, AddPortError, GatewayIpVersion, GetExternalIpError, PortMappingProtocol, RemovePortError,
-    SearchError, SearchOptions,
+    AddAnyPortError, AddPortError, GatewayIpVersion, GetExternalIpError, GetGenericPortMappingEntryError,
+    PortMappingProtocol, RemovePortError, SearchError, SearchOptions,
 };
 use tokio::net::UdpSocket;
 use tokio::time::{timeout, Instant};
@@ -122,7 +128,9 @@ pub async fn renew(mapping: &Mapping) -> Result<Mapping, MappingError> {
     }
 }
 
-/// Give the port back. A mapping the router no longer has counts as removed.
+/// Give the port back. A mapping the router no longer has counts as removed. A UPnP mapping is deleted only if the
+/// router holds it for this PC (see the module docs); one it holds for another computer, or that it will not say
+/// anything about, is left alone and the error says so.
 pub async fn remove(mapping: &Mapping) -> Result<(), MappingError> {
     let (natpmp, upnp) = system().await;
     match mapping.protocol {
@@ -146,6 +154,9 @@ const NATPMP_FIRST_WAIT: Duration = Duration::from_millis(250);
 
 /// Requests to a UPnP router before giving up on a port that keeps being taken.
 const MAX_ATTEMPTS: usize = 10;
+
+/// Mappings of a router read at most when looking for one: a longer table is not searched to its end.
+const MAX_LISTED: u32 = 256;
 
 const DESCRIPTION: &str = "Velora";
 
@@ -508,12 +519,7 @@ impl Mapper for Upnp {
     }
 
     async fn remove(&self, mapping: &Mapping) -> Result<(), Failure> {
-        match self.discover().await?.remove_port(mapping.external_port).await {
-            Ok(()) => Ok(()),
-            // Gone already (a restart, or the lease ended): that is what was asked for.
-            Err(IgdError::NoSuchMapping) => Ok(()),
-            Err(e) => Err(e.into()),
-        }
+        upnp_remove(&self.discover().await?, mapping).await
     }
 }
 
@@ -530,6 +536,17 @@ trait Igd: Send + Sync {
         lease_secs: u32,
     ) -> impl Future<Output = Result<(), IgdError>> + Send;
     fn remove_port(&self, external_port: u16) -> impl Future<Output = Result<(), IgdError>> + Send;
+    /// What the router holds for UDP at `external_port`; `None` when nothing.
+    fn entry_at(&self, external_port: u16) -> impl Future<Output = Result<Option<Entry>, IgdError>> + Send;
+    /// Whether `client`, the way a router names the internal client of a mapping, is this PC.
+    fn is_this_pc(&self, client: &str) -> bool;
+}
+
+/// A mapping as a router lists it: where it sends the packets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Entry {
+    internal_client: String,
+    internal_port: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -544,6 +561,8 @@ enum IgdError {
     PermanentLeaseOnly,
     /// 714: nothing is mapped there.
     NoSuchMapping,
+    /// The router would not say what it holds at an external port (or its answer did not come).
+    CannotCheck(String),
     Other(String),
 }
 
@@ -557,6 +576,9 @@ impl From<IgdError> for Failure {
             }
             IgdError::PermanentLeaseOnly => Failure::Refused("the router keeps only permanent mappings".into()),
             IgdError::NoSuchMapping => Failure::Refused("the router has no such mapping".into()),
+            IgdError::CannotCheck(reason) => {
+                Failure::Refused(format!("could not check what the router holds at that port ({reason}): left alone"))
+            }
             IgdError::Other(reason) => Failure::Broken(reason),
         }
     }
@@ -637,6 +659,31 @@ impl Igd for RealIgd {
     async fn remove_port(&self, external_port: u16) -> Result<(), IgdError> {
         Ok(self.gateway.remove_port(PortMappingProtocol::UDP, external_port).await?)
     }
+
+    async fn entry_at(&self, external_port: u16) -> Result<Option<Entry>, IgdError> {
+        // `igd-next` lists by index only: read the table until the entry, or its end.
+        for index in 0..MAX_LISTED {
+            match self.gateway.get_generic_port_mapping_entry(index).await {
+                Ok(entry) if entry.protocol == PortMappingProtocol::UDP && entry.external_port == external_port => {
+                    return Ok(Some(Entry {
+                        internal_client: entry.internal_client,
+                        internal_port: entry.internal_port,
+                    }));
+                }
+                Ok(_) => {}
+                Err(GetGenericPortMappingEntryError::SpecifiedArrayIndexInvalid) => return Ok(None),
+                Err(GetGenericPortMappingEntryError::ActionNotAuthorized) => {
+                    return Err(IgdError::CannotCheck("the router does not let this PC read its mappings".into()));
+                }
+                Err(other) => return Err(IgdError::CannotCheck(other.to_string())),
+            }
+        }
+        Err(IgdError::CannotCheck(format!("it is not among the first {MAX_LISTED} mappings")))
+    }
+
+    fn is_this_pc(&self, client: &str) -> bool {
+        client.parse::<IpAddr>().is_ok_and(|ip| ip == self.local_ip)
+    }
 }
 
 /// The port after `port` for a router that says it is taken.
@@ -659,7 +706,11 @@ async fn upnp_map<I: Igd>(igd: &I, request: &Request) -> Result<Granted, Failure
     for _ in 0..MAX_ATTEMPTS {
         let lease_secs = if permanent { 0 } else { request.lease_secs };
         let attempt = if router_chooses {
-            igd.add_any_port(request.local_port, lease_secs).await
+            // Port 0 is no port: a router that answers it is as good as one whose AddAnyPortMapping does not work.
+            igd.add_any_port(request.local_port, lease_secs).await.and_then(|port| match port {
+                0 => Err(IgdError::Other("the router reserved external port 0".into())),
+                port => Ok(port),
+            })
         } else {
             igd.add_port(port, request.local_port, lease_secs).await.map(|()| port)
         };
@@ -690,6 +741,24 @@ async fn upnp_map<I: Igd>(igd: &I, request: &Request) -> Result<Granted, Failure
         }
     }
     Err(Failure::Refused(format!("{MAX_ATTEMPTS} external ports in a row were refused or taken")))
+}
+
+/// Gives a UPnP mapping back, but only if what the router holds at its external port is this PC's own. Nothing there
+/// is done already; something else there is left alone, and so is a table that cannot be read.
+async fn upnp_remove<I: Igd>(igd: &I, mapping: &Mapping) -> Result<(), Failure> {
+    let Some(held) = igd.entry_at(mapping.external_port).await? else { return Ok(()) };
+    if held.internal_port != mapping.local_port || !igd.is_this_pc(&held.internal_client) {
+        return Err(Failure::Refused(format!(
+            "the router holds UDP {} for {}:{}, not for this PC's port {}: left alone",
+            mapping.external_port, held.internal_client, held.internal_port, mapping.local_port
+        )));
+    }
+    match igd.remove_port(mapping.external_port).await {
+        Ok(()) => Ok(()),
+        // Gone since it was read (a restart, or the lease ended): that is what was asked for.
+        Err(IgdError::NoSuchMapping) => Ok(()),
+        Err(e) => Err(e.into()),
+    }
 }
 
 #[cfg(test)]
@@ -975,6 +1044,8 @@ mod tests {
         Works,
         /// In the description of the router, then an error when called.
         Broken,
+        /// In the description of the router, then it answers port 0.
+        Zero,
     }
 
     struct FakeIgd {
@@ -986,8 +1057,14 @@ mod tests {
         same_port_only: bool,
         denied: bool,
         calls: Mutex<Vec<String>>,
-        /// external port -> (internal port, lease)
+        /// external port -> (internal port, lease), for this PC
         mapped: Mutex<HashMap<u16, (u16, u32)>>,
+        /// This PC, as the router knows it.
+        local_ip: IpAddr,
+        /// What the router holds for other computers: external port -> (internal client, internal port).
+        others: Mutex<HashMap<u16, (String, u16)>>,
+        /// What the router says when asked what it holds at a port.
+        listing: Result<(), IgdError>,
     }
 
     impl FakeIgd {
@@ -1001,6 +1078,9 @@ mod tests {
                 denied: false,
                 calls: Mutex::default(),
                 mapped: Mutex::default(),
+                local_ip: "192.0.2.10".parse().unwrap(),
+                others: Mutex::default(),
+                listing: Ok(()),
             }
         }
 
@@ -1028,6 +1108,9 @@ mod tests {
             if self.any_port == AnyPort::Broken {
                 return Err(IgdError::Other("500 action failed".into()));
             }
+            if self.any_port == AnyPort::Zero {
+                return Ok(0);
+            }
             let mut mapped = self.mapped.lock().unwrap();
             let port = (40000..).find(|port| !self.taken.contains(port) && !mapped.contains_key(port)).unwrap();
             mapped.insert(port, (local_port, lease_secs));
@@ -1053,10 +1136,31 @@ mod tests {
         }
 
         async fn remove_port(&self, external_port: u16) -> Result<(), IgdError> {
-            match self.mapped.lock().unwrap().remove(&external_port) {
-                Some(_) => Ok(()),
-                None => Err(IgdError::NoSuchMapping),
+            self.calls.lock().unwrap().push(format!("delete {external_port}"));
+            // A router deletes whatever is at that port, whoever it is for.
+            let ours = self.mapped.lock().unwrap().remove(&external_port).is_some();
+            let theirs = self.others.lock().unwrap().remove(&external_port).is_some();
+            if ours || theirs {
+                Ok(())
+            } else {
+                Err(IgdError::NoSuchMapping)
             }
+        }
+
+        async fn entry_at(&self, external_port: u16) -> Result<Option<Entry>, IgdError> {
+            self.calls.lock().unwrap().push(format!("look {external_port}"));
+            self.listing.clone()?;
+            if let Some((internal_port, _)) = self.mapped.lock().unwrap().get(&external_port) {
+                return Ok(Some(Entry { internal_client: self.local_ip.to_string(), internal_port: *internal_port }));
+            }
+            let others = self.others.lock().unwrap();
+            Ok(others
+                .get(&external_port)
+                .map(|(client, port)| Entry { internal_client: client.clone(), internal_port: *port }))
+        }
+
+        fn is_this_pc(&self, client: &str) -> bool {
+            client == self.local_ip.to_string()
         }
     }
 
@@ -1078,6 +1182,15 @@ mod tests {
         let granted = upnp_map(&igd, &request()).await.unwrap();
         assert_eq!(granted.external_port, 7422);
         assert_eq!(igd.calls(), ["7420 -> 7420 lease 3600", "7421 -> 7420 lease 3600", "7422 -> 7420 lease 3600"]);
+    }
+
+    #[tokio::test]
+    async fn upnp_add_any_port_that_answers_port_0_falls_back_to_add_port() {
+        let igd = FakeIgd { any_port: AnyPort::Zero, taken: ports([7420]), ..FakeIgd::new() };
+        let granted = upnp_map(&igd, &request()).await.unwrap();
+        assert_eq!(granted.external_port, 7421);
+        assert_eq!(igd.calls(), ["7420 -> 7420 lease 3600", "any -> 7420 lease 3600", "7421 -> 7420 lease 3600"]);
+        assert!(!igd.mapped.lock().unwrap().contains_key(&0));
     }
 
     #[tokio::test]
@@ -1177,6 +1290,59 @@ mod tests {
         assert_eq!(upnp_map(&igd, &renewal).await.unwrap().external_port, first.external_port + 1);
     }
 
+    // --- UPnP: giving the port back only when it is this PC's ---
+
+    #[tokio::test]
+    async fn upnp_removal_reads_the_entry_and_deletes_what_is_this_pcs() {
+        let igd = FakeIgd::new();
+        let granted = upnp_map(&igd, &request()).await.unwrap();
+        let held = Mapping { external_port: granted.external_port, ..mapping(MappingProtocol::Upnp, 0) };
+        upnp_remove(&igd, &held).await.unwrap();
+        assert!(igd.mapped.lock().unwrap().is_empty());
+        assert_eq!(igd.calls(), ["7420 -> 7420 lease 3600", "look 7420", "delete 7420"]);
+    }
+
+    #[tokio::test]
+    async fn upnp_removal_leaves_the_mapping_of_another_computer_alone() {
+        // After a move: the router of the new network holds that port number for someone else.
+        let igd = FakeIgd::new();
+        igd.others.lock().unwrap().insert(7420, ("192.0.2.99".into(), 7420));
+        let failure = upnp_remove(&igd, &mapping(MappingProtocol::Upnp, 7420)).await.unwrap_err();
+        let reason = failure.to_string();
+        assert!(matches!(failure, Failure::Refused(_)), "{reason}");
+        assert!(reason.contains("192.0.2.99") && reason.contains("left alone"), "{reason}");
+        assert!(igd.others.lock().unwrap().contains_key(&7420), "still there");
+        assert_eq!(igd.calls(), ["look 7420"]);
+    }
+
+    #[tokio::test]
+    async fn upnp_removal_leaves_alone_a_mapping_of_this_pc_for_another_port() {
+        // Another program of this PC holds that external port, for its own port.
+        let igd = FakeIgd::new();
+        igd.others.lock().unwrap().insert(7420, (igd.local_ip.to_string(), 9000));
+        let failure = upnp_remove(&igd, &mapping(MappingProtocol::Upnp, 7420)).await.unwrap_err();
+        assert!(matches!(failure, Failure::Refused(_)), "{failure:?}");
+        assert!(igd.others.lock().unwrap().contains_key(&7420));
+        assert_eq!(igd.calls(), ["look 7420"]);
+    }
+
+    #[tokio::test]
+    async fn upnp_removal_of_what_the_router_no_longer_has_is_done() {
+        let igd = FakeIgd::new();
+        upnp_remove(&igd, &mapping(MappingProtocol::Upnp, 7420)).await.unwrap();
+        assert_eq!(igd.calls(), ["look 7420"], "nothing to delete");
+    }
+
+    #[tokio::test]
+    async fn upnp_removal_deletes_nothing_when_the_router_will_not_say_what_it_holds() {
+        let igd = FakeIgd { listing: Err(IgdError::CannotCheck("no".into())), ..FakeIgd::new() };
+        igd.mapped.lock().unwrap().insert(7420, (7420, 3600));
+        let failure = upnp_remove(&igd, &mapping(MappingProtocol::Upnp, 7420)).await.unwrap_err();
+        assert!(matches!(&failure, Failure::Refused(reason) if reason.contains("left alone")), "{failure:?}");
+        assert!(igd.mapped.lock().unwrap().contains_key(&7420), "left to its lease");
+        assert_eq!(igd.calls(), ["look 7420"]);
+    }
+
     #[test]
     fn ports_do_not_run_past_the_end() {
         assert_eq!(next_port(7420), 7421);
@@ -1254,6 +1420,10 @@ mod tests {
         mapped: HashMap<u16, Stored>,
         /// The SOAP actions received, in order.
         actions: Vec<String>,
+        /// The UPnP error code the router answers when asked to list its mappings (606: not authorized).
+        listing_fault: Option<u16>,
+        /// `AddAnyPortMapping` answers that it reserved port 0.
+        reserve_zero: bool,
     }
 
     /// A router on loopback: answers the SSDP search, describes itself and speaks SOAP. It runs on
@@ -1275,6 +1445,8 @@ mod tests {
                 denied: false,
                 mapped: HashMap::new(),
                 actions: Vec::new(),
+                listing_fault: None,
+                reserve_zero: false,
             };
             configure(&mut state);
             let state = Arc::new(Mutex::new(state));
@@ -1419,6 +1591,20 @@ mod tests {
         actions += &action("GetExternalIPAddress", &[("NewExternalIPAddress", "out")]);
         actions +=
             &action("DeletePortMapping", &[("NewRemoteHost", "in"), ("NewExternalPort", "in"), ("NewProtocol", "in")]);
+        actions += &action(
+            "GetGenericPortMappingEntry",
+            &[
+                ("NewPortMappingIndex", "in"),
+                ("NewRemoteHost", "out"),
+                ("NewExternalPort", "out"),
+                ("NewProtocol", "out"),
+                ("NewInternalPort", "out"),
+                ("NewInternalClient", "out"),
+                ("NewEnabled", "out"),
+                ("NewPortMappingDescription", "out"),
+                ("NewLeaseDuration", "out"),
+            ],
+        );
         if add_any_port {
             let mut arguments = add_port.to_vec();
             arguments.push(("NewReservedPort", "out"));
@@ -1482,6 +1668,9 @@ mod tests {
                         && state.mapped.get(&port).is_none_or(|held| held.client == stored.client)
                 };
                 if action == "AddAnyPortMapping" {
+                    if state.reserve_zero {
+                        return ok("<NewReservedPort>0</NewReservedPort>");
+                    }
                     let reserved = std::iter::once(external).chain(40000..).find(|port| free(*port, state)).unwrap();
                     state.mapped.insert(reserved, stored);
                     return ok(&format!("<NewReservedPort>{reserved}</NewReservedPort>"));
@@ -1491,6 +1680,26 @@ mod tests {
                 }
                 state.mapped.insert(external, stored);
                 ok("")
+            }
+            "GetGenericPortMappingEntry" => {
+                if let Some(code) = state.listing_fault {
+                    return fault(code, "The router will not list its mappings");
+                }
+                let mut ports: Vec<u16> = state.mapped.keys().copied().collect();
+                ports.sort_unstable();
+                let index = arg("NewPortMappingIndex").and_then(|value| value.parse::<usize>().ok());
+                let Some(port) = index.and_then(|index| ports.get(index).copied()) else {
+                    return fault(713, "SpecifiedArrayIndexInvalid");
+                };
+                let held = &state.mapped[&port];
+                ok(&format!(
+                    "<NewRemoteHost></NewRemoteHost><NewExternalPort>{port}</NewExternalPort>\
+                     <NewProtocol>{}</NewProtocol><NewInternalPort>{}</NewInternalPort>\
+                     <NewInternalClient>{}</NewInternalClient><NewEnabled>1</NewEnabled>\
+                     <NewPortMappingDescription>Velora</NewPortMappingDescription>\
+                     <NewLeaseDuration>{}</NewLeaseDuration>",
+                    held.protocol, held.internal_port, held.client, held.lease
+                ))
             }
             "DeletePortMapping" => {
                 match arg("NewExternalPort").and_then(|v| v.parse().ok()).and_then(|p: u16| state.mapped.remove(&p)) {
@@ -1581,6 +1790,116 @@ mod tests {
         assert!(router.state.lock().unwrap().mapped.is_empty());
         // The router now says there is no such mapping, which is as good as removed.
         remove_with(&upnp, &renewed, Duration::from_secs(4)).await.unwrap();
+    }
+
+    fn someone_elses(port: u16) -> Stored {
+        Stored { protocol: "UDP".into(), client: "192.0.2.99".into(), internal_port: port, lease: 3600 }
+    }
+
+    #[tokio::test]
+    async fn upnp_real_removal_reads_the_entry_and_then_deletes_it() {
+        let router = FakeUpnpRouter::start(|state| {
+            // Other computers' mappings come before and after this PC's in the router's table.
+            state.mapped.insert(7000, someone_elses(7000));
+            state.mapped.insert(9000, someone_elses(9000));
+        });
+        let upnp = router.upnp();
+        let granted = upnp.map(&request()).await.unwrap();
+        let ours = Mapping { external_port: granted.external_port, ..mapping(MappingProtocol::Upnp, 0) };
+        let before = router.actions().len();
+        upnp.remove(&ours).await.unwrap();
+        // The table is read until this PC's entry (the second: 7000, 7420), and that entry is deleted.
+        let actions = router.actions();
+        assert_eq!(
+            actions[before..],
+            ["GetGenericPortMappingEntry", "GetGenericPortMappingEntry", "DeletePortMapping"]
+        );
+        let held = router.state.lock().unwrap().mapped.keys().copied().collect::<HashSet<u16>>();
+        assert_eq!(held, ports([7000, 9000]), "only this PC's mapping went");
+    }
+
+    #[tokio::test]
+    async fn upnp_real_removal_leaves_the_mapping_of_another_computer_alone() {
+        let router = FakeUpnpRouter::start(|state| {
+            state.mapped.insert(7420, someone_elses(7420));
+        });
+        let failure = router.upnp().remove(&mapping(MappingProtocol::Upnp, 7420)).await.unwrap_err();
+        assert!(matches!(&failure, Failure::Refused(reason) if reason.contains("192.0.2.99")), "{failure:?}");
+        assert_eq!(router.actions(), ["GetGenericPortMappingEntry"]);
+        assert!(router.state.lock().unwrap().mapped.contains_key(&7420), "not deleted");
+    }
+
+    #[tokio::test]
+    async fn upnp_real_removal_of_a_mapping_the_router_does_not_have_is_done() {
+        let router = FakeUpnpRouter::start(|state| {
+            state.mapped.insert(7000, someone_elses(7000));
+        });
+        router.upnp().remove(&mapping(MappingProtocol::Upnp, 7420)).await.unwrap();
+        // The table was read to its end (one entry, then the router says there is no second) and nothing was deleted.
+        assert_eq!(router.actions(), ["GetGenericPortMappingEntry", "GetGenericPortMappingEntry"]);
+        assert_eq!(router.state.lock().unwrap().mapped.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn upnp_real_removal_from_a_router_that_will_not_list_deletes_nothing() {
+        // Not authorized (606), and any other answer a router gives to a table it cannot or will not list: 401 (no
+        // such action) and 501 (action failed).
+        for code in [606, 401, 501] {
+            let router = FakeUpnpRouter::start(|state| {
+                state.listing_fault = Some(code);
+                state.mapped.insert(
+                    7420,
+                    Stored { protocol: "UDP".into(), client: "127.0.0.1".into(), internal_port: 7420, lease: 3600 },
+                );
+            });
+            let failure = router.upnp().remove(&mapping(MappingProtocol::Upnp, 7420)).await.unwrap_err();
+            assert!(
+                matches!(&failure, Failure::Refused(reason) if reason.contains("left alone")),
+                "{code}: {failure:?}"
+            );
+            assert_eq!(router.actions(), ["GetGenericPortMappingEntry"], "{code}");
+            assert!(router.state.lock().unwrap().mapped.contains_key(&7420), "{code}: left to its lease");
+        }
+    }
+
+    #[tokio::test]
+    async fn upnp_real_removal_ignores_mappings_of_another_protocol() {
+        let router = FakeUpnpRouter::start(|state| {
+            state.mapped.insert(7420, Stored { protocol: "TCP".into(), ..someone_elses(7420) });
+        });
+        router.upnp().remove(&mapping(MappingProtocol::Upnp, 7420)).await.unwrap();
+        // The only entry is a TCP one: not this UDP mapping, so it is gone already, and the TCP one stays.
+        assert_eq!(router.actions(), ["GetGenericPortMappingEntry", "GetGenericPortMappingEntry"]);
+        assert!(router.state.lock().unwrap().mapped.contains_key(&7420));
+    }
+
+    #[tokio::test]
+    async fn upnp_real_removal_gives_up_on_a_table_longer_than_it_reads() {
+        let router = FakeUpnpRouter::start(|state| {
+            for port in 10_000..10_000 + MAX_LISTED as u16 {
+                state.mapped.insert(port, someone_elses(port));
+            }
+            // This PC's own comes last in the order of the router.
+            state.mapped.insert(60_000, Stored { client: "127.0.0.1".into(), ..someone_elses(7420) });
+        });
+        let ours = Mapping { local_port: 7420, ..mapping(MappingProtocol::Upnp, 60_000) };
+        let failure = router.upnp().remove(&ours).await.unwrap_err();
+        assert!(matches!(&failure, Failure::Refused(reason) if reason.contains("not among the first")), "{failure:?}");
+        assert!(router.state.lock().unwrap().mapped.contains_key(&60_000), "left to its lease");
+        assert_eq!(router.actions().len(), MAX_LISTED as usize, "no more than that was read");
+    }
+
+    #[tokio::test]
+    async fn upnp_real_router_that_reserves_port_0_is_not_believed() {
+        let router = FakeUpnpRouter::start(|state| {
+            state.add_any_port = true;
+            state.reserve_zero = true;
+            state.taken.insert(7420);
+        });
+        let granted = router.upnp().map(&request()).await.unwrap();
+        assert_eq!(granted.external_port, 7421);
+        assert_eq!(router.actions(), ["GetExternalIPAddress", "AddPortMapping", "AddAnyPortMapping", "AddPortMapping"]);
+        assert!(!router.state.lock().unwrap().mapped.contains_key(&0));
     }
 
     // --- NAT-PMP: the real exchange, against a fake router on loopback ---
