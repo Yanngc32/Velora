@@ -30,7 +30,8 @@ use clap::{Parser, Subcommand};
 use gui::strings::{fill, Strings};
 use settings::Settings;
 use velora_client_core::{
-    hosts, FrameSlot, InputSender, OfferEvent, Route, RouteKind, Session, VideoFrame, VideoOutput, WakeOutcome,
+    hosts, FrameSlot, InputSender, LinkState, NoWayIn, OfferEvent, Route, RouteKind, Session, VideoFrame, VideoOutput,
+    WakeOutcome,
 };
 use velora_protocol::{
     identity::{KnownHost, StateDir},
@@ -214,19 +215,20 @@ fn run() -> Result<()> {
             if let Some(link) = offer {
                 session.input.offer_pairing(&link);
             }
-            run_window(&runtime, event_loop, session, slot, share_clipboard)
+            run_window(&runtime, event_loop, session, slot, share_clipboard, hosts::list(&state).unwrap_or_default())
         }
         Command::Connect { host } => {
             let paired = free_relay(&state, &host, s)?;
             let (proxy, event_loop) = new_event_loop()?;
             let slot = Arc::new(FrameSlot::default());
             let output = VideoOutput::Decoded { slot: slot.clone(), on_frame: redraw_callback(proxy) };
-            let session = runtime.block_on(hosts::connect(&state, &host, &device_name, password, output))?;
+            let session = runtime.block_on(hosts::connect(&state, &host, &device_name, password, output));
+            let session = session.map_err(|e| explain_no_way_in(e, s))?;
             require_screen(&session, s)?;
             println!("{}", connected_line(s, &session.host_name, &way_in(&state, &session, s)));
             // Held for as long as the window lives: the operating system frees it when the process ends, however it does.
-            let _claim = hold_relay(&state, paired.as_deref(), session.route());
-            run_window(&runtime, event_loop, session, slot, share_clipboard)
+            let _claim = hold_relay(&state, paired.as_deref(), &session.route());
+            run_window(&runtime, event_loop, session, slot, share_clipboard, hosts::list(&state).unwrap_or_default())
         }
         Command::Bench { host, seconds } => runtime.block_on(async {
             let paired = free_relay(&state, &host, s)?;
@@ -236,9 +238,11 @@ fn run() -> Result<()> {
                 counter.fetch_add(1, Ordering::Relaxed);
             });
             let output = VideoOutput::Decoded { slot: Arc::new(FrameSlot::default()), on_frame };
-            let session = hosts::connect(&state, &host, &device_name, password, output).await?;
+            let session = hosts::connect(&state, &host, &device_name, password, output)
+                .await
+                .map_err(|e| explain_no_way_in(e, s))?;
             require_screen(&session, s)?;
-            let _claim = hold_relay(&state, paired.as_deref(), session.route());
+            let _claim = hold_relay(&state, paired.as_deref(), &session.route());
             println!(
                 "{} ({}x{})",
                 connected_line(s, &session.host_name, &way_in(&state, &session, s)),
@@ -255,6 +259,14 @@ fn run() -> Result<()> {
             session.close();
             Ok(())
         }),
+    }
+}
+
+/// A connection mode that fits none of the host's addresses, in the launcher's words; other errors as they are.
+fn explain_no_way_in(e: anyhow::Error, s: &Strings) -> anyhow::Error {
+    match e.downcast_ref::<NoWayIn>() {
+        Some(NoWayIn(mode)) => anyhow::anyhow!(fill(s.no_way_in, &[gui::mode_name(*mode, s)])),
+        None => e,
     }
 }
 
@@ -300,7 +312,24 @@ fn wake_report(outcome: Result<WakeOutcome>, s: &Strings) -> Result<String> {
 /// Which way in a connection took, in the launcher's words (`reach_kind_*` and the like in `strings.rs`) and in its form
 /// (`last_reached_text` there): the label, a middle dot and the address, with the relay's name between them for a relay.
 fn route_words(route: &Route, known: &[KnownHost], s: &Strings) -> String {
-    let (label, relay) = match &route.kind {
+    let (label, relay) = route_parts(route, known, s);
+    match relay {
+        Some(name) => format!("{label} · {name} · {}", route.address),
+        None => format!("{label} · {}", route.address),
+    }
+}
+
+/// Which way in a connection took, without the address: what the session window's title says.
+fn route_short(route: &Route, known: &[KnownHost], s: &Strings) -> String {
+    match route_parts(route, known, s) {
+        (label, Some(name)) => format!("{label} · {name}"),
+        (label, None) => label.to_string(),
+    }
+}
+
+/// The label of a way in, and the name of the relay for one.
+fn route_parts(route: &Route, known: &[KnownHost], s: &Strings) -> (&'static str, Option<String>) {
+    match &route.kind {
         RouteKind::Punch => (s.reach_kind_punch, None),
         RouteKind::Address(AddressKind::Lan) => (s.reach_kind_lan, None),
         RouteKind::Address(AddressKind::Vpn) => (s.reach_kind_vpn, None),
@@ -310,10 +339,6 @@ fn route_words(route: &Route, known: &[KnownHost], s: &Strings) -> String {
             (s.reach_kind_relay, Some(relay_name(fingerprint, known)))
         }
         RouteKind::Address(AddressKind::Other(_)) => (s.reach_kind_other, None),
-    };
-    match relay {
-        Some(name) => format!("{label} · {name} · {}", route.address),
-        None => format!("{label} · {}", route.address),
     }
 }
 
@@ -328,7 +353,7 @@ fn relay_name(fingerprint: &str, known: &[KnownHost]) -> String {
 
 /// How `session` reached its host, in words (see [`route_words`]).
 fn way_in(state: &StateDir, session: &Session, s: &Strings) -> String {
-    route_words(session.route(), &hosts::list(state).unwrap_or_default(), s)
+    route_words(&session.route(), &hosts::list(state).unwrap_or_default(), s)
 }
 
 /// The line `velora connect` prints once the session is up, and `velora bench` starts with.
@@ -443,6 +468,7 @@ fn run_window(
     session: Session,
     frames: Arc<FrameSlot>,
     share_clipboard: bool,
+    known: Vec<KnownHost>,
 ) -> Result<()> {
     let session = Arc::new(session);
     let transfers = Arc::new(Mutex::new(Transfers::default()));
@@ -490,6 +516,20 @@ fn run_window(
             std::process::exit(0);
         });
     }
+    // How the connection stands, in the title: the way in, or that it is being regained.
+    let link = Arc::new(Mutex::new(None));
+    {
+        let (link, proxy) = (link.clone(), proxy.clone());
+        let s = gui::strings::current();
+        session.on_link(Arc::new(move |now: &LinkState| {
+            let text = match now {
+                LinkState::Up(route) => route_short(route, &known, s),
+                LinkState::Reconnecting => s.session_reconnecting.to_string(),
+            };
+            *link.lock().unwrap() = Some(text);
+            let _ = proxy.send_event(());
+        }));
+    }
     // The host's displays, when it has several: shown in the title, picked with shortcuts.
     let displays = Arc::new(Mutex::new(None));
     {
@@ -507,6 +547,7 @@ fn run_window(
         proxy,
         transfers,
         displays,
+        link,
         muted: false,
         title: format!("{} — Velora", session.host_name),
         shown_title: String::new(),
@@ -608,6 +649,8 @@ struct App {
     proxy: EventLoopProxy<()>,
     transfers: Arc<Mutex<Transfers>>,
     displays: Arc<Mutex<Option<DisplayList>>>,
+    /// The way in, or that the connection is being regained, in words.
+    link: Arc<Mutex<Option<String>>>,
     /// The host's sound is muted here.
     muted: bool,
     /// Base title, and the one on screen (with the display, sound and transfers).
@@ -661,6 +704,9 @@ impl App {
 
     fn refresh_title(&mut self) {
         let mut title = self.title.clone();
+        if let Some(link) = self.link.lock().unwrap().as_ref() {
+            title = format!("{title} · {link}");
+        }
         if let Some(d) = self.displays.lock().unwrap().as_ref().filter(|d| d.list.len() > 1) {
             let s = gui::strings::current();
             let (n, of) = ((d.current as usize + 1).to_string(), d.list.len().to_string());

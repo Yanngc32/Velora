@@ -81,6 +81,64 @@ pub struct KnownHost {
     /// The MAC address of the host's network adapter, for Wake-on-LAN. Written as base64url text.
     #[serde(default, skip_serializing_if = "Option::is_none", with = "base64_bytes")]
     pub mac: Option<[u8; 6]>,
+    /// The ways in a connection to the host may take: the user's choice. Not written while it
+    /// is [`ConnectMode::Auto`].
+    #[serde(default, skip_serializing_if = "ConnectMode::is_auto")]
+    pub mode: ConnectMode,
+}
+
+/// Which ways of reaching a host a connection may take.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum ConnectMode {
+    /// Whichever answers first, and a better one when it appears during the session.
+    #[default]
+    Auto,
+    /// Only the host's addresses on the local network.
+    Lan,
+    /// Only the host's addresses on a VPN mesh (Tailscale, Netbird).
+    Vpn,
+    /// Only Velora's own ways from other networks: the router's public address, global IPv6,
+    /// hole punching and relays through the user's other PCs.
+    Velora,
+}
+
+impl ConnectMode {
+    pub const ALL: [ConnectMode; 4] = [Self::Auto, Self::Lan, Self::Vpn, Self::Velora];
+
+    pub fn is_auto(&self) -> bool {
+        *self == Self::Auto
+    }
+
+    /// The word written in the state file.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Lan => "lan",
+            Self::Vpn => "vpn",
+            Self::Velora => "velora",
+        }
+    }
+}
+
+impl std::str::FromStr for ConnectMode {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        Self::ALL.into_iter().find(|mode| mode.as_str() == s).with_context(|| format!("unknown connection mode '{s}'"))
+    }
+}
+
+impl Serialize for ConnectMode {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
+    }
+}
+
+/// A word this version does not know (a later one's mode) reads as `Auto`: the entry stays usable.
+impl<'de> Deserialize<'de> for ConnectMode {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        Ok(String::deserialize(d)?.parse().unwrap_or_default())
+    }
 }
 
 /// `Option<[u8; N]>` as base64url text, which reads better in a state file than a list of
@@ -253,5 +311,19 @@ mod tests {
         let hosts: Vec<KnownHost> = serde_json::from_str(json).unwrap();
         assert_eq!((hosts[0].key, hosts[0].secret, hosts[0].mac), (None, None, None));
         assert_eq!(hosts[0].kinds, vec![(AddressKind::Lan, "a:1".to_string())]);
+    }
+
+    #[test]
+    fn the_connection_mode_is_written_only_when_chosen_and_an_unknown_one_reads_as_auto() {
+        assert!(!serde_json::to_string(&old_host()).unwrap().contains("mode"), "auto is not written");
+        let tailscale = KnownHost { mode: ConnectMode::Vpn, ..old_host() };
+        let json = serde_json::to_string(&tailscale).unwrap();
+        assert!(json.contains(r#""mode":"vpn""#), "{json}");
+        assert_eq!(serde_json::from_str::<KnownHost>(&json).unwrap(), tailscale);
+        let later = r#"{"name":"PC","address":"a:1","fingerprint":"f","mode":"carrier-pigeon"}"#;
+        assert_eq!(serde_json::from_str::<KnownHost>(later).unwrap().mode, ConnectMode::Auto);
+        for mode in ConnectMode::ALL {
+            assert_eq!(mode.as_str().parse::<ConnectMode>().unwrap(), mode);
+        }
     }
 }

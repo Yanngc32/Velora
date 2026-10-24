@@ -7,7 +7,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use velora_protocol::{
-    identity::{KnownHost, StateDir},
+    identity::{ConnectMode, KnownHost, StateDir},
     pairing::PairingCode,
     tls::Fingerprint,
     wire::DEFAULT_PORT,
@@ -34,6 +34,15 @@ pub fn forget(state: &StateDir, name: &str) -> Result<()> {
     let _exclusive = exclusive();
     let mut hosts = list(state)?;
     hosts.retain(|h| h.name != name);
+    state.save(StateDir::KNOWN_HOSTS, &hosts)
+}
+
+/// Sets the ways in connections to the paired host called `name` may take (see [`ConnectMode`]).
+pub fn set_mode(state: &StateDir, name: &str, mode: ConnectMode) -> Result<()> {
+    let _exclusive = exclusive();
+    let mut hosts = list(state)?;
+    let host = hosts.iter_mut().find(|h| h.name == name).with_context(|| format!("'{name}' is not paired"))?;
+    host.mode = mode;
     state.save(StateDir::KNOWN_HOSTS, &hosts)
 }
 
@@ -487,6 +496,17 @@ mod tests {
         assert_eq!((stored.name.as_str(), stored.fingerprint.as_str()), ("fake-pc", host.entry().fingerprint.as_str()));
         assert_eq!(stored.secret, Some([9; 16]));
         session.close();
+    }
+
+    #[test]
+    fn the_mode_is_kept_through_pairing_again_and_unknown_hosts_are_an_error() {
+        let temp = TempDir::new();
+        let state = state(&temp);
+        remember(&state, "pc", "192.0.2.10:7420", &[], FINGERPRINT).unwrap();
+        set_mode(&state, "pc", ConnectMode::Lan).unwrap();
+        remember(&state, "pc", "192.0.2.11:7420", &[], FINGERPRINT).unwrap();
+        assert_eq!(list(&state).unwrap()[0].mode, ConnectMode::Lan);
+        assert!(set_mode(&state, "nobody", ConnectMode::Vpn).is_err());
     }
 
     #[tokio::test]

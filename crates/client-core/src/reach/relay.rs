@@ -968,7 +968,7 @@ mod tests {
             .unwrap();
         assert_eq!((session.host_name.as_str(), session.width, session.height), ("relayed-pc", 1280, 720));
         let relay = AddressKind::Relay(rig.identity.fingerprint().to_base64());
-        assert_eq!(session.route(), &Route { kind: relay.into(), address: rig.addr.to_string() });
+        assert_eq!(session.route(), Route { kind: relay.into(), address: rig.addr.to_string() });
         // The hello asked for Reach, the host sent one, and so it hears which of its addresses was reached: the relay's.
         assert!(within("hello", host.hellos.recv()).await.unwrap().unwrap().reach);
         let reached = ClientMsg::Reached { address: rig.addr.to_string() };

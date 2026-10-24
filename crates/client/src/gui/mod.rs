@@ -35,7 +35,7 @@ pub use this_pc::spawn_host;
 use this_pc::{HostLink, ServiceJob};
 use velora_client_core::hosts;
 use velora_protocol::{
-    identity::{KnownHost, StateDir},
+    identity::{ConnectMode, KnownHost, StateDir},
     pairing::{parse_pairing_link, PairingCode},
 };
 use widgets::*;
@@ -688,6 +688,12 @@ impl Launcher {
             Some((DeviceAction::Files, name)) => {
                 self.open_files(name, ui.ctx());
             }
+            Some((DeviceAction::Mode(mode), name)) => {
+                if let Err(e) = hosts::set_mode(&self.state, &name, mode) {
+                    self.error = Some(format!("{e:#}"));
+                }
+                self.refresh_hosts();
+            }
             Some((DeviceAction::Forget, name)) => {
                 if let Err(e) = hosts::forget(&self.state, &name) {
                     self.error = Some(format!("{e:#}"));
@@ -1210,6 +1216,60 @@ enum DeviceAction {
     Connect,
     Files,
     Forget,
+    Mode(ConnectMode),
+}
+
+/// The name of a connection mode, in the launcher's words.
+pub(crate) fn mode_name(mode: ConnectMode, s: &Strings) -> &'static str {
+    match mode {
+        ConnectMode::Auto => s.mode_auto,
+        ConnectMode::Lan => s.mode_lan,
+        ConnectMode::Vpn => s.mode_vpn,
+        ConnectMode::Velora => s.mode_velora,
+    }
+}
+
+fn mode_hint(mode: ConnectMode, s: &Strings) -> &'static str {
+    match mode {
+        ConnectMode::Auto => s.mode_auto_hint,
+        ConnectMode::Lan => s.mode_lan_hint,
+        ConnectMode::Vpn => s.mode_vpn_hint,
+        ConnectMode::Velora => s.mode_velora_hint,
+    }
+}
+
+/// A small chip with the connection mode of a computer; a click lists the modes, each with what it does. The mode picked,
+/// when it changed.
+fn mode_chip(ui: &mut egui::Ui, s: &Strings, current: ConnectMode) -> Option<ConnectMode> {
+    let text = format!("{} · {}", s.mode_label, mode_name(current, s));
+    let name = ui.painter().layout_no_wrap(text, font(12.0, medium()), WEAK);
+    let size = Vec2::new(10.0 + name.size().x + 22.0, 22.0);
+    let (rect, button) = ui.allocate_exact_size(size, Sense::click());
+    let hover = ui.ctx().animate_bool_with_time(button.id.with("hover"), button.hovered(), HOVER_SECONDS);
+    let painter = ui.painter();
+    let tint = if current.is_auto() { BORDER } else { ACCENT_TEXT.gamma_multiply(0.6) };
+    painter.rect(rect, RADIUS, HOVER.gamma_multiply(hover), egui::Stroke::new(1.0, tint), egui::StrokeKind::Inside);
+    let color = WEAK.lerp_to_gamma(TEXT, hover);
+    painter.galley(egui::pos2(rect.left() + 10.0, rect.center().y - name.size().y / 2.0), name, color);
+    let c = egui::pos2(rect.right() - 11.0, rect.center().y + 1.0);
+    let chevron = vec![c + Vec2::new(-3.5, -2.0), c + Vec2::new(0.0, 1.5), c + Vec2::new(3.5, -2.0)];
+    painter.add(egui::Shape::line(chevron, egui::Stroke::new(1.3, color)));
+    let button = button.on_hover_cursor(egui::CursorIcon::PointingHand);
+    let mut pick = None;
+    egui::Popup::menu(&button).show(|ui| {
+        ui.set_width(300.0);
+        for mode in ConnectMode::ALL {
+            let label =
+                ui.selectable_label(mode == current, RichText::new(mode_name(mode, s)).font(font(13.5, semibold())));
+            ui.add(egui::Label::new(RichText::new(mode_hint(mode, s)).font(font(12.0, medium())).color(WEAK)).wrap());
+            ui.add_space(4.0);
+            if label.clicked() {
+                pick = Some(mode);
+                ui.close();
+            }
+        }
+    });
+    pick.filter(|mode| *mode != current)
 }
 
 /// A button that removes something only when held: grey at rest, red under the pointer
@@ -1317,6 +1377,9 @@ impl DeviceCard<'_> {
                 ui.spacing_mut().item_spacing.y = 4.0;
                 ui.add(egui::Label::new(RichText::new(&self.host.name).font(font(15.0, semibold()))).truncate());
                 ui.label(RichText::new(&self.host.address).font(mono(12.5)).color(WEAK));
+                if let Some(mode) = mode_chip(ui, s, self.host.mode) {
+                    action = Some(DeviceAction::Mode(mode));
+                }
             });
         });
         if self.running {

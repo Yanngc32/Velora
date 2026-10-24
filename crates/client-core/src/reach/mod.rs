@@ -41,7 +41,7 @@ use tokio::{
 };
 use velora_nat::addresses::{classify, AddressClass};
 use velora_protocol::{
-    identity::{Identity, KnownHost},
+    identity::{ConnectMode, Identity, KnownHost},
     tls::{self, Fingerprint},
     wire::{AddressKind, DEVICE_SECRET_LEN, REACH_KEY_LEN},
 };
@@ -138,6 +138,46 @@ impl fmt::Display for Candidate {
             }
             Self::Punch { endpoint, via } => write!(f, "punch {endpoint} (signalled through {} relays)", via.len()),
         }
+    }
+}
+
+/// How good a way in is, lower being better: what a session compares to move to a better one. The local network first;
+/// then a direct connection from elsewhere (a VPN mesh, the router's public address, IPv6, a punched hole), all alike;
+/// then a relay, which costs another PC its bandwidth and the session a hop.
+pub fn rank(kind: &RouteKind) -> u8 {
+    match kind {
+        RouteKind::Address(AddressKind::Lan) => 0,
+        RouteKind::Address(AddressKind::Relay(_)) => 2,
+        _ => 1,
+    }
+}
+
+/// Whether a connection in `mode` may take a way in of this kind. Kinds this version does not know are left to
+/// [`ConnectMode::Auto`].
+pub fn allows(mode: ConnectMode, kind: &RouteKind) -> bool {
+    match mode {
+        ConnectMode::Auto => true,
+        ConnectMode::Lan => *kind == RouteKind::Address(AddressKind::Lan),
+        ConnectMode::Vpn => *kind == RouteKind::Address(AddressKind::Vpn),
+        ConnectMode::Velora => matches!(
+            kind,
+            RouteKind::Punch | RouteKind::Address(AddressKind::Public | AddressKind::V6 | AddressKind::Relay(_))
+        ),
+    }
+}
+
+/// Which candidates a race may try: those the host's mode allows and, when a session looks for a better way in than the
+/// one it has, those of a lower rank only.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Filter {
+    pub mode: ConnectMode,
+    pub below: Option<u8>,
+}
+
+impl Filter {
+    pub fn admits(&self, candidate: &Candidate) -> bool {
+        let kind = candidate.route().kind;
+        allows(self.mode, &kind) && self.below.is_none_or(|below| rank(&kind) < below)
     }
 }
 
@@ -1161,5 +1201,33 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(wake(&Identity::generate().unwrap(), &host).await.unwrap(), WakeOutcome::NoRelay);
+    }
+
+    #[test]
+    fn a_mode_admits_its_own_ways_in_and_a_rank_only_better_ones() {
+        let fingerprint = Fingerprint([5; 32]);
+        let lan = Candidate::Direct("192.168.1.9:7420".parse().unwrap(), AddressKind::Lan);
+        let vpn = Candidate::Direct("100.101.102.103:7420".parse().unwrap(), AddressKind::Vpn);
+        let public = Candidate::Direct("203.0.113.7:51820".parse().unwrap(), AddressKind::Public);
+        let punch = Candidate::Punch { endpoint: "203.0.113.7:40000".parse().unwrap(), via: Vec::new() };
+        let relay = Candidate::Relay {
+            relay_addr: "198.51.100.2:7420".parse().unwrap(),
+            relay_fingerprint: fingerprint,
+            target: fingerprint,
+        };
+        let all = [&lan, &vpn, &public, &punch, &relay];
+        let admitted = |filter: Filter| all.iter().filter(|c| filter.admits(c)).count();
+        let only = |mode| Filter { mode, below: None };
+        assert_eq!(admitted(only(ConnectMode::Auto)), 5);
+        assert!(only(ConnectMode::Lan).admits(&lan) && admitted(only(ConnectMode::Lan)) == 1);
+        assert!(only(ConnectMode::Vpn).admits(&vpn) && admitted(only(ConnectMode::Vpn)) == 1);
+        assert_eq!(admitted(only(ConnectMode::Velora)), 3, "public, punch and relay");
+        assert!(!only(ConnectMode::Velora).admits(&lan) && !only(ConnectMode::Velora).admits(&vpn));
+        // From a relay, anything direct is better; from a direct way, only the local network; from it, nothing.
+        let below = |rank| Filter { mode: ConnectMode::Auto, below: Some(rank) };
+        assert_eq!(admitted(below(2)), 4);
+        assert_eq!(admitted(below(1)), 1);
+        assert_eq!(admitted(below(0)), 0);
+        assert!(!Filter { mode: ConnectMode::Velora, below: Some(2) }.admits(&lan), "the mode still holds");
     }
 }

@@ -21,6 +21,7 @@ use std::{
         atomic::{AtomicU32, Ordering},
         Arc, Mutex,
     },
+    time::Duration,
 };
 
 use anyhow::{bail, Result};
@@ -36,6 +37,7 @@ use velora_protocol::{
 
 pub use files::{OfferEvent, RemoteFiles};
 pub use reach::{ReachInfo, Route, RouteKind, WakeOutcome};
+pub use velora_protocol::identity::ConnectMode;
 
 #[cfg(feature = "decode")]
 pub use video::{Chroma, FrameSlot, GpuPicture, VideoFrame};
@@ -51,6 +53,7 @@ pub struct EncodedFrame {
     pub data: Vec<u8>,
 }
 
+#[derive(Clone)]
 pub enum VideoOutput {
     /// Decode in software into `slot`; `on_frame` runs (on the decoder thread) after each new
     /// picture, e.g. to request a redraw. Frames are acknowledged automatically.
@@ -79,6 +82,13 @@ pub struct ConnectParams {
     pub reach: Option<reach::ReachParams>,
 }
 
+impl ConnectParams {
+    /// The ways in the user allows for this host ([`KnownHost::mode`]); any for a host being paired.
+    pub fn mode(&self) -> ConnectMode {
+        self.reach.as_ref().map_or_else(ConnectMode::default, |reach| reach.host.mode)
+    }
+}
+
 /// The host has an access password: ask the user for it and connect again with
 /// [`ConnectParams::password`]. Find it in a connection error with `downcast_ref`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,6 +104,18 @@ impl std::fmt::Display for PasswordRequired {
 }
 
 impl std::error::Error for PasswordRequired {}
+
+/// The connection mode chosen for the host allows none of the ways in this device knows for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NoWayIn(pub ConnectMode);
+
+impl std::fmt::Display for NoWayIn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "no address of this computer fits the connection mode '{}'", self.0.as_str())
+    }
+}
+
+impl std::error::Error for NoWayIn {}
 
 /// The host ended the connection without a word: what hosts that predate hello extensions do
 /// with a hello that has them.
@@ -135,23 +157,32 @@ struct Established {
 /// relays it is registered with, a hole punch. Only the TLS handshake races: the host opens
 /// nothing before the hello, which goes on the winner alone, so the others never become a
 /// session that would take over.
-async fn establish(params: &ConnectParams) -> Result<Established> {
+///
+/// Only the ways in that `filter` admits are tried. A filter that wants the local network alone (looking for a better way
+/// in than a direct one) does not ask the DHT: the host's LAN addresses are stored.
+async fn establish(params: &ConnectParams, filter: reach::Filter) -> Result<Established> {
     let shared = Arc::new(params.clone());
     // Only with the host's key and this device's secret, which come with its `Reach`.
-    let lookup = reach::can_resolve(params).then(|| {
+    let lookup = (reach::can_resolve(params) && filter.below.is_none_or(|below| below > 1)).then(|| {
         let shared = shared.clone();
         async move { reach::resolve_record(&shared).await }
     });
-    establish_with(shared, lookup).await
+    establish_with(shared, lookup, filter).await
 }
 
 /// [`establish`] with the lookup given, so that tests can bring candidates in late.
-async fn establish_with<L>(params: Arc<ConnectParams>, lookup: Option<L>) -> Result<Established>
+async fn establish_with<L>(params: Arc<ConnectParams>, lookup: Option<L>, filter: reach::Filter) -> Result<Established>
 where
     L: Future<Output = Result<Vec<reach::Candidate>>> + Send + 'static,
 {
     let config = tls::client_config(&params.identity, params.host_fingerprint)?;
-    let first = reach::stored_candidates(&params);
+    let first: Vec<_> = reach::stored_candidates(&params).into_iter().filter(|c| filter.admits(c)).collect();
+    if first.is_empty() && lookup.is_none() {
+        bail!(NoWayIn(filter.mode));
+    }
+    let lookup = lookup.map(|lookup| async move {
+        lookup.await.map(|found| found.into_iter().filter(|c| filter.admits(c)).collect::<Vec<_>>())
+    });
     let dial = move |candidate: reach::Candidate| {
         let (params, config) = (params.clone(), config.clone());
         async move { reach::dial(&params, config, &candidate).await }
@@ -162,8 +193,8 @@ where
     Ok(Established { endpoint, conn, route: candidate.route() })
 }
 
-async fn handshake(params: &ConnectParams, ext: Option<HelloExt>) -> Result<Handshake> {
-    let Established { endpoint, conn, route } = establish(params).await?;
+async fn handshake(params: &ConnectParams, ext: Option<HelloExt>, filter: reach::Filter) -> Result<Handshake> {
+    let Established { endpoint, conn, route } = establish(params, filter).await?;
 
     let (mut send, mut recv) = conn.open_bi().await?;
     send.write_all(
@@ -239,6 +270,85 @@ struct ReachSlot {
     listeners: Vec<ReachListener>,
 }
 
+/// How the connection to the host stands, for a session that keeps it up (see [`Session::on_link`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinkState {
+    /// Connected through `Route`: at first, after a reconnection, or after moving to a better way in.
+    Up(Route),
+    /// The connection was lost and the session is trying to get it back.
+    Reconnecting,
+}
+
+/// Called when the connection to the host changes (see [`Session::on_link`]).
+pub type LinkListener = Arc<dyn Fn(&LinkState) + Send + Sync>;
+
+/// The current state of the link and who to tell when it changes.
+#[derive(Default)]
+struct LinkSlot {
+    state: Option<LinkState>,
+    listeners: Vec<LinkListener>,
+}
+
+/// Where files the host sends go, once a caller asked for them ([`Session::receive_files`]): every connection of the
+/// session gets the same.
+#[derive(Clone)]
+struct Offers {
+    dest: PathBuf,
+    on_event: Arc<dyn Fn(OfferEvent) + Send + Sync>,
+    on_clip: Arc<dyn Fn(u8, Vec<u8>) + Send + Sync>,
+}
+
+/// One connection to the host and what goes with it. A session has one at a time; reconnecting, or moving to a better
+/// way in, replaces it.
+#[derive(Clone)]
+struct Link {
+    conn: quinn::Connection,
+    /// Writes to this connection's control stream.
+    control: mpsc::UnboundedSender<ClientMsg>,
+    route: Route,
+    features: u32,
+    _endpoint: quinn::Endpoint,
+}
+
+/// What a session and its input sender share: the current connection, and what outlives connections.
+struct Shared {
+    link: Mutex<Link>,
+    states: Mutex<LinkSlot>,
+    offers: Mutex<Option<Offers>>,
+    /// Set by [`Session::close`]: the end of the connection is the end of the session.
+    closing: std::sync::atomic::AtomicBool,
+    /// Why the session ended, once it has.
+    ended: tokio::sync::watch::Sender<Option<String>>,
+}
+
+impl Shared {
+    fn link(&self) -> Link {
+        self.link.lock().unwrap().clone()
+    }
+
+    fn set_state(&self, state: LinkState) {
+        let listeners = {
+            let mut slot = self.states.lock().unwrap();
+            if slot.state.as_ref() == Some(&state) {
+                return;
+            }
+            slot.state = Some(state.clone());
+            slot.listeners.clone()
+        };
+        for listener in listeners {
+            listener(&state);
+        }
+    }
+
+    fn end(&self, reason: String) {
+        self.ended.send_if_modified(|ended| ended.is_none() && ended.replace(reason).is_none());
+    }
+}
+
+/// A session with a host: video, input, sound, files. It keeps its connection up: when it is lost, the session connects
+/// again (for [`RECONNECT_LIMIT`]); when a better way in appears (the local network, or anything direct when a relay
+/// carries it), the session moves to it. The host gives the screen to the newest connection of a device, so a new one
+/// takes over from the old without a gap beyond a keyframe. [`Session::on_link`] tells about both.
 pub struct Session {
     pub host_name: String,
     /// Where else the host answers (see `HostMsg::Welcome`).
@@ -248,50 +358,58 @@ pub struct Session {
     pub width: u16,
     pub height: u16,
     pub input: InputSender,
-    features: u32,
+    shared: Arc<Shared>,
     displays: Arc<Mutex<Displays>>,
     reach: Arc<Mutex<ReachSlot>>,
-    route: Route,
     /// Plays the host's sound, when it sends it.
     audio: Option<Arc<velora_audio::Player>>,
-    conn: quinn::Connection,
     runtime: tokio::runtime::Handle,
-    _endpoint: quinn::Endpoint,
 }
 
 impl Session {
-    /// Resolves when the connection ends, with the reason.
+    /// Resolves when the session ends, with the reason: closed here, ended by the host, or lost and not regained.
     pub async fn closed(&self) -> String {
-        match self.conn.closed().await {
-            quinn::ConnectionError::ApplicationClosed(c) => String::from_utf8_lossy(&c.reason).into_owned(),
-            e => e.to_string(),
-        }
+        let mut ended = self.shared.ended.subscribe();
+        let reason = match ended.wait_for(Option::is_some).await {
+            Ok(reason) => reason.clone().unwrap_or_default(),
+            Err(_) => "the session ended".into(),
+        };
+        reason
     }
 
     pub fn rtt(&self) -> std::time::Duration {
-        self.conn.rtt()
+        self.shared.link().conn.rtt()
     }
 
     pub fn close(&self) {
-        self.conn.close(0u32.into(), b"client closed");
+        self.shared.closing.store(true, Ordering::Relaxed);
+        self.shared.link().conn.close(0u32.into(), b"client closed");
+        self.shared.end("client closed".into());
     }
 
-    /// The host's files, when it serves them (hosts before file transfers don't).
+    /// The host's files, when it serves them (hosts before file transfers don't), over the current connection.
     pub fn files(&self) -> Option<RemoteFiles> {
-        (self.features & FEATURE_FILES != 0).then(|| RemoteFiles { conn: self.conn.clone() })
+        let link = self.shared.link();
+        (link.features & FEATURE_FILES != 0).then(|| RemoteFiles { conn: link.conn })
     }
 
-    /// Saves files the host sends (Send To on the host) into `dest`, reporting each transfer.
-    /// Hosts without file transfers never send any.
     /// Accepts what the host sends: files into `dest`, reported to `on_event`, and its
     /// clipboard content (kind and bytes, see `velora-clipboard`), passed to `on_clip`.
+    /// Hosts without file transfers never send any. Holds for the connections that follow too.
     pub fn receive_files(
         &self,
         dest: PathBuf,
         on_event: Arc<dyn Fn(OfferEvent) + Send + Sync>,
         on_clip: Arc<dyn Fn(u8, Vec<u8>) + Send + Sync>,
     ) {
-        self.runtime.spawn(files::receive_offers(self.conn.clone(), dest, on_event, on_clip));
+        let offers = Offers { dest, on_event, on_clip };
+        *self.shared.offers.lock().unwrap() = Some(offers.clone());
+        self.runtime.spawn(files::receive_offers(
+            self.shared.link().conn,
+            offers.dest,
+            offers.on_event,
+            offers.on_clip,
+        ));
     }
 
     /// The host's displays, when it has more than one to choose from (hosts that predate the
@@ -333,9 +451,22 @@ impl Session {
         }
     }
 
-    /// How this connection was made: the kind of the address that won the race and that address.
-    pub fn route(&self) -> &Route {
-        &self.route
+    /// How the current connection was made: the kind of the address that won the race and that address.
+    pub fn route(&self) -> Route {
+        self.shared.link().route
+    }
+
+    /// Calls `listener` with the state of the connection: right away, and whenever it is lost, regained or moved to
+    /// another way in. Listeners add up.
+    pub fn on_link(&self, listener: LinkListener) {
+        let now = {
+            let mut slot = self.shared.states.lock().unwrap();
+            slot.listeners.push(listener.clone());
+            slot.state.clone()
+        };
+        if let Some(state) = now {
+            listener(&state);
+        }
     }
 
     /// The host's sound plays here.
@@ -352,10 +483,11 @@ impl Session {
 
     /// Sends this computer's clipboard content to the host, when it shares its clipboard.
     pub fn send_clipboard(&self, kind: u8, data: Vec<u8>) {
-        if self.features & FEATURE_CLIPBOARD == 0 {
+        let link = self.shared.link();
+        if link.features & FEATURE_CLIPBOARD == 0 {
             return;
         }
-        let conn = self.conn.clone();
+        let conn = link.conn;
         self.runtime.spawn(async move {
             let sent = async {
                 let (mut send, _recv) = conn.open_bi().await?;
@@ -366,6 +498,13 @@ impl Session {
                 Err(e) => tracing::debug!("clipboard not sent: {e:#}"),
             }
         });
+    }
+}
+
+impl Drop for Session {
+    /// The connection is kept up by a task of its own: it ends with the session.
+    fn drop(&mut self) {
+        self.close();
     }
 }
 
@@ -403,7 +542,8 @@ impl Drop for FilesSession {
 pub async fn connect_files(params: ConnectParams) -> Result<FilesSession> {
     const TOO_OLD: &str = "this computer's Velora is too old for file transfers; update it";
     let ext = HelloExt { files_only: true, addresses: true, ..Default::default() };
-    let hs = match handshake(&params, Some(ext)).await {
+    let filter = reach::Filter { mode: params.mode(), below: None };
+    let hs = match handshake(&params, Some(ext), filter).await {
         Err(e) if e.is::<NoReply>() => bail!(TOO_OLD),
         hs => hs?,
     };
@@ -426,9 +566,22 @@ pub async fn connect_files(params: ConnectParams) -> Result<FilesSession> {
     })
 }
 
-/// Connects, authenticates and starts delivering video to `output`.
-pub async fn connect(params: ConnectParams, output: VideoOutput) -> Result<Session> {
-    let ext = HelloExt {
+/// How long a lost session keeps trying to connect again before it ends.
+pub const RECONNECT_LIMIT: Duration = Duration::from_secs(90);
+/// The longest wait between two attempts to connect again (they start sooner and back off).
+const RECONNECT_BACKOFF: Duration = Duration::from_secs(8);
+/// Most one attempt to connect again, or to move to a better way in, may take.
+const ATTEMPT_LIMIT: Duration = Duration::from_secs(20);
+/// How often a session that could have a better way in looks for one, and how soon after it began.
+pub const UPGRADE_EVERY: Duration = Duration::from_secs(30);
+#[cfg(not(test))]
+const FIRST_UPGRADE: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const FIRST_UPGRADE: Duration = Duration::from_millis(500);
+
+/// The hello of a session: everything this version takes.
+fn session_hello() -> HelloExt {
+    HelloExt {
         files_only: false,
         clipboard: true,
         addresses: true,
@@ -436,86 +589,48 @@ pub async fn connect(params: ConnectParams, output: VideoOutput) -> Result<Sessi
         audio: velora_audio::SUPPORTED,
         // Hosts that predate standalone reach ignore the bit and send nothing more.
         reach: true,
-    };
-    let hs = match handshake(&params, Some(ext)).await {
+    }
+}
+
+/// Connects, authenticates and starts delivering video to `output`. The session then keeps its connection up (see
+/// [`Session`]).
+pub async fn connect(params: ConnectParams, output: VideoOutput) -> Result<Session> {
+    let filter = reach::Filter { mode: params.mode(), below: None };
+    let ext = Some(session_hello());
+    let (hs, ext) = match handshake(&params, ext, filter).await {
         // Hosts that predate hello extensions drop the connection: ask again as they expect.
-        Err(e) if e.is::<NoReply>() => handshake(&params, None).await?,
-        hs => hs?,
+        Err(e) if e.is::<NoReply>() => (handshake(&params, None, filter).await?, None),
+        hs => (hs?, ext),
     };
-    let Handshake {
-        endpoint,
-        conn,
-        mut send,
-        recv,
-        host_name,
-        newly_paired,
-        width,
-        height,
-        features,
-        addresses,
-        route,
-    } = hs;
+    let (host_name, newly_paired, width, height, addresses) =
+        (hs.host_name.clone(), hs.newly_paired, hs.width, hs.height, hs.addresses.clone());
 
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel::<ClientMsg>();
-    tokio::spawn(async move {
-        while let Some(msg) = control_rx.recv().await {
-            if send.write_all(&msg.encode()).await.is_err() {
-                break;
-            }
-        }
-    });
-    // Keep reading: the host announces its displays and how else it can be reached here, and a
-    // host-side close is noticed.
-    let displays = Arc::new(Mutex::new(Displays::default()));
-    let reach = Arc::new(Mutex::new(ReachSlot::default()));
-    tokio::spawn(read_control(recv, displays.clone(), reach.clone(), control_tx.clone(), route.clone()));
-
-    // The host's sound arrives in datagrams; newer ones only, a lost one is a short gap.
-    let audio = (features & FEATURE_AUDIO != 0).then(velora_audio::Player::start).and_then(|player| match player {
+    // The host's sound plays through one player whatever the connection.
+    let audio = (hs.features & FEATURE_AUDIO != 0).then(velora_audio::Player::start).and_then(|player| match player {
         Ok(player) => Some(Arc::new(player)),
         Err(e) => {
             tracing::warn!("cannot play the host's sound: {e:#}");
             None
         }
     });
-    if let Some(player) = audio.clone() {
-        let conn = conn.clone();
-        tokio::spawn(async move {
-            let mut last = 0;
-            while let Ok(datagram) = conn.read_datagram().await {
-                let Ok(packet) = AudioPacket::decode(&datagram) else { continue };
-                if packet.is_newer_than(last) {
-                    if last == 0 {
-                        tracing::info!("playing the host's sound");
-                    }
-                    last = packet.seq;
-                    player.push(packet.data);
-                }
-            }
-        });
-    }
-
-    let decoder = match output {
-        #[cfg(feature = "decode")]
-        VideoOutput::Decoded { slot, on_frame } => video::spawn_decoder(slot, control_tx.clone(), on_frame),
-        VideoOutput::Encoded(sink) => spawn_encoded(sink, control_tx.clone()),
+    let parts = Parts {
+        displays: Arc::new(Mutex::new(Displays::default())),
+        reach: Arc::new(Mutex::new(ReachSlot::default())),
+        audio: audio.clone(),
+        output,
     };
-    {
-        let conn = conn.clone();
-        tokio::spawn(async move {
-            while let Ok(mut stream) = conn.accept_uni().await {
-                let decoder = decoder.clone();
-                tokio::spawn(async move {
-                    let mut header = [0u8; FrameHeader::LEN];
-                    if stream.read_exact(&mut header).await.is_err() {
-                        return;
-                    }
-                    let Ok(data) = stream.read_to_end(wire::MAX_FRAME_BYTES).await else { return };
-                    let _ = decoder.send(reorder::Packet { header: FrameHeader::decode(&header), data });
-                });
-            }
-        });
-    }
+    let link = parts.attach(hs, None);
+    let route = link.route.clone();
+    let shared = Arc::new(Shared {
+        link: Mutex::new(link),
+        states: Mutex::new(LinkSlot { state: Some(LinkState::Up(route)), listeners: Vec::new() }),
+        offers: Mutex::new(None),
+        closing: false.into(),
+        ended: tokio::sync::watch::channel(None).0,
+    });
+    // Once paired, the next connections are those of a paired device.
+    let params = ConnectParams { pairing_secret: None, ..params };
+    tokio::spawn(keep_up(shared.clone(), parts.clone(), params, ext));
 
     Ok(Session {
         host_name,
@@ -523,16 +638,221 @@ pub async fn connect(params: ConnectParams, output: VideoOutput) -> Result<Sessi
         newly_paired,
         width,
         height,
-        input: InputSender { conn: conn.clone(), control: control_tx, seq: Arc::new(AtomicU32::new(0)) },
-        features,
-        displays,
-        reach,
-        route,
+        input: InputSender { shared: shared.clone(), seq: Arc::new(AtomicU32::new(0)) },
+        shared,
+        displays: parts.displays,
+        reach: parts.reach,
         audio,
-        conn,
         runtime: tokio::runtime::Handle::current(),
-        _endpoint: endpoint,
     })
+}
+
+/// What every connection of a session feeds: the displays and reach slots, the sound player and the video output.
+#[derive(Clone)]
+struct Parts {
+    displays: Arc<Mutex<Displays>>,
+    reach: Arc<Mutex<ReachSlot>>,
+    audio: Option<Arc<velora_audio::Player>>,
+    output: VideoOutput,
+}
+
+impl Parts {
+    /// Starts reading a connection the host accepted: its control stream, sound, video and offered files.
+    fn attach(&self, hs: Handshake, offers: Option<Offers>) -> Link {
+        let Handshake { endpoint, conn, mut send, recv, features, route, .. } = hs;
+        let (control_tx, mut control_rx) = mpsc::unbounded_channel::<ClientMsg>();
+        tokio::spawn(async move {
+            while let Some(msg) = control_rx.recv().await {
+                if send.write_all(&msg.encode()).await.is_err() {
+                    break;
+                }
+            }
+        });
+        // Keep reading: the host announces its displays and how else it can be reached here, and a
+        // host-side close is noticed.
+        tokio::spawn(read_control(recv, self.displays.clone(), self.reach.clone(), control_tx.clone(), route.clone()));
+
+        // The host's sound arrives in datagrams; newer ones only, a lost one is a short gap.
+        if let Some(player) = self.audio.clone().filter(|_| features & FEATURE_AUDIO != 0) {
+            let conn = conn.clone();
+            tokio::spawn(async move {
+                let mut last = 0;
+                while let Ok(datagram) = conn.read_datagram().await {
+                    let Ok(packet) = AudioPacket::decode(&datagram) else { continue };
+                    if packet.is_newer_than(last) {
+                        if last == 0 {
+                            tracing::info!("playing the host's sound");
+                        }
+                        last = packet.seq;
+                        player.push(packet.data);
+                    }
+                }
+            });
+        }
+
+        // Each connection numbers its frames from the start: a decoder of its own.
+        let decoder = match &self.output {
+            #[cfg(feature = "decode")]
+            VideoOutput::Decoded { slot, on_frame } => {
+                video::spawn_decoder(slot.clone(), control_tx.clone(), on_frame.clone())
+            }
+            VideoOutput::Encoded(sink) => spawn_encoded(sink.clone(), control_tx.clone()),
+        };
+        {
+            let conn = conn.clone();
+            tokio::spawn(async move {
+                while let Ok(mut stream) = conn.accept_uni().await {
+                    let decoder = decoder.clone();
+                    tokio::spawn(async move {
+                        let mut header = [0u8; FrameHeader::LEN];
+                        if stream.read_exact(&mut header).await.is_err() {
+                            return;
+                        }
+                        let Ok(data) = stream.read_to_end(wire::MAX_FRAME_BYTES).await else { return };
+                        let _ = decoder.send(reorder::Packet { header: FrameHeader::decode(&header), data });
+                    });
+                }
+            });
+        }
+        if let Some(offers) = offers {
+            tokio::spawn(files::receive_offers(conn.clone(), offers.dest, offers.on_event, offers.on_clip));
+        }
+        Link { conn, control: control_tx, route, features, _endpoint: endpoint }
+    }
+}
+
+/// Whether a session in `mode`, connected through a way in of `rank`, could find a better one.
+fn could_improve(mode: ConnectMode, rank: u8) -> bool {
+    match mode {
+        ConnectMode::Auto => rank > 0,
+        // Velora's own ways in: a relay can give way to a direct one.
+        ConnectMode::Velora => rank > 1,
+        ConnectMode::Lan | ConnectMode::Vpn => false,
+    }
+}
+
+/// Whether a connection that ended this way is worth connecting again: it was lost, not ended by either side.
+fn lost(error: &quinn::ConnectionError) -> bool {
+    !matches!(error, quinn::ConnectionError::ApplicationClosed(_) | quinn::ConnectionError::LocallyClosed)
+}
+
+fn reason(error: &quinn::ConnectionError) -> String {
+    match error {
+        quinn::ConnectionError::ApplicationClosed(c) => String::from_utf8_lossy(&c.reason).into_owned(),
+        e => e.to_string(),
+    }
+}
+
+/// Connects once more, for a session: a full handshake through a way in that `filter` admits, bounded in time.
+async fn reopen(params: &ConnectParams, ext: Option<HelloExt>, filter: reach::Filter) -> Result<Handshake> {
+    tokio::time::timeout(ATTEMPT_LIMIT, handshake(params, ext, filter))
+        .await
+        .map_err(|_| anyhow::anyhow!("no answer within {ATTEMPT_LIMIT:?}"))?
+}
+
+/// Keeps a session's connection up until the session ends: connects again when it is lost, and moves to a better way in
+/// when one answers.
+async fn keep_up(shared: Arc<Shared>, parts: Parts, params: ConnectParams, ext: Option<HelloExt>) {
+    let mode = params.mode();
+    let mut next_look = tokio::time::Instant::now() + FIRST_UPGRADE;
+    let mut upgrade: Option<tokio::task::JoinHandle<Result<Handshake>>> = None;
+    loop {
+        let link = shared.link();
+        let rank = reach::rank(&link.route.kind);
+        let looking = upgrade.is_none() && could_improve(mode, rank);
+        tokio::select! {
+            error = link.conn.closed() => {
+                if shared.closing.load(Ordering::Relaxed) {
+                    shared.end("client closed".into());
+                    return;
+                }
+                // Moving to a better way in: the host sends the old connection away as soon as the new one says hello.
+                if let Some(task) = upgrade.take() {
+                    if let Ok(Ok(hs)) = task.await {
+                        move_to(&shared, &parts, hs, "moved to a better way in");
+                        continue;
+                    }
+                }
+                if !lost(&error) {
+                    shared.end(reason(&error));
+                    return;
+                }
+                tracing::info!("connection lost ({error}); connecting again");
+                shared.set_state(LinkState::Reconnecting);
+                match regain(&shared, &params, ext, mode).await {
+                    Some(hs) => {
+                        let link = parts.attach(hs, shared.offers.lock().unwrap().clone());
+                        tracing::info!("connected again through {}", link.route);
+                        let route = link.route.clone();
+                        *shared.link.lock().unwrap() = link;
+                        shared.set_state(LinkState::Up(route));
+                    }
+                    None => {
+                        shared.end(reason(&error));
+                        return;
+                    }
+                }
+            }
+            done = async { upgrade.as_mut().expect("guarded").await }, if upgrade.is_some() => {
+                upgrade = None;
+                next_look = tokio::time::Instant::now() + UPGRADE_EVERY;
+                match done {
+                    Ok(Ok(hs)) => {
+                        let old = shared.link();
+                        move_to(&shared, &parts, hs, "moved to a better way in");
+                        old.conn.close(0u32.into(), b"moved to a better way in");
+                    }
+                    Ok(Err(e)) => tracing::debug!("no better way in: {e:#}"),
+                    Err(e) => tracing::debug!("looking for a better way in failed: {e}"),
+                }
+            }
+            _ = tokio::time::sleep_until(next_look), if looking => {
+                let filter = reach::Filter { mode, below: Some(rank) };
+                let params = params.clone();
+                upgrade = Some(tokio::spawn(async move { reopen(&params, ext, filter).await }));
+            }
+        }
+    }
+}
+
+/// Switches the session to a new connection.
+fn move_to(shared: &Shared, parts: &Parts, hs: Handshake, why: &str) {
+    let link = parts.attach(hs, shared.offers.lock().unwrap().clone());
+    tracing::info!("{why}: {}", link.route);
+    let route = link.route.clone();
+    *shared.link.lock().unwrap() = link;
+    shared.set_state(LinkState::Up(route));
+}
+
+/// Connects again after a loss, backing off between attempts, until [`RECONNECT_LIMIT`] or the session is closed. A host
+/// that now asks for a password, or turns the device away, is not asked again.
+async fn regain(
+    shared: &Shared,
+    params: &ConnectParams,
+    ext: Option<HelloExt>,
+    mode: ConnectMode,
+) -> Option<Handshake> {
+    let began = tokio::time::Instant::now();
+    let mut wait = Duration::from_millis(500);
+    let filter = reach::Filter { mode, below: None };
+    loop {
+        if shared.closing.load(Ordering::Relaxed) {
+            return None;
+        }
+        match reopen(params, ext, filter).await {
+            Ok(hs) => return Some(hs),
+            Err(e) if e.is::<PasswordRequired>() || format!("{e:#}").contains("rejected") => {
+                tracing::warn!("cannot connect again: {e:#}");
+                return None;
+            }
+            Err(e) => tracing::debug!("connecting again failed: {e:#}"),
+        }
+        if began.elapsed() + wait > RECONNECT_LIMIT {
+            return None;
+        }
+        tokio::time::sleep(wait).await;
+        wait = (wait * 2).min(RECONNECT_BACKOFF);
+    }
 }
 
 /// Reads what the host says on the control stream after the welcome: its displays, and how else
@@ -590,8 +910,8 @@ async fn read_control(
 /// remote display.
 #[derive(Clone)]
 pub struct InputSender {
-    conn: quinn::Connection,
-    control: mpsc::UnboundedSender<ClientMsg>,
+    /// Input goes to the session's current connection.
+    shared: Arc<Shared>,
     seq: Arc<AtomicU32>,
 }
 
@@ -600,7 +920,7 @@ impl InputSender {
     pub fn mouse_move(&self, x: u16, y: u16) {
         let seq = self.seq.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
         let datagram = MouseMove { seq, x, y }.encode();
-        let _ = self.conn.send_datagram(bytes::Bytes::copy_from_slice(&datagram));
+        let _ = self.shared.link().conn.send_datagram(bytes::Bytes::copy_from_slice(&datagram));
     }
 
     pub fn mouse_button(&self, button: MouseButton, down: bool, x: u16, y: u16) {
@@ -650,7 +970,7 @@ impl InputSender {
     }
 
     fn send(&self, msg: ClientMsg) {
-        let _ = self.control.send(msg);
+        let _ = self.shared.link().control.send(msg);
     }
 }
 
@@ -741,6 +1061,8 @@ pub(crate) mod testing {
         pub reach: Option<HostMsg>,
         /// Drops the connection on a hello that has extensions, as the hosts that predate them do.
         pub legacy: bool,
+        /// Ends the session with this reason right after the welcome, as a host does when another device takes over.
+        pub end_with: Option<&'static str>,
     }
 
     /// A host that accepts any client, answers its hello with a welcome, says what the script says and records what the
@@ -818,6 +1140,11 @@ pub(crate) mod testing {
         if let Some(reach) = script.reach.filter(|_| ext.is_some_and(|e| e.reach)) {
             send.write_all(&reach.encode()).await?;
         }
+        if let Some(reason) = script.end_with {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            conn.close(1u32.into(), reason.as_bytes());
+            return Ok(());
+        }
         while let Some(body) = wire::read_msg(&mut recv).await? {
             let _ = messages.send(ClientMsg::decode(&body)?);
         }
@@ -836,6 +1163,46 @@ pub(crate) mod testing {
             relays: vec![(Fingerprint([5; 32]).to_base64(), vec!["203.0.113.9:7420".into()])],
             mac: Some([0x02, 1, 2, 3, 4, 5]),
             relays_for_others: true,
+        }
+    }
+
+    /// A UDP relay in front of a host, for one client, that can stop passing packets: a path that is lost, or not there
+    /// yet.
+    pub struct Hop {
+        pub addr: SocketAddr,
+        blocked: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Hop {
+        pub async fn to(host: SocketAddr, blocked: bool) -> Self {
+            let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            let addr = socket.local_addr().unwrap();
+            let blocked = Arc::new(std::sync::atomic::AtomicBool::new(blocked));
+            let flag = blocked.clone();
+            tokio::spawn(async move {
+                let mut client: Option<SocketAddr> = None;
+                let mut buf = vec![0u8; 65536];
+                while let Ok((n, from)) = socket.recv_from(&mut buf).await {
+                    if flag.load(Ordering::Relaxed) {
+                        continue;
+                    }
+                    let to = if from == host {
+                        match client {
+                            Some(client) => client,
+                            None => continue,
+                        }
+                    } else {
+                        client = Some(from);
+                        host
+                    };
+                    let _ = socket.send_to(&buf[..n], to).await;
+                }
+            });
+            Self { addr, blocked }
+        }
+
+        pub fn block(&self, blocked: bool) {
+            self.blocked.store(blocked, Ordering::Relaxed);
         }
     }
 
@@ -896,7 +1263,7 @@ mod tests {
         assert!(within("hello", host.hellos.recv()).await.unwrap().unwrap().reach);
         assert_eq!(session.host_name, "fake-pc");
         assert_eq!(session.addresses, vec!["192.0.2.10:7420".to_string()]);
-        assert_eq!(session.route(), &Route { kind: AddressKind::Lan.into(), address: host.addr.to_string() });
+        assert_eq!(session.route(), Route { kind: AddressKind::Lan.into(), address: host.addr.to_string() });
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(session.reach(), None);
 
@@ -985,7 +1352,7 @@ mod tests {
         };
         let began = std::time::Instant::now();
         let stale = Arc::new(params(&host, silent.local_addr().unwrap()));
-        let established = within("race", establish_with(stale, Some(lookup))).await.unwrap();
+        let established = within("race", establish_with(stale, Some(lookup), reach::Filter::default())).await.unwrap();
         assert_eq!(established.route, Route { kind: AddressKind::Public.into(), address: host.addr.to_string() });
         assert!(began.elapsed() >= reach::LOOKUP_DELAY, "the DHT is not asked before its delay");
         established.conn.close(0u32.into(), b"");
@@ -1001,6 +1368,106 @@ mod tests {
         assert_eq!(files.host_name, "fake-pc");
     }
 
+    /// Records the states a session goes through.
+    fn states(session: &Session) -> Arc<Mutex<Vec<LinkState>>> {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let into = seen.clone();
+        session.on_link(Arc::new(move |state: &LinkState| into.lock().unwrap().push(state.clone())));
+        seen
+    }
+
+    /// Params whose stored entry gives each address its kind, as a host's `Reach` does.
+    fn params_with_kinds(host: &FakeHost, kinds: Vec<(AddressKind, SocketAddr)>, dir: &TempDir) -> ConnectParams {
+        let entry = KnownHost {
+            kinds: kinds.iter().map(|(kind, addr)| (kind.clone(), addr.to_string())).collect(),
+            ..host.entry()
+        };
+        ConnectParams {
+            reach: Some(reach::ReachParams { host: entry, state_dir: dir.path().to_path_buf() }),
+            ..params(host, kinds[0].1)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_lost_connection_is_regained_and_input_goes_to_the_new_one() {
+        let mut host = FakeHost::start(Script::default());
+        let path = Hop::to(host.addr, false).await;
+        let session = within("connect", connect(params(&host, path.addr), sink())).await.unwrap();
+        let seen = states(&session);
+        within("hello", host.hellos.recv()).await;
+
+        // The path goes quiet: once the connection times out, the session says so and tries again.
+        path.block(true);
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while !seen.lock().unwrap().contains(&LinkState::Reconnecting) {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the loss is noticed");
+        path.block(false);
+        within("the second hello", host.hellos.recv()).await;
+        eventually("up again", || matches!(seen.lock().unwrap().last(), Some(LinkState::Up(_))).then_some(())).await;
+        assert_eq!(session.route().address, path.addr.to_string());
+
+        session.input.release_all();
+        assert_eq!(within("message", host.messages.recv()).await, Some(ClientMsg::ReleaseAll));
+    }
+
+    #[tokio::test]
+    async fn a_session_the_host_ends_is_not_connected_again() {
+        let mut host = FakeHost::start(Script { end_with: Some("another device took over"), ..Default::default() });
+        let session = within("connect", connect(params(&host, host.addr), sink())).await.unwrap();
+        assert_eq!(within("the end", session.closed()).await, "another device took over");
+        within("hello", host.hellos.recv()).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(host.hellos.try_recv().is_err(), "no second hello");
+    }
+
+    #[tokio::test]
+    async fn a_session_moves_to_the_local_network_when_it_answers() {
+        let mut host = FakeHost::start(Script::default());
+        let dir = TempDir::new();
+        let vpn = Hop::to(host.addr, false).await;
+        let lan = Hop::to(host.addr, true).await;
+        let params = params_with_kinds(&host, vec![(AddressKind::Vpn, vpn.addr), (AddressKind::Lan, lan.addr)], &dir);
+        let session = within("connect", connect(params, sink())).await.unwrap();
+        assert_eq!(session.route().kind, RouteKind::Address(AddressKind::Vpn), "the LAN does not answer yet");
+        let seen = states(&session);
+        within("hello", host.hellos.recv()).await;
+
+        lan.block(false);
+        let lan_route = Route { kind: AddressKind::Lan.into(), address: lan.addr.to_string() };
+        eventually("moved to the LAN", || {
+            seen.lock().unwrap().contains(&LinkState::Up(lan_route.clone())).then_some(())
+        })
+        .await;
+        within("the new hello", host.hellos.recv()).await;
+        assert_eq!(session.route(), lan_route);
+        assert!(!seen.lock().unwrap().contains(&LinkState::Reconnecting), "moved without a loss");
+        session.input.release_all();
+        assert_eq!(within("message", host.messages.recv()).await, Some(ClientMsg::ReleaseAll));
+    }
+
+    #[tokio::test]
+    async fn a_mode_keeps_to_its_ways_in() {
+        let host = FakeHost::start(Script::default());
+        let dir = TempDir::new();
+        let lan = Hop::to(host.addr, false).await;
+        let vpn = Hop::to(host.addr, false).await;
+        let kinds = vec![(AddressKind::Lan, lan.addr), (AddressKind::Vpn, vpn.addr)];
+        let mut params = params_with_kinds(&host, kinds, &dir);
+        params.reach.as_mut().unwrap().host.mode = ConnectMode::Vpn;
+        let session = within("connect", connect(params.clone(), sink())).await.unwrap();
+        assert_eq!(session.route(), Route { kind: AddressKind::Vpn.into(), address: vpn.addr.to_string() });
+        drop(session);
+
+        // A mode none of the stored addresses fits fails at once, and says why.
+        params.reach.as_mut().unwrap().host.mode = ConnectMode::Velora;
+        let error = within("connect", connect(params, sink())).await.err().expect("no way in");
+        assert_eq!(error.downcast_ref::<NoWayIn>(), Some(&NoWayIn(ConnectMode::Velora)));
+    }
+
     /// Never called: it only has to compile. Callers spawn these futures on a multi-threaded runtime, and the hooks of
     /// F2-F4 sit inside them, so a hook that is not `Send` would stop the clients from building.
     #[allow(dead_code)]
@@ -1008,7 +1475,7 @@ mod tests {
         fn send<T: Send>(_: T) {}
         send(connect(params.clone(), sink()));
         send(connect_files(params.clone()));
-        send(establish(&params));
+        send(establish(&params, reach::Filter::default()));
         send(hosts::connect(state, "pc", "me", None, sink()));
         send(hosts::wake(state, "pc"));
         send(reach::wake(&params.identity, host));

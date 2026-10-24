@@ -7,7 +7,9 @@
 
 use std::sync::{Arc, Mutex, OnceLock};
 
-use velora_client_core::{hosts, EncodedFrame, VideoOutput, WakeOutcome as CoreWake};
+use velora_client_core::{
+    hosts, ConnectMode as CoreMode, EncodedFrame, LinkState, Route, RouteKind, VideoOutput, WakeOutcome as CoreWake,
+};
 use velora_protocol::{
     identity::{KnownHost, StateDir},
     wire::{AddressKind as WireKind, KeyState, MouseButton as WireButton},
@@ -129,6 +131,95 @@ impl From<CoreWake> for WakeOutcome {
     }
 }
 
+/// Which ways of reaching a computer a connection may take: the user's choice, kept per computer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum ConnectionMode {
+    /// Whichever answers first, and a better one when it appears during the session.
+    Auto,
+    /// Only the computer's addresses on the local network.
+    Lan,
+    /// Only its addresses on a VPN mesh (Tailscale, Netbird).
+    Vpn,
+    /// Only Velora's own ways from other networks: public address, IPv6, hole punching, relays.
+    Velora,
+}
+
+impl From<CoreMode> for ConnectionMode {
+    fn from(mode: CoreMode) -> Self {
+        match mode {
+            CoreMode::Auto => Self::Auto,
+            CoreMode::Lan => Self::Lan,
+            CoreMode::Vpn => Self::Vpn,
+            CoreMode::Velora => Self::Velora,
+        }
+    }
+}
+
+impl From<ConnectionMode> for CoreMode {
+    fn from(mode: ConnectionMode) -> Self {
+        match mode {
+            ConnectionMode::Auto => Self::Auto,
+            ConnectionMode::Lan => Self::Lan,
+            ConnectionMode::Vpn => Self::Vpn,
+            ConnectionMode::Velora => Self::Velora,
+        }
+    }
+}
+
+/// The way a connection reached the computer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum Way {
+    Lan,
+    Vpn,
+    Public,
+    V6,
+    /// A hole punched through the NATs on both sides.
+    Punch,
+    /// Through another paired computer that relays.
+    Relay,
+    Other,
+}
+
+impl From<&Route> for Way {
+    fn from(route: &Route) -> Self {
+        match &route.kind {
+            RouteKind::Punch => Self::Punch,
+            RouteKind::Address(kind) => match AddressKind::from(kind) {
+                AddressKind::Lan => Self::Lan,
+                AddressKind::Vpn => Self::Vpn,
+                AddressKind::Public => Self::Public,
+                AddressKind::V6 => Self::V6,
+                AddressKind::Relay => Self::Relay,
+                AddressKind::Other => Self::Other,
+            },
+        }
+    }
+}
+
+/// How a session's connection stands.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum LinkStatus {
+    /// Connected that way: at first, after reconnecting, or after moving to a better way during the session.
+    Up { way: Way, address: String },
+    /// The connection was lost and the session is getting it back (for about a minute and a half; then `on_closed`).
+    Reconnecting,
+}
+
+impl From<&LinkState> for LinkStatus {
+    fn from(state: &LinkState) -> Self {
+        match state {
+            LinkState::Up(route) => Self::Up { way: route.into(), address: route.address.clone() },
+            LinkState::Reconnecting => Self::Reconnecting,
+        }
+    }
+}
+
+/// Implemented by the app to follow a session's connection. Called from background threads.
+#[uniffi::export(with_foreign)]
+pub trait LinkListener: Send + Sync {
+    fn on_link(&self, status: LinkStatus);
+}
+
 /// The distinct kinds of address a paired computer last listed, in the order it listed them.
 fn kinds_of(host: &KnownHost) -> Vec<AddressKind> {
     let mut kinds = Vec::new();
@@ -186,6 +277,17 @@ impl Client {
 
     pub fn forget(&self, name: String) -> Result<()> {
         Ok(hosts::forget(&self.state, &name)?)
+    }
+
+    /// The connection mode chosen for the paired computer `name`.
+    pub fn connection_mode(&self, name: String) -> Result<ConnectionMode> {
+        let host = hosts::list(&self.state)?.into_iter().find(|h| h.name == name);
+        Ok(host.map_or(ConnectionMode::Auto, |h| h.mode.into()))
+    }
+
+    /// Sets which ways connections to the paired computer `name` may take; from the next connection on.
+    pub fn set_connection_mode(&self, name: String, mode: ConnectionMode) -> Result<()> {
+        Ok(hosts::set_mode(&self.state, &name, mode.into())?)
     }
 
     /// Pairs with the code printed by `velora-host run --pair`. Blocking. Fails with
@@ -304,6 +406,18 @@ impl Session {
 
     pub fn rtt_ms(&self) -> f64 {
         self.inner.rtt().as_secs_f64() * 1000.0
+    }
+
+    /// How the current connection reached the computer.
+    pub fn link(&self) -> LinkStatus {
+        let route = self.inner.route();
+        LinkStatus::Up { way: (&route).into(), address: route.address }
+    }
+
+    /// Calls `listener` with how the connection stands: right away, and whenever it is lost, regained or moved to a
+    /// better way.
+    pub fn watch_link(&self, listener: Arc<dyn LinkListener>) {
+        self.inner.on_link(Arc::new(move |state: &LinkState| listener.on_link(state.into())));
     }
 
     /// Absolute pointer position, `0..=65535` on each axis of the remote display.
@@ -436,6 +550,28 @@ mod tests {
         assert_eq!(kinds_of(&listed), vec![AddressKind::Lan, AddressKind::Vpn, AddressKind::V6, AddressKind::Relay]);
         // A computer that has not said, as one paired before this version: no kinds, not a guess.
         assert!(kinds_of(&host("old", "192.0.2.12:7420", Vec::new())).is_empty());
+    }
+
+    #[test]
+    fn the_connection_mode_is_kept_per_computer_and_every_way_has_a_name() {
+        let dir = TempDir::new();
+        let client = client_with(&dir, &[host("desk", "192.0.2.10:7420", Vec::new())]);
+        assert_eq!(client.connection_mode("desk".into()).unwrap(), ConnectionMode::Auto);
+        client.set_connection_mode("desk".into(), ConnectionMode::Vpn).unwrap();
+        assert_eq!(client.connection_mode("desk".into()).unwrap(), ConnectionMode::Vpn);
+        assert!(client.set_connection_mode("nobody".into(), ConnectionMode::Lan).is_err());
+        for mode in CoreMode::ALL {
+            assert_eq!(CoreMode::from(ConnectionMode::from(mode)), mode);
+        }
+        let route = |kind: RouteKind| Route { kind, address: "192.0.2.10:7420".into() };
+        assert_eq!(Way::from(&route(RouteKind::Punch)), Way::Punch);
+        assert_eq!(Way::from(&route(WireKind::Relay("one".into()).into())), Way::Relay);
+        assert_eq!(Way::from(&route(WireKind::Vpn.into())), Way::Vpn);
+        assert_eq!(
+            LinkStatus::from(&LinkState::Up(route(WireKind::Lan.into()))),
+            LinkStatus::Up { way: Way::Lan, address: "192.0.2.10:7420".into() }
+        );
+        assert_eq!(LinkStatus::from(&LinkState::Reconnecting), LinkStatus::Reconnecting);
     }
 
     #[test]
