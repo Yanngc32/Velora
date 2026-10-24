@@ -535,7 +535,9 @@ mod tests {
     /// A MAC address of the locally administered kind: made up.
     const MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 0x01];
 
-    /// Documentation addresses (RFC 5737, RFC 3849): nothing here is anyone's real network.
+    /// Documentation addresses (RFC 5737, RFC 3849): nothing here is anyone's real network. Later
+    /// tickets add fields to the status (relay management does); the update keeps this building.
+    #[allow(clippy::needless_update)]
     fn reach() -> ReachStatus {
         ReachStatus {
             standalone: true,
@@ -551,6 +553,7 @@ mod tests {
             v6: vec!["[2001:db8::7]:7420".into()],
             last_reached: Some((AddressKind::Public, "198.51.100.9:50000".into())),
             registered_with: vec!["Office PC".into(), "Laptop".into()],
+            ..Default::default()
         }
     }
 
