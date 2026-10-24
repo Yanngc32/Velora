@@ -21,7 +21,7 @@ use tokio::sync::{mpsc, oneshot};
 use velora_protocol::{
     control::{self, Reply, Request},
     files as wire_files,
-    identity::{AuthorizedClient, StateDir},
+    identity::{AuthorizedClient, Identity, StateDir},
     pairing::{pairing_uri_with, parse_pairing_uri, PairingCode},
     tls::{self, Fingerprint},
     wire::{
@@ -52,6 +52,10 @@ const UPDATE_IDLE_POLL: Duration = Duration::from_secs(30);
 const PAIRING_TTL: Duration = Duration::from_secs(10 * 60);
 /// Longest pairing link, in characters, that still makes a QR code a phone reads without trouble.
 const MAX_LINK_LEN: usize = 300;
+/// The largest packet, in bytes, a connection that arrives through a relay tunnel may grow to. Its
+/// packets travel as datagrams of the connection to the relay, which hold about 1400 bytes less
+/// the 3 of the relay framing: a packet up to this is one datagram, a longer one is two.
+const TUNNEL_MTU: u16 = 1350;
 
 pub struct HostOptions {
     pub bind: SocketAddr,
@@ -133,8 +137,22 @@ pub struct Shared {
     active: Mutex<Option<Active>>,
     files: Mutex<Vec<FilesConn>>,
     links: Mutex<Vec<LinkConn>>,
+    /// What connections that arrive through a relay tunnel are accepted with: see [`tunnel_config`].
+    tunnel_config: Arc<quinn::ServerConfig>,
     shutdown: tokio::sync::Notify,
     awake: crate::awake::Awake,
+}
+
+/// The server config for connections that arrive through a relay tunnel: the host's own, with path
+/// MTU discovery stopping at [`TUNNEL_MTU`] where the endpoint's would go on to 1452. Ordinary
+/// connections keep the endpoint's config, and so do the retries.
+fn tunnel_config(identity: &Identity) -> Result<Arc<quinn::ServerConfig>> {
+    let mut config = tls::server_config(identity)?;
+    let transport = Arc::get_mut(&mut config.transport).context("the transport config is shared")?;
+    let mut discovery = quinn::MtuDiscoveryConfig::default();
+    discovery.upper_bound(TUNNEL_MTU);
+    transport.mtu_discovery_config(Some(discovery));
+    Ok(Arc::new(config))
 }
 
 /// Binds the socket, opens the endpoint on it and builds the host around both. Needs a Tokio
@@ -160,6 +178,7 @@ fn open(mut options: HostOptions, state: StateDir) -> Result<(Arc<Shared>, quinn
         identity.fingerprint()
     );
 
+    let tunnel_config = tunnel_config(&identity)?;
     let state = Arc::new(state);
     let fingerprint = identity.fingerprint();
     let reach = reach::Reach::new(ReachState {
@@ -186,6 +205,7 @@ fn open(mut options: HostOptions, state: StateDir) -> Result<(Arc<Shared>, quinn
         active: Mutex::new(None),
         files: Mutex::new(Vec::new()),
         links: Mutex::new(Vec::new()),
+        tunnel_config,
         shutdown: tokio::sync::Notify::new(),
     });
     // The first welcome must not go out with no address in it.
@@ -357,7 +377,13 @@ async fn update_loop(shared: &Shared) {
 }
 
 async fn handle_connection(incoming: quinn::Incoming, shared: Arc<Shared>) -> Result<()> {
-    let conn = tokio::time::timeout(HANDSHAKE_TIMEOUT, incoming).await.context("handshake timeout")??;
+    // What arrives through a relay tunnel is held to packets that fit one datagram of the relay's.
+    let connecting = if reach::socket::is_tunnel_addr(incoming.remote_address()) {
+        incoming.accept_with(shared.tunnel_config.clone())?
+    } else {
+        incoming.accept()?
+    };
+    let conn = tokio::time::timeout(HANDSHAKE_TIMEOUT, connecting).await.context("handshake timeout")??;
     let fingerprint = tls::peer_fingerprint(&conn)?;
 
     let (mut send, mut recv) =
@@ -380,12 +406,18 @@ async fn handle_connection(incoming: quinn::Incoming, shared: Arc<Shared>) -> Re
         bail!("client '{name}' uses protocol {version}");
     }
 
+    // The hello of a relay link (files only, and it asks for `Reach`), which no session and no file
+    // manager sends. A host this computer's user paired with may open one without being a paired
+    // device: see `authorize`.
+    let link_hello = ext.is_some_and(|e| e.files_only && e.reach);
     let auth = {
         let shared = shared.clone();
         let name = name.clone();
         // Checking a password is deliberately slow (key stretching): off the async workers.
-        tokio::task::spawn_blocking(move || authorize(&shared, fingerprint, &name, pairing_secret, password.as_deref()))
-            .await??
+        tokio::task::spawn_blocking(move || {
+            authorize(&shared, fingerprint, &name, pairing_secret, password.as_deref(), link_hello)
+        })
+        .await??
     };
     let refusal = match auth {
         Auth::Known => None,
@@ -416,7 +448,7 @@ async fn handle_connection(incoming: quinn::Incoming, shared: Arc<Shared>) -> Re
     let (control, outbox) = ControlSender::channel();
     // A relay link: the device only talks to the relay service. Under `--relay-only` that is
     // every connection.
-    let link = shared.options.relay_only || ext.is_some_and(|e| e.files_only && e.reach);
+    let link = shared.options.relay_only || link_hello;
     let client = ClientConn {
         conn: conn.clone(),
         fingerprint,
@@ -682,6 +714,11 @@ impl Shared {
             Request::SetReach { standalone, relay_for_others, dht } => {
                 self.reach.set_switches(Switches { standalone, relay_for_others, dht })
             }
+            // The protocol has them; the host answers them in the next commit.
+            Request::AddRelay { .. }
+            | Request::RemoveRelay { .. }
+            | Request::AllowRelayHost { .. }
+            | Request::RemoveRelayHost { .. } => Err(anyhow::anyhow!("this build does not manage relays yet")),
         };
         result.and_then(|()| self.status()).map_err(|e| format!("{e:#}"))
     }
@@ -996,12 +1033,22 @@ enum Auth {
 /// Decides whether a connecting device may open a session. The pairing code is consumed only
 /// once the password (if any) was right too, so a device asked for the password can retry
 /// with the same code. Unpaired devices learn nothing about the password.
+///
+/// `link_hello` is whether the hello is the one of a relay link, which reaches no screen. A link from
+/// a device this host knows needs no password (the password protects the screen, and a client that
+/// dials a relay holds only the password of the host it wants to reach, not this one's). Known means
+/// a paired client, or a computer whose *host* this one's user paired with (it is in
+/// `known_hosts.json` of the client side, see `reach::relay::trusts`): that registers with a relay
+/// under its host identity, which is not in the list of client devices, and may open a link and
+/// nothing else. Any other hello of such a device, and any link from one nobody knows, is judged
+/// as it always was.
 fn authorize(
     shared: &Shared,
     fingerprint: Fingerprint,
     name: &str,
     secret: Option<[u8; wire::PAIRING_SECRET_LEN]>,
     password: Option<&str>,
+    link_hello: bool,
 ) -> Result<Auth> {
     let fp = fingerprint.to_base64();
     let pairing_valid = |secret: &[u8; wire::PAIRING_SECRET_LEN]| {
@@ -1013,6 +1060,18 @@ fn authorize(
         let _clients = shared.clients.lock().unwrap();
         shared.state.load::<Vec<AuthorizedClient>>(StateDir::AUTHORIZED_CLIENTS)?.iter().any(|c| c.fingerprint == fp)
     };
+    // What is let in here is served as a link, because the same hello decides both. A link reaches
+    // no screen, which is what the access password protects, so none is asked. Any other hello of
+    // the same device, a session or files, is judged below, as it always was.
+    if link_hello && secret.is_none() {
+        if known {
+            return Ok(Auth::Known);
+        }
+        if reach::relay::trusts(shared.reach.context(), &fingerprint) {
+            tracing::info!("accepted a link from the paired computer {fingerprint}");
+            return Ok(Auth::Known);
+        }
+    }
     if !known && !secret.as_ref().is_some_and(pairing_valid) {
         return Ok(Auth::Denied);
     }
@@ -1589,7 +1648,7 @@ mod tests {
 
     use velora_protocol::{
         control::ReachStatus,
-        identity::Identity,
+        identity::{Identity, KnownHost},
         pairing::{parse_pairing_link, URI_PREFIX},
     };
 
@@ -1818,6 +1877,135 @@ mod tests {
         assert!(matches!(client.next().await, HostMsg::Rejected { .. }));
     }
 
+    // A host behind a NAT registers with a relay under its *host* identity, which is not in the
+    // relay's list of client devices. The relay lets in a link from a host its own user paired with:
+    // one in `known_hosts.json` of the client side of the relay's computer, beside the host's state.
+
+    /// The client side of the host's computer has paired with `device`'s host.
+    fn pair_back(host: &TestHost, device: &Identity) {
+        let client_dir = host.dir.join("client");
+        std::fs::create_dir_all(&client_dir).unwrap();
+        let paired = [KnownHost {
+            name: "home PC".into(),
+            address: "198.51.100.8:7420".into(),
+            fingerprint: device.fingerprint().to_base64(),
+            ..Default::default()
+        }];
+        std::fs::write(client_dir.join(StateDir::KNOWN_HOSTS), serde_json::to_vec(&paired).unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_link_is_refused_to_a_device_nobody_paired_exactly_as_before() {
+        let host = host("trust-stranger", true).await;
+        let (computer, stranger) = (Identity::generate().unwrap(), Identity::generate().unwrap());
+        pair_back(&host, &computer);
+        let mut client = host.connect(&stranger, Some(link_hello())).await;
+        let HostMsg::Rejected { reason } = client.next().await else { panic!("refused") };
+        assert_eq!(reason, "this device is not paired with the host");
+        assert!(host.shared.links.lock().unwrap().is_empty());
+        // And with no list at all, which is how most computers are.
+        let host = self::host("trust-none", true).await;
+        let mut client = host.connect(&stranger, Some(link_hello())).await;
+        assert!(matches!(client.next().await, HostMsg::Rejected { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_host_this_computers_user_paired_with_gets_a_link_and_can_register() {
+        let host = host("trust-link", true).await;
+        let (computer, client) = (Identity::generate().unwrap(), Identity::generate().unwrap());
+        pair_back(&host, &computer);
+        host.pair(&client, "phone");
+        // An access password protects the screen, and a link reaches none: it does not stand in the way
+        // of the host's link.
+        crate::password::set(&host.shared.state, Some("a password")).unwrap();
+
+        let mut link = host.connect(&computer, Some(link_hello())).await;
+        let HostMsg::Welcome { width, height, features, .. } = link.next().await else { panic!("a welcome") };
+        assert_eq!((width, height, features), (0, 0, Some(0)), "a link: no screen and no files");
+        let HostMsg::Reach { relays_for_others, .. } = link.next().await else { panic!("Reach") };
+        assert!(relays_for_others, "the host relays for others");
+        link.send(ClientMsg::RelayRegister { mac: None }).await;
+        assert_eq!(link.next().await, HostMsg::RelayStatus { ok: true, reason: String::new() });
+        until(|| host.shared.links.lock().unwrap().len() == 1).await;
+
+        // A link and nothing more: no session, nobody sent away, no file stream; and the host is not
+        // a paired device now, so no other hello of it is let in because of this one.
+        assert!(host.shared.active.lock().unwrap().is_none());
+        assert!(host.shared.files.lock().unwrap().is_empty());
+        let paired: Vec<AuthorizedClient> = host.shared.state.load(StateDir::AUTHORIZED_CLIENTS).unwrap();
+        assert!(paired.iter().all(|c| c.fingerprint != computer.fingerprint().to_base64()));
+    }
+
+    #[tokio::test]
+    async fn a_link_of_a_paired_device_needs_no_password_but_a_session_and_files_do() {
+        let host = host("password-links", false).await;
+        let (client, stranger) = (Identity::generate().unwrap(), Identity::generate().unwrap());
+        host.pair(&client, "phone");
+        crate::password::set(&host.shared.state, Some("a password")).unwrap();
+
+        // A link reaches no screen, and the client that dials a relay has no password of this
+        // computer to send: it gets in.
+        let mut link = host.connect(&client, Some(link_hello())).await;
+        assert!(matches!(link.next().await, HostMsg::Welcome { width: 0, height: 0, features: Some(0), .. }));
+        assert!(matches!(link.next().await, HostMsg::Reach { .. }));
+
+        // Its other hellos still ask for the password: a session (before and after extensions) and a
+        // file manager.
+        let session = HelloExt { clipboard: true, reach: true, ..Default::default() };
+        let files = HelloExt { files_only: true, addresses: true, ..Default::default() };
+        for ext in [None, Some(session), Some(files)] {
+            let mut asked = host.connect(&client, ext).await;
+            assert!(matches!(asked.next().await, HostMsg::PasswordRequired { wrong: false }), "hello: {ext:?}");
+        }
+        assert!(host.shared.active.lock().unwrap().is_none());
+
+        // A device nobody knows is refused as before, and learns nothing about the password.
+        let mut unknown = host.connect(&stranger, Some(link_hello())).await;
+        let HostMsg::Rejected { reason } = unknown.next().await else { panic!("refused") };
+        assert_eq!(reason, "this device is not paired with the host");
+    }
+
+    #[tokio::test]
+    async fn the_same_host_is_still_refused_a_session_files_and_a_pairing() {
+        for relay_only in [false, true] {
+            let host = host("trust-session", relay_only).await;
+            let computer = Identity::generate().unwrap();
+            pair_back(&host, &computer);
+            // The hellos that are not a link's: a session (before and after extensions) and a file manager.
+            let session = HelloExt { clipboard: true, reach: true, ..Default::default() };
+            let files = HelloExt { files_only: true, addresses: true, ..Default::default() };
+            for ext in [None, Some(session), Some(files)] {
+                let mut client = host.connect(&computer, ext).await;
+                let HostMsg::Rejected { reason } = client.next().await else {
+                    panic!("refused (relay only: {relay_only}, hello: {ext:?})")
+                };
+                assert_eq!(reason, "this device is not paired with the host");
+            }
+            assert!(host.shared.active.lock().unwrap().is_none());
+            assert!(host.shared.files.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_paired_client_gets_in_as_before_whether_or_not_it_is_a_known_host_too() {
+        let host = host("trust-client", false).await;
+        let (client, both) = (Identity::generate().unwrap(), Identity::generate().unwrap());
+        host.pair(&client, "phone");
+        host.pair(&both, "laptop");
+        pair_back(&host, &both);
+        for identity in [&client, &both] {
+            // A link, as for any paired device.
+            let mut link = host.connect(identity, Some(link_hello())).await;
+            assert!(matches!(link.next().await, HostMsg::Welcome { width: 0, height: 0, features: Some(0), .. }));
+            assert!(matches!(link.next().await, HostMsg::Reach { .. }));
+            // A file manager, which serves files: the rights of a paired client are its own.
+            let files = HelloExt { files_only: true, addresses: true, ..Default::default() };
+            let mut manager = host.connect(identity, Some(files)).await;
+            let HostMsg::Welcome { features, .. } = manager.next().await else { panic!("a welcome") };
+            assert_eq!(features, Some(FEATURE_FILES));
+        }
+    }
+
     #[tokio::test]
     async fn messages_on_a_link_go_to_the_reach_hooks() {
         let host = host("link", false).await;
@@ -2025,6 +2213,43 @@ mod tests {
         assert!(host.shared.reach.context().socket.stats().tunnel_in > 0);
     }
 
+    #[tokio::test]
+    async fn a_connection_through_a_relay_tunnel_keeps_its_packets_to_one_relay_datagram() {
+        let host = host("tunnel-mtu", true).await;
+        let identity = Identity::generate().unwrap();
+        host.pair(&identity, "laptop");
+        let (relay_address, _peer, _pump) = relay_for(&host, [4; 32]).await;
+        let mut direct = host.connect(&identity, Some(link_hello())).await;
+        assert!(matches!(direct.next().await, HostMsg::Welcome { .. }));
+        let mut relayed = host.connect_to(relay_address, &identity, Some(link_hello())).await;
+        assert!(matches!(relayed.next().await, HostMsg::Welcome { .. }));
+
+        // The host finds out by itself, after the handshake, how big its packets can be. An ordinary
+        // connection goes on to quinn's own limit; the one through a tunnel stops where the datagrams
+        // of the relay hold its packets.
+        let mtu = |through_tunnel: bool| {
+            let links = host.shared.links.lock().unwrap();
+            let link = links
+                .iter()
+                .find(|link| reach::socket::is_tunnel_addr(link.conn.remote_address()) == through_tunnel)?;
+            Some(link.conn.stats().path.current_mtu)
+        };
+        // Wait until neither has moved for half a second, so that what is measured is where each ended.
+        let (mut last, mut steady) = ((0, 0), 0);
+        for _ in 0..500 {
+            let now = (mtu(false).unwrap_or(0), mtu(true).unwrap_or(0));
+            steady = if now == last { steady + 1 } else { 0 };
+            last = now;
+            if steady >= 25 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let (direct_mtu, relayed_mtu) = last;
+        assert!(direct_mtu > TUNNEL_MTU, "an ordinary connection grows past it: {direct_mtu}");
+        assert!(relayed_mtu > 1200 && relayed_mtu <= TUNNEL_MTU, "and one through a tunnel stops there: {relayed_mtu}");
+    }
+
     #[test]
     fn retry_is_for_unvalidated_addresses_of_a_host_reached_from_outside() {
         let direct: SocketAddr = "203.0.113.5:40000".parse().unwrap();
@@ -2124,7 +2349,7 @@ mod tests {
         let pairing = host.shared.start_pairing().unwrap();
         let device = Identity::generate().unwrap().fingerprint();
 
-        let auth = authorize(&host.shared, device, "new phone", Some(pairing.code.secret), None).unwrap();
+        let auth = authorize(&host.shared, device, "new phone", Some(pairing.code.secret), None, false).unwrap();
         assert!(matches!(auth, Auth::Paired));
         let paired: Vec<AuthorizedClient> = host.shared.state.load(StateDir::AUTHORIZED_CLIENTS).unwrap();
         assert_eq!(paired.len(), 1);
@@ -2136,7 +2361,7 @@ mod tests {
         host.reach().update(|state| state.dht_key = None);
         let pairing = host.shared.start_pairing().unwrap();
         let other = Identity::generate().unwrap().fingerprint();
-        authorize(&host.shared, other, "tablet", Some(pairing.code.secret), None).unwrap();
+        authorize(&host.shared, other, "tablet", Some(pairing.code.secret), None, false).unwrap();
         assert_eq!(calls.paired.lock().unwrap()[1], (other, None));
     }
 

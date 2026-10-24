@@ -280,6 +280,9 @@ impl ReachState {
             v6: self.addresses_of(&AddressKind::V6),
             last_reached: self.last_reached.clone(),
             registered_with: self.relays.iter().map(|relay| relay.name.clone()).collect(),
+            // These two are read from the files the host keeps: `Shared::status` fills them in.
+            relays: Vec::new(),
+            relay_hosts: Vec::new(),
         }
     }
 }
@@ -1556,11 +1559,12 @@ mod tests {
         }
         assert!(outbox.try_recv().is_err());
 
-        // With the switch on they reach E4's hook, which (still a stub) says it cannot yet.
+        // With the switch on they reach E4's hook, which answers them itself (what it says is for
+        // its own tests): not with this refusal.
         ctx.reach.update(|state| state.switches.relay_for_others = true);
         for request in requests {
             handle_client_msg(&ctx, &from, request).await.unwrap();
-            let Some(HostMsg::RelayStatus { ok: false, reason }) = outbox.recv().await else { panic!("a status") };
+            let Some(HostMsg::RelayStatus { reason, .. }) = outbox.recv().await else { panic!("a status") };
             assert_ne!(reason, "this computer does not relay for other devices");
         }
         // A session cannot give its datagrams to the relay, whatever the switch: the two requests
@@ -1577,7 +1581,7 @@ mod tests {
         ] {
             handle_client_msg(&ctx, &on_a_session, request).await.unwrap();
             let Some(HostMsg::RelayStatus { reason, .. }) = outbox.recv().await else { panic!("a status") };
-            assert_eq!(reason, "this build cannot relay yet", "the hook answered");
+            assert_ne!(reason, "ask for a relay on a link connection, not on a session", "the hook answered");
         }
         // Anything else is not for reach.
         handle_client_msg(&ctx, &from, ClientMsg::RequestKeyframe).await.unwrap();
