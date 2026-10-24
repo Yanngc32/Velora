@@ -338,7 +338,8 @@ them and a release means reinstalling (and pairing again).
 From another network a device needs an address that leads to this PC's UDP port. There are three
 ways to get one, and they combine: a device keeps every address it knows for a PC and tries them
 together (the usual one first, each other one 250 ms later), and the session opens on the first
-that answers. All are optional, none needs an account, and none uses a server run by anyone.
+that answers. All are optional, none needs an account, and none depends on a server run by
+someone else (a relay PC is a computer of yours).
 
 | | Right when | It needs |
 |---|---|---|
@@ -352,8 +353,8 @@ off until you turn them on:
 | Switch | What it does |
 |---|---|
 | **Reach this PC from other networks without a VPN** | Asks the router to forward UDP 7420 (NAT-PMP, then UPnP) and tells your devices this PC's public and IPv6 addresses. Also lets it open a hole when a device asks and register with a relay PC. |
-| **Find this PC when its address changes** | Publishes where it is in the BitTorrent Mainline DHT, sealed so that only your paired devices can read it. |
-| **Let my other PCs connect through this one** | Makes this PC a relay. A session through it takes about 6 to 12 Mbit/s of its internet, both ways. |
+| **Find this PC when its address changes** | Publishes the PC's addresses in the BitTorrent Mainline DHT, sealed so that only your paired devices can read them. It lists what the first switch finds, so use both. |
+| **Let my other PCs connect through this one** | Makes this PC a relay. A session through it uses as much of its internet as the picture's bitrate (12 Mbit/s at most by default), both ways. |
 
 A device learns the addresses, the DHT key and the relays when it connects (both ends need a
 version with these features; older ones keep using the addresses they have), so after changing a
@@ -377,12 +378,13 @@ port. As the lock screen service, changing a switch or a relay list needs admini
 2. On this PC, paste the relay PC's pairing link under *Relays this PC uses* and click *Use as
    my relay*. On the relay PC, paste this PC's link under *Computers allowed to use this PC as a
    relay*, click *Let it use this PC* and turn on *Let my other PCs connect through this one*. A
-   PC shows its link under *Show QR code* → *Copy link*.
+   PC shows its link under *Show QR code* → *Copy link* (open the relay PC's after its card shows a
+   public address).
 3. Pair your phone or laptop with this PC, as usual (a device paired earlier connects once from
    home to learn the relay).
 
-The relay PC must itself be reachable (a port open on its router, or a VPS) and on, and this PC
-needs the first switch on.
+The relay PC must itself be on and reachable: a port open on its router, which needs the first
+switch on there too, or a VPS. This PC needs the first switch on as well.
 
 **Waking a sleeping PC.** The **Wake** button on a PC's card, or `velora wake <name>`, sends a
 Wake-on-LAN packet. It needs, and Velora cannot check:
@@ -396,7 +398,7 @@ Wake-on-LAN packet. It needs, and Velora cannot check:
   phone on the home Wi-Fi), or a relay PC there that is on and has this PC registered. A router
   drops a magic packet that comes in from the internet.
 
-*Sent* only says the packet left. From outside the home network the sender has to be a relay PC at
+*Wake-up signal sent* only says the packet left. From outside the home network the sender has to be a relay PC at
 home that can itself be reached (a VPS is not on that network). The Android app has no Wake button
 yet.
 

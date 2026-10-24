@@ -513,8 +513,9 @@ is [standalone-reach.md](standalone-reach.md).
    connection to a `--relay-only` host). A link starts no session and sends nobody away, and a
    known device's link is not asked for the access password.
 3. **One client per host per relay.** The 3-byte frame header carries no flow id, so a host's
-   registration serves one client; a newer `RelayTo` takes the older over. Connections through the
-   tunnel stop MTU discovery at 1350 bytes so that a full packet fits one relay datagram.
+   registration serves one client; a newer `RelayTo` takes the older over. The host stops MTU
+   discovery at 1350 bytes on connections that come through a tunnel, so that a full packet fits one
+   relay datagram.
 4. **Punching.** The request reaches the host on a unidirectional stream of its registration with
    the relay. With no relay the host polls the DHT every 45 s per device (every 8 s for 3 minutes
    after the last disconnect), not every 30 to 60 s, and the device waits up to 10 s after a relay

@@ -9,7 +9,8 @@ Velora connects over QUIC on UDP port 7420. From another network, a device needs
 leads to that port on the PC it wants to control (the *home PC* below, though it can be anywhere).
 Over a mesh VPN such as Tailscale or Netbird that address is the VPN's, and you need nothing from
 this guide. This guide covers the ways Velora can get a device to the PC **without a VPN and
-without a server run by anyone**, not the project and not you.
+without a server run by the project or by anyone else**; the only machine you may add is a relay PC
+or a VPS of your own.
 
 Everything here is optional and off until you turn it on. A connection is authenticated and
 encrypted end to end (mutual TLS 1.3, pinned certificates) whichever way it travels, so none of
@@ -75,11 +76,12 @@ asked and no relay is bothered. Away from home the order is the order of cost: d
 first, then the DHT, then relays and punches. That is why a connection from afar can take a few
 seconds longer than one at home.
 
-**What a device keeps.** Every time it connects, the PC sends its addresses with their kinds, its
-DHT key, the secret that opens its record for that device, the relays it is registered with and the
-address of its network adapter (for Wake). The device stores them in `known_hosts.json`. Nothing
-reaches a device that cannot connect, so after you change a switch each device has to connect once
-to hear about it. Pairing counts as a connection.
+**What a device keeps.** Every time a session connects, and when a device pairs, the PC sends its
+addresses with their kinds, its DHT key, the secret that opens its record for that device, the
+relays it is registered with and the address of its network adapter (for Wake). The device stores
+them in `known_hosts.json`. A files-only connection neither asks for this nor stores it. Nothing
+reaches a device that cannot connect, so after you change a switch each device has to open a
+session once to hear about it.
 
 **Which way won** is shown in three places: **This PC** says *The last connection came in through*
 and the kind and address; `velora connect` prints *Connected to 'X' through the public address
@@ -88,8 +90,11 @@ and the kind and address; `velora connect` prints *Connected to 'X' through the 
 ## The switches
 
 All three are on **This PC → Reach from other networks**, off by default, saved in `reach.json` in
-the host's [state folder](#files) and independent of each other. They need the host running (sharing
-on). Under the [Windows service](#the-windows-service) changing them needs an administrator.
+the host's [state folder](#files), and each can be on without the others. They need the host
+running (sharing on). Under the [Windows service](#the-windows-service) changing them needs an
+administrator. They work best together: the public and IPv6 addresses, the punch endpoint and the
+relays that the DHT record lists all come from the first switch, so the second one alone publishes
+only the PC's LAN and VPN addresses.
 
 **Reach this PC from other networks without a VPN** (`standalone`). While it is on, the host:
 
@@ -173,7 +178,8 @@ mapped on a router in front of another NAT only reaches that NAT, so Velora does
 What is left, in the order it is worth trying:
 
 1. **Public IPv6**, if your provider gives it (see above).
-2. **A relay PC**, which does not care what is in front of the home PC.
+2. **A relay PC**: the home PC connects out to it, so no port has to be opened on the home PC's
+   router (not yet confirmed on a real CGNAT, see [Status](#status)).
 3. **The DHT and a hole punch.** Turn on both the first switch and **Find this PC when its address
    changes**. The PC pings DHT nodes from its QUIC socket; when its NAT keeps one external port per
    socket it lists that endpoint in its record, and a device asks the PC to open a hole toward the
@@ -202,13 +208,14 @@ encrypted packets between them:
 
 What you need:
 
-- The relay PC runs a Velora with this feature, is on, and can be reached from outside: **Port
-  open on the router** on its own card, a port you forwarded, IPv6, or a VPS
-  ([below](#a-vps-as-the-relay)). Copy its link after its card shows a public address, because the
-  link carries the addresses it has at that moment.
-- **Let my other PCs connect through this one** is on at the relay PC.
-- **Reach this PC from other networks without a VPN** is on at the home PC: it registers only while
-  that switch is on.
+- The relay PC runs a Velora with this feature and is on.
+- At the relay PC, **Let my other PCs connect through this one** is on, and so is **Reach this PC
+  from other networks without a VPN**: the second switch is what asks its router for a port and
+  lists its public and IPv6 addresses, which is how a device away learns where the relay is. Its
+  card should say **Port open on the router**. A relay that no address reaches is no use; a VPS has
+  a public address of its own ([below](#a-vps-as-the-relay)).
+- At the home PC, **Reach this PC from other networks without a VPN** is on: it registers only
+  while that switch is on.
 
 The steps are the ones **This PC → Relay PCs** shows, on both PCs:
 
@@ -217,11 +224,19 @@ The steps are the ones **This PC → Relay PCs** shows, on both PCs:
    **Use as my relay**. On the relay PC, under **Computers allowed to use this PC as a relay**,
    paste the home PC's link and click **Let it use this PC**. A PC shows its link when you click
    **Show QR code** and then **Copy link**; the home PC's link exists while its pairing window is
-   open (10 minutes), which is long enough to copy it. Neither PC dials the other, so this works for
-   a home PC that nobody can reach.
-3. Pair your phone or laptop with the home PC, as usual. A device paired before connects once from
-   home, after the relay shows as registered, to learn where the relay is (with the DHT switch on
-   it can also read it from the record).
+   open (10 minutes), which is long enough to copy it. The relay PC never dials the home PC (the
+   home PC dials out to it), so this works for a home PC that nobody can reach.
+3. Pair your phone or laptop with the home PC, as usual. A device paired before opens a session
+   once from home, after the relay shows as registered, to learn where the relay is (with the DHT
+   switch on it can also read it from the record).
+
+**Which addresses the link carries.** A pairing link lists the PC's LAN and VPN addresses and its
+router-mapped public address, as they were when the pairing window opened. Open **Show QR code** on
+the relay PC after its card shows the public address (close it and open it again if the address
+came later). The link never carries a global IPv6 address or a port you forwarded by hand: for those,
+write the address, or a DNS name, into `relays.json` on the home PC. The home PC dials the
+addresses stored for the relay; the devices away are given the relay's own list (public, IPv6,
+VPN, LAN) and the address that worked from the home PC.
 
 Check it: on the home PC the relay has a green dot, *Registered: your devices can reach this PC
 through it*; on the relay PC the home PC reads *Registered here now*. From another network
@@ -231,19 +246,21 @@ Things to know:
 
 - **What happens by itself.** A home PC with the first switch on and no public address also tries
   the computers in its own **Devices** list, 10 s after it starts, and registers with one that
-  relays for others. A computer that says no is asked again 10 minutes later, so a PC you have just
-  switched to relay can take that long to be found. The steps above make it immediate and work for
-  a relay PC that is not in that list.
+  relays for others and knows this PC: the relay PC must have paired with the home PC from its own
+  side or been told to allow it (step 2). One that does not relay, or does not know it, is asked
+  again 10 minutes later, so a PC you have just switched to relay can take that long to be found;
+  at most 4 such registrations are held at once. The steps above make it immediate, and work for a
+  relay PC that is not in that list.
 - **A relay you listed is used always**, even when the home PC has a public address of its own; one
   found by itself only while it has none. List the PC that will wake yours (see
   [Waking](#waking-a-sleeping-pc)) for that reason.
 - **One device at a time.** A relay carries one client per home PC; a second device that asks
-  takes the first over ("another device took over this host"). A files window and a session through
-  the same relay take each other over too, so `velora connect` refuses a second window of the same
-  PC on one computer while the first goes through a relay.
+  takes the first over. So does a Files window of the same computer: `velora connect` and
+  `velora bench` check for this and refuse a second window of the same PC while the first goes
+  through a relay, but the Files page does not check and takes the session over.
 - **Bandwidth.** The relay PC receives the whole picture and sends it on: as much upload as the
-  session's bitrate (the app says 6 to 12 Mbit/s), and the same in download. The bitrate adapts
-  to what that link can carry, which shows as a softer picture, not a failure.
+  session's bitrate (12 Mbit/s at most by default; the app says 6 to 12), and the same in download.
+  The bitrate adapts to what that link can carry, which shows as a softer picture, not a failure.
 - **Passwords.** An access password on the relay PC protects its own screen. It is not asked of the
   relay links that your devices and your computers make to it, and a device that is paired with
   the relay PC can use its bandwidth without it. The home PC asks for its own password as always,
@@ -260,11 +277,17 @@ Things to know:
 
 A machine with a public address and no screen can be a relay: `velora-host run --relay-only`
 serves relays and nothing else (no capture, no input, every connection is a link). The VPS firewall
-or cloud security group must let **UDP 7420** in. This needs no app on the VPS:
+or cloud security group must let **UDP 7420** in. This needs no app on the VPS. Unpack the Linux
+archive in `/opt/velora`, give the relay a user and a folder of its own, and pair with it as that
+user, in that folder: a pairing run without `--config-dir` would write the VPS's identity
+somewhere else, the service below would make a new one, and the fingerprints you copy would stop
+matching.
 
 ```sh
-# on the VPS (from the Linux archive; --config-dir is optional)
-velora-host run --relay-only --pair          # prints a one-time code (10 minutes); keeps running
+# on the VPS
+sudo useradd --system --create-home --home-dir /var/lib/velora velora
+sudo -u velora /opt/velora/velora-host --config-dir /var/lib/velora run --relay-only --pair
+#   prints a one-time code (10 minutes) and keeps running; press Ctrl-C once your laptop has paired
 # on your laptop: pair with the VPS like any host
 velora pair <vps-address>:7420 VL1-...       # "Paired with 'vps'. This PC only relays connections..."
 ```
@@ -285,13 +308,12 @@ with the unit below), allows the home PC:
 ```
 
 The home PC needs **Reach this PC from other networks without a VPN** on. Pairing your phone or
-laptop with the home PC is as usual, and a device that was paired before connects once from home,
-after the home PC has registered, to learn about the VPS.
+laptop with the home PC is as usual, and a device that was paired before opens a session once from
+home, after the home PC has registered, to learn about the VPS.
 
-A systemd unit for the VPS, as an example to adapt (Velora does not ship a service file yet, and
-this one has not been run by the project). Create the user first, for instance with
-`sudo useradd --system --home-dir /var/lib/velora velora`, and unpack the Linux archive in
-`/opt/velora`:
+To keep the relay running, a systemd unit like this one, as an example to adapt (Velora does not
+ship a service file yet, and this one has not been run by the project). It uses the user and the
+folder from above:
 
 ```ini
 [Unit]
@@ -373,9 +395,10 @@ Velora cannot see. Check, on the sleeping PC:
 
 **Asleep versus off.** Sleep and hibernate are the easy cases: the adapter can stay powered and
 listen. A PC that is shut down only wakes if the firmware keeps the adapter powered, and Windows'
-fast startup can interfere. Laptops with Modern Standby vary by model. While sharing is on Velora
-keeps the PC from sleeping by itself (**Keep this PC awake**, on by default), so Wake matters for a
-PC you shut down or put to sleep, for a closed laptop lid, and when sharing is off.
+fast startup can interfere. Laptops with Modern Standby vary by model. On Windows, while sharing is
+on, Velora keeps the PC from sleeping by itself (**Keep this PC awake**, on by default; elsewhere
+it holds nothing), so Wake matters for a PC you shut down or put to sleep, for a closed laptop lid,
+and when sharing is off.
 
 **Who can send the packet.** It has to start on the sleeping PC's own network; a router drops a
 magic packet that comes in from the internet (it forgets the sleeping PC's ARP entry and refuses
@@ -396,19 +419,20 @@ that stays on and can be reached from outside** (a port open on its router, IPv6
 address), registered with the home PC under *Relays this PC uses*. A VPS cannot do it, and neither
 can a relay at home when nothing at home can be reached from outside.
 
-**After *Sent*.** The packet left; the PC needs from several seconds to a minute or more to come up
-and publish again, and the host redoes its mapping and its DHT record at once after waking. Try
+**After *Wake-up signal sent*.** The packet left; the PC needs from several seconds to a minute or
+more to come up and publish again, and the host redoes its mapping and its DHT record at once after
+waking. Try
 `connect` no faster than once every 5 s: a relay lets a device start 6 requests at once and then one
 every 5 s, shared by registering, relaying, waking and punching. If you are on another network that
 uses the same address range as home (192.168.1.x is common), Velora believes you are home, sends
-the packet there and says *Sent* while nothing wakes.
+the packet there and says *Wake-up signal sent* while nothing wakes.
 
 ## On the command line
 
 ```sh
 velora wake <host-name>          # name or address, as for connect
 velora connect <host-name>       # says which way in it took
-velora bench <host-name>         # the same line first
+velora bench <host-name>         # starts with a similar line, and the picture size
 velora-host run --relay-only     # relays only: no screen, no input
 ```
 
@@ -453,7 +477,7 @@ described.
 | File | In | Holds |
 |---|---|---|
 | `reach.json` | host | The three switches `standalone`, `relay_for_others`, `dht`. Written by the app; **by hand** for a headless host, before it starts. |
-| `relays.json` | host | Relay PCs this PC registers with: `[{ "name", "address", "also": [], "fingerprint" }]`, the shape of an entry of `known_hosts.json`. Written by **Use as my relay**; by hand on a VPS or under the service. Addresses are `ip:port` or `name:port`. Read every 30 s. |
+| `relays.json` | host | Relay PCs this PC registers with: `[{ "name", "address", "also": [], "fingerprint" }]`, the shape of an entry of `known_hosts.json`. Written by **Use as my relay** (also under the service, by an administrator); by hand on a host that has no app. A relay-only VPS never registers with a relay, so this file belongs on the home PC. Addresses are `ip:port` or `name:port`. Read every 30 s. |
 | `relay_hosts.json` | host | Computers allowed to register here: `[{ "name", "fingerprint" }]`. Written by **Let it use this PC**. Read at every link. |
 | `relay_known.json` | host | Computers this relay can wake: fingerprint, adapter address, last address. Written by the host. |
 | `dht_key.bin` | host | The 32-byte seed of the key the record is published under. Made once, never replaced. Every paired device holds its public half, so deleting it makes devices lose the record until they connect again. |
@@ -484,17 +508,18 @@ the relays; for the client's side run `velora connect` in a terminal with
 | *could not publish the host's record in the DHT (…); trying again in …* | Offline, or UDP blocked | Check the network; the host retries by itself. A publish counts when at least 8 nodes stored it |
 | Client debug: *the host has no record in the DHT* | The host has not published, or the lookup came back empty | Wait a minute and retry; a cold start sometimes asks only the bootstrap nodes and hears nothing |
 | Client debug: *the host's record does not open with this device's secret* | The device was removed from the host, or its secret is stale | Pair again; with more than 11 devices all share one secret, which changes when one is removed |
-| Client debug: *no DHT key or secret* | The device has not connected since the DHT switch was turned on | Connect once where the PC can be reached |
+| No DHT line at all in the client's debug output | The device holds no DHT key and secret for the PC yet, so it does not even look: it has not opened a session since the DHT switch was turned on | Open a session once where the PC can be reached |
 | Client info: *the host's record in the DHT lists N addresses and M relays, K ways in*, then *connected through …* | It worked | Nothing |
+| Client debug *the host's record is N hours from the clock: not read*; host log *the punch request is dated N s ahead of this clock…* or *… is N s old, at most 60 s are served* | A clock is wrong: a device ignores a record more than a day from its own clock, and the host refuses a punch request dated more than 10 s ahead of its clock or older than 60 s | Set both computers to automatic time |
 | Home PC's relay has a grey dot, **Not registered: it refused this host: this device is not paired with the host** | The relay PC has not allowed this PC | On the relay PC, **Let it use this PC** with this PC's link |
 | … **Not registered: it does not relay for other devices** | The relay PC's switch is off, or its Velora predates relaying | Turn on **Let my other PCs connect through this one**; update it |
 | … **Not registered: standalone reach is off** | The home PC's first switch is off | Turn it on |
 | … **Not registered: this computer only relays** | The home PC runs with `--relay-only` | Relays do not register with relays |
-| *relay '…' (…): …; trying again in N s* in the log | The reason is in the text. The host retries, waiting 5 s at first and doubling up to 5 minutes (90 s after another connection of the same PC replaced it, 10 minutes after the relay removed this PC) | Fix the reason. Two copies of one host (the same identity on two computers) replace each other |
-| A session through a relay ends: *another device took over this host* | A second device, or a files window, used the same relay | One device at a time per PC through a relay |
-| **Wake**: *no relay* | Not on the PC's network and no registered relay PC there could send | [Waking](#waking-a-sleeping-pc) |
-| **Wake**: *unsupported* | The PC never told your device its adapter address | Connect once while it is on, with a recent Velora on both sides |
-| **Wake**: *Sent*, nothing happens | Firmware or Windows settings, or the same-address-range case | The table under [Waking](#waking-a-sleeping-pc) |
+| *relay '…' (…): …; trying again in N s* in the log | The reason is in the text. The host retries after 5 s, then doubling up to 5 minutes (with up to 20 % more by chance). A refusal (this PC is not allowed, the PC does not relay, it asks for a password) waits 1 minute for a relay you listed and 10 minutes for a computer found by itself; being replaced by another connection of the same PC, 90 s; being removed by the relay, 10 minutes; the relay stopping, 2 minutes; this PC already holding as many relays as it allows, 1 minute | Fix the reason. Two copies of one host (the same identity on two computers) replace each other |
+| A session through a relay ends: `velora connect` prints *disconnected: closed*, and its log says *the relay ended the link: another device took the host over* | A second device, or a Files page of the same computer, asked the same relay for the same PC | One device at a time per PC through a relay |
+| **Wake**: *You are not on this PC's network, and none of your PCs there could send the signal…* | Not on the PC's network and no registered relay PC there could send | [Waking](#waking-a-sleeping-pc) |
+| **Wake**: *This PC has not told Velora how to wake it…* | The PC never told your device its adapter address | Open a session once while it is on, with a recent Velora on both sides |
+| **Wake**: *Wake-up signal sent…*, and nothing happens | Firmware or Windows settings, or the same-address-range case | The table under [Waking](#waking-a-sleeping-pc) |
 | *Only an administrator can change this…* | The host runs as the Windows service | Open Velora as administrator |
 | *This PC only relays connections: there is no screen to show.* | You connected to a `--relay-only` host | Expected; use it as a relay PC |
 | A Windows Firewall prompt for `velora-host` | A program with no rule opened a socket | Choose **Allow** |
@@ -512,8 +537,8 @@ the relay's own connection is authenticated. The access password stays a second 
 **IPv6.** The host now listens on IPv6 as well as IPv4 by default. If your provider gives the PC a
 global IPv6 address and your router's IPv6 firewall lets inbound UDP through, the port is reachable
 over IPv6 whatever the switches say, just as a forwarded port is over IPv4, and Retry is used only
-while a switch that exposes the host is on. Start the host with `--bind 0.0.0.0:7420` to keep it to
-IPv4.
+while a switch that exposes the host is on. A host you start by hand can be kept to IPv4 with
+`--bind 0.0.0.0:7420`; the app and the Windows service start it with the default.
 
 **The DHT record.** It is signed with an Ed25519 key of its own (a second key beside the TLS
 identity, so no fingerprint changes and nobody has to pair again) and encrypted separately for each
@@ -527,13 +552,18 @@ the record, roughly how many devices can read it. They do not see an address, a 
 fingerprint. A device looks the record up only when the addresses it stored did not answer within
 half a second.
 
+Punch requests are separate items, each under a key derived from one device's secret. With the
+first two switches on and no relay registered, the nodes see the IP address of the host looking
+those keys up (once per paired device every 45 s) and, when a device is punching, the IP address of
+that device publishing there, and when. The key says nothing about who is who.
+
 **Revoking a device.** A removed device is left out at the next publish (within about 15 s when you
 remove it in the app, within a minute with `velora-host revoke`) and can no longer open new
 records. It can still read the last record it fetched, and DHT nodes keep an item for hours, so
 it may read the addresses in it for that long. It cannot connect: the host checks its paired list
 on every connection. With more than 11 paired devices all of them share one secret, and removing
-any device changes it for the others, which then cannot read the record until they connect once by
-another route.
+any device changes it for the others, which then cannot read the record until they open a session
+once by another route. Pairing the 12th device does the same to the first eleven.
 
 **A relay PC** copies QUIC packets between two authenticated connections and cannot read or change
 what is inside, because the TLS session runs between your device and the home PC. It forwards only
@@ -549,16 +579,18 @@ servers `stun.l.google.com` and `stun.cloudflare.com`. The DHT client never serv
 nobody and stores nobody's items. Nothing else leaves the computer, and nothing is reported to
 anyone.
 
-**What is in the link and the QR code.** The public address and IPv6 addresses appear in the pairing
-link and on **This PC**, as the LAN address does: you decide who sees the link. A pairing link also
+**What is in the link and the QR code.** The router-mapped public address appears in the pairing
+link, and it and the IPv6 addresses appear on **This PC** and go to every device that connects, as
+the LAN address does: you decide who sees the link. A pairing link also
 carries the host's DHT key and the secret for the device that pairs with it: whoever holds that
 secret can read the host's addresses in the DHT until the device is removed, though it cannot
 connect without being paired.
 
 ### Background traffic
 
-All numbers are datagram counts from the spike on one home connection
-([dht-spike.md](dht-spike.md) §8), not byte counts.
+The datagram counts are from the spike on one home connection ([dht-spike.md](dht-spike.md) §8),
+not byte counts; the keepalive's volume is worked out from the size of its ping (65 bytes) and its
+rate.
 
 - An idle DHT node exchanges about 50 datagrams a minute (25 each way); a lookup from a fresh node
   about 500; a publish from a fresh node about 1,000. The host publishes every 30 minutes, and
@@ -585,8 +617,9 @@ All numbers are datagram counts from the spike on one home connection
 - **An access password on the relay PC** protects its screen and is not asked of the links made
   to it.
 - **Records.** A record lists at most 1 LAN, 2 VPN, 1 public (or punch), 2 IPv6 addresses and 1
-  relay; up to 11 paired devices have a secret of their own, more share one. A removed device can
-  read the last record for hours.
+  relay; up to 11 paired devices have a secret of their own, more share one (pairing the 12th, or
+  removing any, then locks the others out of the record until they open a session again). A removed
+  device can read the last record for hours.
 - **Wake** needs a sender on the sleeping PC's network (see [Waking](#waking-a-sleeping-pc)); from
   outside the home network that is a relay PC at home that can be reached. The Android app has no
   Wake button yet.
@@ -640,9 +673,9 @@ punched session is, is made here.
 **Do I still need Tailscale?** No. If you already use it, keep it: it is still the easiest way
 and Velora uses its addresses in the same race.
 
-**Does it need an account or a server?** No account, and no server run by the project or by you.
-The public DHT and, as a last fallback, two public STUN servers are third parties
-([Security and privacy](#security-and-privacy)).
+**Does it need an account or a server?** No account, and no server run by the project or by anyone
+else. A relay PC or a VPS is a machine of yours, and optional. The public DHT and, as a last
+fallback, two public STUN servers are third parties ([Security and privacy](#security-and-privacy)).
 
 **Is it safe to open a port?** It is the same port a hand-made forward opens. Anything that is not a
 valid handshake for the host's certificate is dropped before Velora sees it, new addresses must
@@ -674,13 +707,16 @@ or IPv6, a VPN). Pairing through a relay or a punch is not implemented.
 after half a second, then relays and punches after two seconds
 ([How a connection is made](#how-a-connection-is-made)).
 
-**What if my public IP changes?** Turn on **Find this PC when its address changes**, and connect
-once from each device afterwards. Or give the home connection a DNS name and pair with it.
+**What if my public IP changes?** Turn on **Reach this PC from other networks without a VPN** and
+**Find this PC when its address changes**, and open a session once from each device afterwards. Or
+give the home connection a DNS name and pair with it.
 
 **Which ports does it use?** UDP 7420 for sessions (inbound, on the home PC and on a relay PC);
-outbound UDP for the DHT (its socket takes port 6881 when that is free, otherwise any free port, and
-it sends to the nodes' own ports) and, as a fallback, for STUN (19302 and 3478); UDP 9 and 7 as a
-broadcast on the LAN for Wake.
+towards the router, UDP 5351 for NAT-PMP, and for UPnP a multicast search on UDP 1900 and then
+HTTP to the router; outbound UDP for the DHT (its socket takes port 6881 when that is free,
+otherwise any free port, and it sends to the nodes' own ports) and, as a fallback, for STUN (19302
+and 3478); UDP 9 and 7 as a broadcast on the LAN for Wake. The host's measurements of its NAT and
+its 20 s keepalive pings leave from the QUIC socket (7420), not from the DHT's.
 
 **Does it work with the access password?** Yes. The home PC asks for its own password inside the
 session as always. A relay PC's password is not asked of the relay links.
@@ -690,8 +726,8 @@ anything else starts.
 
 **Does it change anything when it is off?** Not for how you use Velora: with the switches off the
 host asks the router for nothing, publishes nothing and relays nothing. It does listen on IPv6 as
-well as IPv4 by default (see [Security and privacy](#security-and-privacy);
-`--bind 0.0.0.0:7420` keeps it IPv4 only).
+well as IPv4 by default (see [Security and privacy](#security-and-privacy); a host started by hand
+can use `--bind 0.0.0.0:7420` to stay IPv4 only).
 
 ## How it is built
 
@@ -725,16 +761,25 @@ adapter address and whether the host relays. All zeros for key and secret mean "
 keeps 8 plain addresses, relays left out, because a client from before reads exactly 8. Further
 host messages: `RelayStatus` (7), `PunchRequest` (8). Client messages: `Reached` (11),
 `RelayRegister` (12), `RelayTo` (13), `Wake` (14), `PunchRequest` (15); a host that predates them
-decodes the tags as unsupported and ignores them. The pairing link gains `key=` and `secret=`
-(78 characters), so it carries only what a first connection needs. The app talks to the host with
+decodes the tags as unsupported and ignores them. Lists are capped (16 addresses, 8 relays of 16
+addresses each) and cut, never an error, and an `AddressKind` added later must carry no payload,
+because this version cannot skip one. The pairing link gains `key=` and `secret=` (78 characters),
+so it carries only what a first connection needs. The app talks to the host with
 `Request::SetReach`, `AddRelay`, `RemoveRelay`, `AllowRelayHost` and `RemoveRelayHost`, and reads
 `Status.reach`.
 
 **Links.** A hello with `files_only` and `reach` (and every connection to a `--relay-only` host)
-is a *link*: no capture, no session, nobody sent away, and no access-password question for a device
-the host knows. Relay requests travel only on links. A registering host dials with its *host*
+is a *link*: its welcome is 0 by 0 with no features, there is no capture, no session, nobody sent
+away, and no access-password question for a device the host knows. `RelayRegister` and `RelayTo`, which make the connection's datagrams the relay's,
+are accepted only on links; `Wake` and `PunchRequest` are answered anywhere. A registering host dials with its *host*
 identity; the relay lets in a computer listed in `relay_hosts.json` or in its own client-side
 `known_hosts.json` for `RelayRegister` and nothing else.
+
+**The QUIC socket.** The host's endpoint runs on a multiplexer. Besides ordinary QUIC it carries
+*probes* (DHT pings sent from the QUIC port, their replies kept away from quinn) and relay *tunnels*
+(the peers behind a relay appear to quinn at synthetic addresses; a full or closed tunnel drops
+packets and counts them rather than returning an error, because quinn would end the connection on
+one). quinn shows the IPv4 peers of the dual-stack socket as IPv4-mapped IPv6 addresses.
 
 **The record** (salt `velora/1`). `Record { fingerprint, addresses, nat, relays, mac, ts }` in
 postcard, sealed as `01 | count | nonce(12) | wrap(48) × count | ChaCha20-Poly1305(record)`, where
@@ -742,6 +787,13 @@ each wrap holds a fresh content key under a key derived (HKDF-SHA256) from one d
 sealed value is at most 996 bytes (BEP 44 caps the bencoded value at 1000, and the length prefix
 takes 4), which fits 11 devices beside the largest record; with more, one shared secret has one
 wrap. `seq = max(clock, last + 1)`: an equal `seq` is acknowledged and ignored, a lower one refused.
+
+**The DHT node.** One `Node` is one OS thread and one UDP socket (port 6881 when free). It starts
+from up to 16 saved routing-table nodes plus the default names, returns the first valid record of
+a lookup (and any with a higher `seq` that comes within 200 ms), counts a put as stored only when at
+least 8 nodes acknowledged it, saves its table right after a publish or a lookup, and never serves:
+every node carries a request filter that answers nobody. A host's node that has been left alone for
+10 minutes is rebuilt before its next use, because its table rots.
 
 **The punch item** (salt `velora/punch/1`). A device puts `{ endpoint, nonce, ts }`, sealed with the
 device secret, under an Ed25519 key derived from that same secret, so the host can compute the key of
@@ -752,14 +804,17 @@ from its listening port for 12 s; the device keeps dialing from the socket it me
 
 **Relay framing.** Each datagram on a relay leg is `[id_hi, id_lo, shape, payload…]`, with
 `shape = (chunk_index << 4) | chunk_count`; an inner packet is one datagram or two halves, reassembled
-within 2 s. A relayed inner connection stops its path MTU discovery at 1350 bytes so a full packet
-fits one datagram. The tunnel's peer has a synthetic address in `fd00:7e1a::/32`. Per device the relay
+within 2 s. The host stops the path MTU discovery of a connection that comes through a tunnel at
+1350 bytes, so that a full packet fits one datagram (the client's side keeps quinn's defaults). The tunnel's peer has a synthetic address in `fd00:7e1a::/32`. Per device the relay
 allows a burst of 6 new flows and one more every 5 s. Close codes `0x20` to `0x24` say why a relay
 leg ended (replaced, host gone, taken over, removed, shutdown).
 
 **Lessons from the DHT spike** ([dht-spike.md](dht-spike.md)): `mainline` logs a warning about 17
 times a second while idle on Windows (the filter keeps it to errors); `extra_bootstrap` drops the
-default nodes; DNS for them is resolved once; a refused put looks like a timeout, so sizes are
+default nodes; DNS for them is resolved once; of the four default bootstrap names measured, only
+two answer a ping with the BEP 42 `ip` field, so an endpoint measurement asks several nodes, ignores
+private answers while any public one exists and takes the majority; a refused put looks like a
+timeout, so sizes are
 checked first; it may turn a node into a server after 15 minutes, which the request filter
 prevents; the routing table rots in 15 to 20 minutes, so it is saved right after a lookup.
 
