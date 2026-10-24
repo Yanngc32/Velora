@@ -101,6 +101,9 @@ dependencies {
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.ui:ui")
     implementation("androidx.activity:activity-compose:1.9.3")
+    // registerForActivityResult (file pickers) needs Fragment 1.3+; Play services alone resolve an older one, which the
+    // release lint rejects.
+    implementation("androidx.fragment:fragment-ktx:1.8.5")
     implementation("com.google.android.gms:play-services-code-scanner:16.1.0")
     // UniFFI's Kotlin bindings call into Rust through JNA.
     implementation("net.java.dev.jna:jna:5.15.0@aar")
