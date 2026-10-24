@@ -188,9 +188,11 @@ private fun HostsScreen(
         SecondaryButton(stringResource(R.string.enter_code), onManual, Modifier.fillMaxWidth(), icon = R.drawable.ic_keyboard)
     }
     options?.let { host ->
+        // Read once per opening, not on every redraw: it is a file.
+        val initial = remember(host) { modeOf(host) }
         HostOptions(
             host = host,
-            initial = modeOf(host),
+            initial = initial,
             onMode = { onMode(host, it) },
             onForget = { options = null; confirmForget = host },
             onDismiss = { options = null },

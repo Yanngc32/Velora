@@ -86,7 +86,6 @@ object Transfers {
         try {
             return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 publishTree(context, staged, Environment.DIRECTORY_DOWNLOADS)
-                staged.name
             } else {
                 val target = unique(legacyDownloads(context), staged.name)
                 staged.copyRecursively(target)
@@ -100,10 +99,11 @@ object Transfers {
     }
 
     @TargetApi(Build.VERSION_CODES.Q)
-    private fun publishTree(context: Context, file: File, relativeDir: String) {
+    /** Returns the name the file got there: MediaStore renames one whose name is taken ("x (1).pdf"). */
+    private fun publishTree(context: Context, file: File, relativeDir: String): String {
         if (file.isDirectory) {
             file.listFiles()?.forEach { publishTree(context, it, "$relativeDir/${file.name}") }
-            return
+            return file.name
         }
         val resolver = context.contentResolver
         val values = ContentValues().apply {
@@ -124,6 +124,12 @@ object Transfers {
             resolver.delete(uri, null, null)
             throw e
         }
+        val given = runCatching {
+            resolver.query(uri, arrayOf(MediaStore.MediaColumns.DISPLAY_NAME), null, null, null)?.use { c ->
+                if (c.moveToFirst()) c.getString(0) else null
+            }
+        }.getOrNull()
+        return given ?: file.name
     }
 
     /**
