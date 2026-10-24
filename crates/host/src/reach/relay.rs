@@ -2811,8 +2811,9 @@ mod tests {
             ("Office", "office.example.net:7420", 0)
         );
 
-        // Another relay, with no name: it is shown under its short fingerprint. IPv6 is an address too.
-        add_relay(&ctx, "", "[2001:db8::7]:7420", &[], &studio).unwrap();
+        // Another relay, with no name (nothing but spaces counts as none): it is shown under its
+        // short fingerprint. IPv6 is an address too.
+        add_relay(&ctx, " \t ", "[2001:db8::7]:7420", &[], &studio).unwrap();
         let list = relay_list(&ctx);
         assert_eq!(list.len(), 2);
         assert_eq!(list[1].name, Fingerprint([22; 32]).short());
@@ -2845,8 +2846,10 @@ mod tests {
             "203.0.113.10",
             "203.0.113.10:0",
             "203.0.113.10:99999",
+            "example.net:0",
             "host name:7420",
             "-bad.example:7420",
+            "bad-.example:7420",
             "a..b:7420",
             "[::1]",
             ":7420",
@@ -2861,9 +2864,12 @@ mod tests {
         assert!(add_relay(&ctx, "x", good_address, &nine, &good).is_err());
         assert!(!ctx.state_dir.path(RELAYS_FILE).exists() && !ctx.state_dir.path(HOSTS_FILE).exists());
 
-        // A name loses its control characters and is cut at 64 characters.
+        // A name loses its control characters and is cut at 64 characters. A relay may have as many
+        // more addresses as that allows.
         let long = format!("Of\u{7}fice\n{}", "x".repeat(100));
-        add_relay(&ctx, &long, good_address, &[], &good).unwrap();
+        let eight = vec!["198.51.100.20:7420".to_string(); MAX_EXTRA_ADDRESSES];
+        add_relay(&ctx, &long, good_address, &eight, &good).unwrap();
+        assert_eq!(relay_list(&ctx)[0].also.len(), MAX_EXTRA_ADDRESSES);
         allow_host(&ctx, &long, &good).unwrap();
         for name in [relay_list(&ctx)[0].name.clone(), host_list(&ctx)[0].name.clone()] {
             assert!(
@@ -2872,6 +2878,22 @@ mod tests {
                     && name.chars().count() == MAX_LIST_NAME
             );
         }
+    }
+
+    #[test]
+    fn a_name_in_an_address_is_a_dns_name() {
+        for good in ["example.net", "a-b.example", "a1", "xn--bcher-kva.example", "UPPER.example"] {
+            assert!(is_host_name(good), "{good}");
+        }
+        for bad in ["", ".", "a.", ".a", "a..b", "-a", "a-", "a.-b", "a-.b", "a b", "a_b", "é.example"] {
+            assert!(!is_host_name(bad), "{bad:?}");
+        }
+        // Labels of 63 characters at most, and 253 in all.
+        let label = |n: usize| "a".repeat(n);
+        assert!(is_host_name(&label(63)) && !is_host_name(&label(64)));
+        let all = [label(63), label(63), label(63), label(61)].join(".");
+        assert_eq!(all.len(), 253);
+        assert!(is_host_name(&all) && !is_host_name(&format!("{all}a")));
     }
 
     #[tokio::test]
