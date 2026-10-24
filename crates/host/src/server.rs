@@ -677,7 +677,9 @@ impl Shared {
         // a device's files is the user's call: it can reach their screen already. Staying awake
         // decides only whether the computer sleeps. The standalone reach switches are not here:
         // they decide whether this computer opens a port on the router, is listed in the DHT and
-        // carries other devices' traffic, which is access in the sense that matters.
+        // carries other devices' traffic, which is access in the sense that matters. The relay
+        // requests (which relays it registers with, which computers may register here) are the
+        // same kind of thing.
         let harmless = matches!(
             request,
             Request::Status
@@ -714,11 +716,16 @@ impl Shared {
             Request::SetReach { standalone, relay_for_others, dht } => {
                 self.reach.set_switches(Switches { standalone, relay_for_others, dht })
             }
-            // The protocol has them; the host answers them in the next commit.
-            Request::AddRelay { .. }
-            | Request::RemoveRelay { .. }
-            | Request::AllowRelayHost { .. }
-            | Request::RemoveRelayHost { .. } => Err(anyhow::anyhow!("this build does not manage relays yet")),
+            // Which relays this computer registers with, and which computers may register here. They
+            // are access like the switches above, so under the service only an administrator asks.
+            Request::AddRelay { name, address, also, fingerprint } => {
+                reach::relay::add_relay(self.reach.context(), &name, &address, &also, &fingerprint)
+            }
+            Request::RemoveRelay { fingerprint } => reach::relay::remove_relay(self.reach.context(), &fingerprint),
+            Request::AllowRelayHost { name, fingerprint } => {
+                reach::relay::allow_host(self.reach.context(), &name, &fingerprint)
+            }
+            Request::RemoveRelayHost { fingerprint } => reach::relay::remove_host(self.reach.context(), &fingerprint),
         };
         result.and_then(|()| self.status()).map_err(|e| format!("{e:#}"))
     }
@@ -788,6 +795,10 @@ impl Shared {
             })
         });
         let (address, also) = self.refresh_local();
+        // The two lists the launcher edits live in files, which the reach state does not read.
+        let mut reach = self.reach.reach().read().status();
+        reach.relays = reach::relay::configured(self.reach.context());
+        reach.relay_hosts = reach::relay::allowed_hosts(self.reach.context());
         Ok(control::Status {
             name: self.options.name.clone(),
             version: velora_update::Version::current().to_string(),
@@ -812,7 +823,7 @@ impl Shared {
                 })
                 .collect(),
             stay_awake: self.awake.setting(&self.state),
-            reach: Some(self.reach.reach().read().status()),
+            reach: Some(reach),
         })
     }
 
@@ -2315,6 +2326,126 @@ mod tests {
         host.shared.control(Request::Status, false).unwrap();
         host.shared.control(set, true).unwrap();
         assert!(host.reach().read().switches.dht);
+    }
+
+    #[tokio::test]
+    async fn only_an_administrator_manages_the_relays_of_a_service() {
+        let host = host_as("service-relays", true, true).await;
+        let fingerprint = Fingerprint([21; 32]).to_base64();
+        let requests = [
+            Request::AddRelay {
+                name: "Office PC".into(),
+                address: "203.0.113.10:7420".into(),
+                also: Vec::new(),
+                fingerprint: fingerprint.clone(),
+            },
+            Request::AllowRelayHost { name: "Home PC".into(), fingerprint: fingerprint.clone() },
+            Request::RemoveRelay { fingerprint: fingerprint.clone() },
+            Request::RemoveRelayHost { fingerprint: fingerprint.clone() },
+        ];
+        for request in requests.clone() {
+            let error = host.shared.control(request, false).unwrap_err();
+            assert!(error.contains("administrator"), "{error}");
+        }
+        let reach = host.shared.control(Request::Status, false).unwrap().reach.unwrap();
+        assert!(reach.relays.is_empty() && reach.relay_hosts.is_empty(), "nothing was changed");
+
+        // The administrator can, and gets the status as it is after.
+        let [add, allow, remove_relay, remove_host] = requests;
+        let reach = host.shared.control(add, true).unwrap().reach.unwrap();
+        assert_eq!(
+            reach.relays.iter().map(|relay| relay.fingerprint.as_str()).collect::<Vec<_>>(),
+            [fingerprint.as_str()]
+        );
+        let reach = host.shared.control(allow, true).unwrap().reach.unwrap();
+        assert_eq!(reach.relay_hosts.len(), 1);
+        let reach = host.shared.control(remove_relay, true).unwrap().reach.unwrap();
+        assert!(reach.relays.is_empty() && reach.relay_hosts.len() == 1);
+        let reach = host.shared.control(remove_host, true).unwrap().reach.unwrap();
+        assert!(reach.relay_hosts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_status_lists_the_relays_and_the_computers_allowed_and_refusals_say_why() {
+        let host = host("relay-lists", false).await;
+        let (office, home) = (Fingerprint([21; 32]).to_base64(), Fingerprint([22; 32]).to_base64());
+        let add = |name: &str, address: &str, fingerprint: &str| Request::AddRelay {
+            name: name.into(),
+            address: address.into(),
+            also: vec!["198.51.100.20:7420".into()],
+            fingerprint: fingerprint.into(),
+        };
+        let reach = host.shared.control(add("Office PC", "203.0.113.10:7420", &office), true).unwrap().reach.unwrap();
+        // The switch is off, which is why it is not registered.
+        let expected = control::RelayEntry {
+            name: "Office PC".into(),
+            fingerprint: office.clone(),
+            address: "203.0.113.10:7420".into(),
+            registered: false,
+            reason: Some("standalone reach is off".into()),
+        };
+        assert_eq!(reach.relays, std::slice::from_ref(&expected));
+        // The same relay again replaces it, under its new name and address.
+        let reach =
+            host.shared.control(add("Office", "office.example.net:7420", &office), true).unwrap().reach.unwrap();
+        let renamed =
+            control::RelayEntry { name: "Office".into(), address: "office.example.net:7420".into(), ..expected };
+        assert_eq!(reach.relays, [renamed]);
+
+        let allow = Request::AllowRelayHost { name: "Home PC".into(), fingerprint: home.clone() };
+        let reach = host.shared.control(allow, true).unwrap().reach.unwrap();
+        assert_eq!(
+            reach.relay_hosts,
+            [control::RelayHostEntry { name: "Home PC".into(), fingerprint: home, registered: false }]
+        );
+        // Allowing a computer to relay does not make it one of the paired devices.
+        let paired: Vec<AuthorizedClient> = host.shared.state.load(StateDir::AUTHORIZED_CLIENTS).unwrap();
+        assert!(paired.is_empty());
+
+        // What cannot be done comes back as words, and changes nothing.
+        let refuse = |request: Request| host.shared.control(request, true).unwrap_err();
+        let error = refuse(add("x", "203.0.113.10:7420", "not a fingerprint"));
+        assert!(error.contains("fingerprint"), "{error}");
+        let error = refuse(add("x", "203.0.113.10", &Fingerprint([23; 32]).to_base64()));
+        assert!(error.contains("ip:port or name:port"), "{error}");
+        let error = refuse(Request::AllowRelayHost { name: String::new(), fingerprint: String::new() });
+        assert!(error.contains("fingerprint"), "{error}");
+        let own = host.shared.fingerprint.to_base64();
+        let error = refuse(add("me", "203.0.113.10:7420", &own));
+        assert!(error.contains("its own relay"), "{error}");
+        let reach = host.shared.control(Request::Status, false).unwrap().reach.unwrap();
+        assert_eq!((reach.relays.len(), reach.relay_hosts.len()), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn a_computer_allowed_from_the_launcher_registers_and_is_dropped_when_removed() {
+        let host = host("allow-register", true).await;
+        let computer = Identity::generate().unwrap();
+        let fingerprint = computer.fingerprint().to_base64();
+
+        // Nobody has said it may: refused, as any device nobody knows.
+        let mut stranger = host.connect(&computer, Some(link_hello())).await;
+        assert!(matches!(stranger.next().await, HostMsg::Rejected { .. }));
+
+        // The launcher says so, and it gets a link and registers.
+        let allow = Request::AllowRelayHost { name: "Home PC".into(), fingerprint: fingerprint.clone() };
+        let reach = host.shared.control(allow, true).unwrap().reach.unwrap();
+        assert!(!reach.relay_hosts[0].registered);
+        let mut link = host.connect(&computer, Some(link_hello())).await;
+        assert!(matches!(link.next().await, HostMsg::Welcome { width: 0, height: 0, features: Some(0), .. }));
+        assert!(matches!(link.next().await, HostMsg::Reach { relays_for_others: true, .. }));
+        link.send(ClientMsg::RelayRegister { mac: None }).await;
+        assert_eq!(link.next().await, HostMsg::RelayStatus { ok: true, reason: String::new() });
+        let reach = host.shared.control(Request::Status, false).unwrap().reach.unwrap();
+        assert!(reach.relay_hosts[0].registered, "the status shows the registration");
+
+        // Removed, its registration is dropped and a new link is refused.
+        let forget = Request::RemoveRelayHost { fingerprint };
+        let reach = host.shared.control(forget, true).unwrap().reach.unwrap();
+        assert!(reach.relay_hosts.is_empty());
+        tokio::time::timeout(Duration::from_secs(5), link.conn.closed()).await.expect("the registration is dropped");
+        let mut again = host.connect(&computer, Some(link_hello())).await;
+        assert!(matches!(again.next().await, HostMsg::Rejected { .. }));
     }
 
     #[tokio::test]
