@@ -33,4 +33,35 @@
     <string name="update_downloading">Baixando… %1$d%%</string>
     <string name="update">Atualizar</string>
     <string name="update_failed">Falha na atualização: %1$s</string>
+    <string name="files">Arquivos</string>
+    <string name="files_up">Voltar</string>
+    <string name="files_empty">Esta pasta está vazia.</string>
+    <string name="files_loading">Carregando…</string>
+    <string name="upload_here">Enviar arquivos para cá</string>
+    <string name="upload_to_downloads">Enviar arquivos para Downloads</string>
+    <string name="download">Baixar</string>
+    <string name="transfer_preparing">%1$s: preparando…</string>
+    <string name="transfer_waiting">%1$s: aguardando o computador aceitar…</string>
+    <string name="transfer_progress">%1$s · %2$d%%</string>
+    <string name="saved_to_downloads">Salvo em Downloads: %1$s</string>
+    <string name="sent_to">Enviado para %1$s: %2$s</string>
+    <string name="transfer_failed">Falha na transferência: %1$s</string>
+    <string name="share_title">Enviar para um computador</string>
+    <plurals name="share_items">
+        <item quantity="one">%1$d item, para a pasta Downloads do computador</item>
+        <item quantity="other">%1$d itens, para a pasta Downloads do computador</item>
+    </plurals>
+    <string name="share_nothing">Não há nada para enviar.</string>
+    <string name="share_no_hosts">Pareie um computador no Velora primeiro.</string>
+    <string name="sent_to_downloads">Enviado para a pasta Downloads de %1$s.</string>
+    <string name="send_failed">Não foi possível enviar: %1$s</string>
+    <string name="done">Concluir</string>
+    <string name="try_again">Tentar de novo</string>
+    <string name="shared_text_name">Texto.txt</string>
+    <string name="receiving_from">Recebendo arquivos de %1$s…</string>
+    <string name="receive_failed">Falha ao receber arquivos: %1$s</string>
+    <plurals name="items_count">
+        <item quantity="one">%1$d item</item>
+        <item quantity="other">%1$d itens</item>
+    </plurals>
 </resources>

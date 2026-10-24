@@ -35,4 +35,35 @@
     <string name="update_downloading">Downloading… %1$d%%</string>
     <string name="update">Update</string>
     <string name="update_failed">Update failed: %1$s</string>
+    <string name="files">Files</string>
+    <string name="files_up">Up</string>
+    <string name="files_empty">This folder is empty.</string>
+    <string name="files_loading">Loading…</string>
+    <string name="upload_here">Send files here</string>
+    <string name="upload_to_downloads">Send files to Downloads</string>
+    <string name="download">Download</string>
+    <string name="transfer_preparing">%1$s: preparing…</string>
+    <string name="transfer_waiting">%1$s: waiting for the computer to accept…</string>
+    <string name="transfer_progress">%1$s · %2$d%%</string>
+    <string name="saved_to_downloads">Saved to Downloads: %1$s</string>
+    <string name="sent_to">Sent to %1$s: %2$s</string>
+    <string name="transfer_failed">Transfer failed: %1$s</string>
+    <string name="share_title">Send to a computer</string>
+    <plurals name="share_items">
+        <item quantity="one">%1$d item, to the Downloads folder on the computer</item>
+        <item quantity="other">%1$d items, to the Downloads folder on the computer</item>
+    </plurals>
+    <string name="share_nothing">There is nothing to send.</string>
+    <string name="share_no_hosts">Pair a computer in Velora first.</string>
+    <string name="sent_to_downloads">Sent to the Downloads folder of %1$s.</string>
+    <string name="send_failed">Could not send: %1$s</string>
+    <string name="done">Done</string>
+    <string name="try_again">Try again</string>
+    <string name="shared_text_name">Text.txt</string>
+    <string name="receiving_from">Receiving files from %1$s…</string>
+    <string name="receive_failed">Receiving files failed: %1$s</string>
+    <plurals name="items_count">
+        <item quantity="one">%1$d item</item>
+        <item quantity="other">%1$d items</item>
+    </plurals>
 </resources>
