@@ -9,6 +9,7 @@ mod file_icons;
 mod files;
 mod icons;
 mod motion;
+mod reach;
 pub(crate) mod strings;
 mod theme;
 mod this_pc;
@@ -18,7 +19,7 @@ mod widgets;
 
 use std::{
     io::{Read, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -650,7 +651,14 @@ impl Launcher {
                         };
                         // A pairing session is labelled with the address it dialed.
                         let running = self.sessions.iter().any(|x| x.label == host.name || x.label == host.address);
-                        let card = DeviceCard { host, running, fresh, now: self.now, width: card_width };
+                        let card = DeviceCard {
+                            host,
+                            running,
+                            fresh,
+                            now: self.now,
+                            width: card_width,
+                            config_dir: self.config_dir.as_deref(),
+                        };
                         let (picked, rect) = card.show(ui, s, &self.icons);
                         if let Some(a) = picked {
                             action = Some((a, host.name.clone()));
@@ -669,14 +677,17 @@ impl Launcher {
             ui.add_space(24.0);
         });
         if let Some(name) = drop_on {
-            self.open_files(name.clone(), &ctx);
-            if let Some(manager) = &mut self.files {
-                manager.send_when_ready(name, dropped, &ctx);
+            if self.open_files(name.clone(), &ctx) {
+                if let Some(manager) = &mut self.files {
+                    manager.send_when_ready(name, dropped, &ctx);
+                }
             }
         }
         match action {
             Some((DeviceAction::Connect, name)) => self.spawn(name.clone(), &["connect", &name], None),
-            Some((DeviceAction::Files, name)) => self.open_files(name, ui.ctx()),
+            Some((DeviceAction::Files, name)) => {
+                self.open_files(name, ui.ctx());
+            }
             Some((DeviceAction::Forget, name)) => {
                 if let Err(e) = hosts::forget(&self.state, &name) {
                     self.error = Some(format!("{e:#}"));
@@ -687,7 +698,14 @@ impl Launcher {
         }
     }
 
-    fn open_files(&mut self, host: String, ctx: &egui::Context) {
+    /// Shows `host` in the file manager, opening it if needed; whether it did. A relay carries one connection to a computer
+    /// from this one at a time, and a second takes the first over, so a session that is open through a relay to `host` is
+    /// not displaced by a file connection: the banner says to close it first (see `crate::free_relay`).
+    fn open_files(&mut self, host: String, ctx: &egui::Context) -> bool {
+        if let Err(e) = crate::free_relay(&self.state, &host, self.s) {
+            self.error = Some(format!("{e:#}"));
+            return false;
+        }
         match &mut self.files {
             // Keeps its transfers: the computer just shows on the right.
             Some(manager) => manager.show_host(host, ctx),
@@ -696,11 +714,15 @@ impl Launcher {
                     files::FileManager::open(host, self.config_dir.clone(), self.settings.device_name.clone(), ctx);
                 match manager {
                     Ok(manager) => self.files = Some(manager),
-                    Err(e) => return self.error = Some(format!("{e:#}")),
+                    Err(e) => {
+                        self.error = Some(format!("{e:#}"));
+                        return false;
+                    }
                 }
             }
         }
         self.go(Page::Files);
+        true
     }
 
     fn files_page(&mut self, ui: &mut egui::Ui) {
@@ -1248,6 +1270,8 @@ struct DeviceCard<'a> {
     fresh: Option<f64>,
     now: f64,
     width: f32,
+    /// The launcher's `--config-dir`, for what a card does on its own (waking the computer).
+    config_dir: Option<&'a Path>,
 }
 
 impl DeviceCard<'_> {
@@ -1318,6 +1342,10 @@ impl DeviceCard<'_> {
         }
         if secondary_button(&mut buttons, s.files).clicked() {
             action = Some(DeviceAction::Files);
+        }
+        // No use for it while a session is open: the computer is awake.
+        if !self.running {
+            reach::wake_button(&mut buttons, s, self.host, rect, self.config_dir);
         }
         buttons.with_layout(Layout::left_to_right(Align::Center), |ui| {
             if hold_to_forget(ui, s) {

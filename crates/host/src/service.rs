@@ -58,7 +58,10 @@ use windows_service::{
     service_manager::{ServiceManager, ServiceManagerAccess},
 };
 
-use crate::win::{self, Handle};
+use crate::{
+    reach,
+    win::{self, Handle},
+};
 
 pub const SERVICE_NAME: &str = "Velora";
 const DISPLAY_NAME: &str = "Velora Host";
@@ -343,24 +346,34 @@ fn owner_sid(path: &Path) -> Result<String> {
     }
 }
 
-/// Brings the user's host identity and paired devices over, so phones stay paired.
+/// Brings the user's host identity, paired devices and reach files (the DHT key, the device secrets, the switches, the
+/// relays) over, so phones stay paired and keep finding and opening the host.
 fn migrate_state(user_config: Option<PathBuf>, service_config: &Path) -> Result<()> {
     let to = StateDir::open(Some(service_config.to_path_buf()), "host")?;
-    if to.path(StateDir::IDENTITY).exists() {
-        return Ok(());
-    }
-    let from = StateDir::open(user_config, "host")?;
-    for file in [StateDir::IDENTITY, StateDir::AUTHORIZED_CLIENTS, StateDir::ACCESS_PASSWORD] {
-        if from.path(file).exists() {
-            fs::copy(from.path(file), to.path(file))?;
-        }
-    }
+    let Some(from) = copy_user_state(user_config, &to)? else { return Ok(()) };
     // Copies take the folder's access list, but set it explicitly anyway.
     restrict_tree(to.dir(), PRIVATE_SDDL)?;
     if from.path(StateDir::IDENTITY).exists() {
         println!("Kept this computer's identity and paired devices from {}.", from.dir().display());
     }
     Ok(())
+}
+
+/// Copies what the user's host keeps into the service's state directory `to`, file by file and only the files there
+/// are. A service that has an identity already keeps its state as it is, and nothing is copied (`None`); otherwise the
+/// user's state directory is returned.
+fn copy_user_state(user_config: Option<PathBuf>, to: &StateDir) -> Result<Option<StateDir>> {
+    if to.path(StateDir::IDENTITY).exists() {
+        return Ok(None);
+    }
+    let from = StateDir::open(user_config, "host")?;
+    let paired = [StateDir::IDENTITY, StateDir::AUTHORIZED_CLIENTS, StateDir::ACCESS_PASSWORD];
+    for file in paired.into_iter().chain(reach::STATE_FILES) {
+        if from.path(file).exists() {
+            fs::copy(from.path(file), to.path(file))?;
+        }
+    }
+    Ok(Some(from))
 }
 
 define_windows_service!(ffi_service_main, service_main);
@@ -571,5 +584,100 @@ impl Host {
             let _ = TerminateProcess(self.process.0, 1);
             WaitForSingleObject(self.process.0, 5000);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    /// Two empty folders, one for the user's host and one for the service, removed at the end.
+    struct Folders {
+        user: PathBuf,
+        service: PathBuf,
+    }
+
+    impl Folders {
+        fn new() -> Folders {
+            static COUNTER: AtomicUsize = AtomicUsize::new(0);
+            let tag = format!("velora-migrate-{}-{}", std::process::id(), COUNTER.fetch_add(1, Ordering::Relaxed));
+            let base = std::env::temp_dir().join(tag);
+            let _ = fs::remove_dir_all(&base);
+            Folders { user: base.join("user"), service: base.join("service") }
+        }
+
+        /// The state directory of the user's host, or of the service.
+        fn user(&self) -> StateDir {
+            StateDir::open(Some(self.user.clone()), "host").unwrap()
+        }
+
+        fn service(&self) -> StateDir {
+            StateDir::open(Some(self.service.clone()), "host").unwrap()
+        }
+    }
+
+    impl Drop for Folders {
+        fn drop(&mut self) {
+            if let Some(base) = self.user.parent() {
+                let _ = fs::remove_dir_all(base);
+            }
+        }
+    }
+
+    const PAIRED: [&str; 3] = [StateDir::IDENTITY, StateDir::AUTHORIZED_CLIENTS, StateDir::ACCESS_PASSWORD];
+
+    fn write(state: &StateDir, file: &str, whose: &str) {
+        fs::write(state.path(file), format!("{file} of {whose}")).unwrap();
+    }
+
+    fn read(state: &StateDir, file: &str) -> Option<String> {
+        fs::read_to_string(state.path(file)).ok()
+    }
+
+    #[test]
+    fn the_identity_the_paired_devices_and_every_file_of_the_reach_code_are_brought_over() {
+        let folders = Folders::new();
+        let (user, service) = (folders.user(), folders.service());
+        for file in PAIRED.into_iter().chain(reach::STATE_FILES) {
+            write(&user, file, "the user");
+        }
+        let from = copy_user_state(Some(folders.user.clone()), &service).unwrap().expect("it copied");
+        assert_eq!(from.dir(), user.dir());
+        for file in PAIRED.into_iter().chain(reach::STATE_FILES) {
+            assert_eq!(read(&service, file), Some(format!("{file} of the user")), "{file}");
+        }
+    }
+
+    #[test]
+    fn what_the_user_does_not_have_is_not_invented() {
+        let folders = Folders::new();
+        let (user, service) = (folders.user(), folders.service());
+        write(&user, StateDir::IDENTITY, "the user");
+        copy_user_state(Some(folders.user.clone()), &service).unwrap().expect("it copied");
+        assert_eq!(read(&service, StateDir::IDENTITY), Some("identity.json of the user".into()));
+        for file in reach::STATE_FILES {
+            assert_eq!(read(&service, file), None, "{file}");
+        }
+    }
+
+    #[test]
+    fn a_service_that_has_an_identity_keeps_all_its_state_as_it_is() {
+        let folders = Folders::new();
+        let (user, service) = (folders.user(), folders.service());
+        for file in PAIRED.into_iter().chain(reach::STATE_FILES) {
+            write(&user, file, "the user");
+        }
+        // The service has its identity, and a DHT key and secrets of its own; the rest it does not have.
+        write(&service, StateDir::IDENTITY, "the service");
+        write(&service, reach::STATE_FILES[0], "the service");
+        assert!(copy_user_state(Some(folders.user.clone()), &service).unwrap().is_none());
+        assert_eq!(read(&service, StateDir::IDENTITY), Some("identity.json of the service".into()));
+        assert_eq!(read(&service, reach::STATE_FILES[0]), Some(format!("{} of the service", reach::STATE_FILES[0])));
+        for file in reach::STATE_FILES.into_iter().skip(1) {
+            assert_eq!(read(&service, file), None, "{file} is not copied over a service that has its own state");
+        }
+        assert_eq!(read(&service, StateDir::AUTHORIZED_CLIENTS), None);
     }
 }

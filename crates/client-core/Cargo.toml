@@ -9,6 +9,11 @@ repository.workspace = true
 [dependencies]
 velora-protocol.workspace = true
 velora-audio.workspace = true
+# Standalone reach (src/reach): router and LAN facts, the DHT record, relaying. The feature tickets
+# F2-F4 work in src/reach/{dht,relay,punch}.rs and cannot edit this file, so everything they need is here.
+velora-nat.workspace = true
+velora-dht.workspace = true
+velora-relay.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tokio.workspace = true
@@ -27,7 +32,8 @@ windows = { version = "0.62", optional = true, features = [
 ] }
 
 [dev-dependencies]
-tokio = { workspace = true }
+# test-util: the race's timing tests run on a paused clock.
+tokio = { workspace = true, features = ["test-util"] }
 
 [features]
 default = ["decode"]
