@@ -12,7 +12,7 @@ Times are medians with the range in brackets. Where a cell says "pending", §11 
 | # | Question | Answer |
 |---|---|---|
 | 1 | Does `Dht::client()` bootstrap here? How fast, cold and warm? How many nodes? | Yes: all 6 cold and all 19 warm-start runs of §3.1 ended with a routing table (25-139 nodes). **Cold**: first routing-table node after 124 ms (76-290), 8 nodes after 0.58 s (0.54-1.12), 86 nodes at 5 s (25-115) and no more at 30 s. **Warm** (16 saved nodes + the 4 default names): first node 82 ms (35-98), 8 nodes 154 ms, 102 nodes at 5 s. `bootstrapped()` and `public_address()` need 2.8-4.3 s from any start (§3.1). |
-| 2 | What do `public_address()` and `firewalled()` report? Is the observed port the bound one? | `public_address()` is the carrier's public IPv4 and **the port the node bound**: this line (a home router behind CGNAT) keeps the source port, for every port tried, and the mapping is endpoint-independent (§3.2). Behind a second NAT (WSL2) the port is rewritten (6881 became 64773) but stays endpoint-independent. `firewalled()` stays `true` and the node stays a client. |
+| 2 | What do `public_address()` and `firewalled()` report? Is the observed port the bound one? | `public_address()` is the carrier's public IPv4 and **the port the node bound**: the test line (a home router behind CGNAT) keeps the source port, for every port tried, and the mapping is endpoint-independent (§3.2). Behind a second NAT (WSL2) the port is rewritten (6881 became 64773) but stays endpoint-independent. `firewalled()` stays `true` and the node stays a client. |
 | 3 | `put_mutable` / `get_mutable_most_recent`: latency, success rate, 1000 and 1001 bytes, republishing, seq | **Resolve**: first value after 0.54 s warm start (0.10-0.77), 1.17 s cold (0.68-1.68); the stream ends at 2.6-3.9 s; 12 of 46 cold resolves started seconds apart came back empty (the same lookup repeated on the node always worked), 0 of 20 from a saved table. **Publish**: 2.1 s for the host's real pattern (same key, higher seq) up to 5.8 s for a new key from a cold node; 20 of 20 `Ok`. **Limit: 996 bytes**, not 1000: 997-1001 were refused by every node, and the library reports it as `Timeout`. Higher seq replaces the value; lower seq is `NotMostRecent`; **an equal seq is acknowledged and ignored** (§4). |
 | 4 | Resolve from a second node | Second process on this PC: found. A static Linux build behind WSL2's extra NAT layer: found. Both 2 of 3 tries (the third was an empty cold start). Another network: **pending: needs another network** (§5). |
 | 5 | How long does a published item live? | **At least 4.5 hours.** Both readers found the exact value at every one of 20 checks, the last 270 minutes after a single publish (8 of 30 asked nodes for the node that had run since before the publish, 14 of 143 for a new one); the watcher was stopped then, with the item still there. The plan assumed about two hours, so the 30-minute republish has a wide margin (§6). |
@@ -22,14 +22,12 @@ Times are medians with the range in brackets. Where a cell says "pending", §11 
 
 ## 2. How it was measured
 
-**Machine and network.** The author's line: a desktop PC (8-core, 16-thread Intel CPU, 16 GB of RAM, Windows 11 Pro, Rust 1.99.1,
-release builds) wired by Gigabit Ethernet to a home router behind CGNAT on a residential fibre line. The DHT sees the carrier's
-public IPv4 address (not written here); the hops after the router are private ISP addresses; and a few replies, from nodes that are
-probably inside the ISP, saw a private `10.x` endpoint for the same source port (§3.2), which is what a private WAN address
-behind a carrier NAT looks like. The router's own WAN address was not read (B1/E2 will compare it with the observed one). Other
-sessions were building on the PC during the runs (1.4-2.2 GB of RAM free), which does not show in network numbers. Several mesh-VPN
-adapters are installed, but their default routes have far worse metrics than the wired one, so the DHT traffic left through the
-router and not through a VPN.
+**Machine and network.** One desktop PC (Windows 11 Pro, Rust 1.99.1, release builds) wired by Gigabit Ethernet to a home router
+behind CGNAT. The DHT sees the carrier's public IPv4 address (not written here); the hops after the router are private ISP
+addresses; and a few replies, from nodes that are probably inside the ISP, saw a private `10.x` endpoint for the same source port
+(§3.2), which is what a private WAN address behind a carrier NAT looks like. The router's own WAN address was not read (E2 compares
+it with the observed one). Other builds were running on the PC during the runs, which does not show in network numbers. The DHT
+traffic left through the router and not through a VPN.
 
 **The program.** `velora-spike`, throwaway, outside the repository (§12): Rust on `mainline = "=8.0.1"` with the async API,
 one mode per question. It counts the datagrams the library sends and receives by listening to its TRACE events
@@ -88,7 +86,7 @@ thread. Polled every 50 ms (cold: 6 runs of 30 s; each warm variant: 4 runs of 1
   library clears the flag only when a ping it sends to its own public address comes back, and that never happened here: the
   carrier NAT or the router does not loop the packet back (no hairpin), or Windows Firewall drops it (no inbound rule exists for the
   program).
-  Either way the node never left client mode on this network.
+  Either way the node never left client mode on the test network.
 - Windows Firewall showed no prompt and created no rule for the program; outbound-initiated UDP and its replies work without one.
 
 ### 3.3 The routing table does not survive being idle
@@ -233,13 +231,13 @@ The same item (random 64 bytes, published once by one process) was read by a nod
 | Reader | Result |
 |---|---|
 | A second process on this PC, another UDP port | found in 2 of 3 tries (UDP ports 65506, 64991 and 52574): first value after 1.13 and 1.30 s, query complete after 4.0 and 4.3 s, 22-24 nodes returned it, value and seq identical to what was published. The third try found nothing: its lookup asked 5 nodes (a bad cold start, §9.10) |
-| A static Linux build of the same program inside WSL2. The only distro installed is Docker Desktop's own: it sits behind the Windows host's NAT (interface MTU 1280), behind the router, so one more NAT layer than the Windows process | found in 2 of 3 tries (the process always bound 6881): first value after 1.02 and 1.09 s, complete after 3.7 and 4.0 s, 25-27 nodes, identical. The third asked 8 nodes and found nothing. The DHT saw this process as `<public IP>:64773` although it was bound to 6881: the NAT of Windows in front of WSL2 rewrites the port. In the `nat` mode run from there, 6881 became 64773, 53496 became 64730, 41234 became 64760 and 55555 became 64717, each seen by 183 to 264 replies and by no other endpoint: the rewriting is endpoint-independent, which is what hole punching needs |
+| A static Linux build of the same program inside WSL2. It sits behind the Windows host's NAT (interface MTU 1280), behind the router, so one more NAT layer than the Windows process | found in 2 of 3 tries (the process always bound 6881): first value after 1.02 and 1.09 s, complete after 3.7 and 4.0 s, 25-27 nodes, identical. The third asked 8 nodes and found nothing. The DHT saw this process as `<public IP>:64773` although it was bound to 6881: the NAT of Windows in front of WSL2 rewrites the port. In the `nat` mode run from there, 6881 became 64773, 53496 became 64730, 41234 became 64760 and 55555 became 64717, each seen by 183 to 264 replies and by no other endpoint: the rewriting is endpoint-independent, which is what hole punching needs |
 | A node on another network (a laptop on other Wi-Fi, a phone hotspot) | **pending: needs another network** (commands below) |
 
 To run the last row, with nothing but the 1.5 MB program (no installer, no admin right, no config):
 
 ```
-:: on the author's PC, left running (it republishes every 20 minutes for 2 hours):
+:: on the measuring PC, left running (it republishes every 20 minutes for 2 hours):
 velora-spike.exe publish --hold 7200 --every 1200
 :: it prints KEY=.. SALT=.. VALUE=.. and the exact line to run on the other network:
 velora-spike.exe resolve --key <KEY> --salt <SALT> --expect <VALUE> --tries 3
@@ -457,15 +455,14 @@ let nodes: Vec<String> = dht.to_bootstrap().await;                   // "ip:port
   a table of fewer than 8 nodes (§3.3). A cache 22 minutes old worked as well as a fresh one, and one 51 minutes old as well
   (first node 74-137 ms, 85-123 nodes at 5 s); one five hours old as well (first node 55-242 ms, 8 nodes after 121-319 ms, 101-115 nodes at 5 s, 3 runs).
 
-**Corrections to the design documents** (H1 owns the edit; this file only records them)
+**Corrections to the design documents** (applied to [nat-traversal.md](nat-traversal.md) by the documentation ticket; kept here as the record)
 - [nat-traversal.md](nat-traversal.md) phase 2: "BEP 44 allows 1000 bytes" is **996 bytes** of value; "joins in well under a
   second without touching the bootstrap nodes" is "usable after about 0.1 s, finished after 3 s, and the default names stay in
   the list as a fallback"; "seq = unix time (monotonic across restarts without a counter file)" is `max(now, last + 1)` with the
   recovery above; "A DHT client sends a few hundred small UDP packets per minute" is about 50 a minute idle and about 500 per
   lookup (§8); "nodes keep items for about two hours" is **at least 4.5 hours** here (§6), so the 30-minute republish has a wide margin.
 
-**For other tickets** (the short version was handed over earlier in `docs/reach-handover/S0-early-findings.md`; where that note and
-this document differ, this one is right)
+**For other tickets** (a shorter version was handed over earlier; where it and this document differ, this one is right)
 - **C1**: 996 is right and confirmed on the network. The 12-device record of 922 bytes was not tested as such, but 900 and 996
   bytes resolved from another node.
 - **E1 and G3**: add `mainline=error` to the default filters (`"info"` becomes `"info,mainline=error"`) in `host/src/main.rs`
@@ -484,8 +481,8 @@ this document differ, this one is right)
 
 ## 11. Still pending
 
-- **Pending: another network** (§5). One run on a laptop on other Wi-Fi or a phone hotspot, which needs the author's laptop or a
-  phone. Nothing here can stand in for it: WSL2 adds a NAT layer but shares the router and the ISP with the PC. The commands are
+- **Pending: another network** (§5). One run on a laptop on other Wi-Fi or a phone hotspot, which cannot be done from the measuring
+  PC. Nothing here can stand in for it: WSL2 adds a NAT layer but shares the router and the ISP with the PC. The commands are
   in §5.
 - **Not measured, and not measurable from here**: whether the DHT port can ever be seen as reachable (hairpin NAT, an inbound rule,
   a router mapping), which decides if the adaptive switch to server mode can happen; the router's own WAN address (carrier NAT
