@@ -370,7 +370,10 @@ fn claim_relay(state: &StateDir, fingerprint: &str) -> Option<RelayClaim> {
     let file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path);
     match file.map_err(TryLockError::Error).and_then(|file| file.try_lock().map(|()| file)) {
         Ok(file) => Some(RelayClaim { _lock: file }),
-        Err(TryLockError::WouldBlock) => None,
+        Err(TryLockError::WouldBlock) => {
+            tracing::warn!("another window of this computer held the relay to this host; this connection took it over");
+            None
+        }
         Err(TryLockError::Error(e)) => {
             tracing::debug!("cannot claim the relay ({}): {e}", path.display());
             None
