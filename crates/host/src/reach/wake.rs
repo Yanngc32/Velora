@@ -37,9 +37,10 @@ mod tests {
 
     fn adapter(n: u8, virtual_adapter: bool) -> LocalMac {
         LocalMac {
-            mac: [0x00, 0x1b, 0x21, 0x00, 0x00, n],
+            // The ranges meant for documentation (RFC 7042, RFC 5737): the repository is public.
+            mac: [0x00, 0x00, 0x5e, 0x00, 0x53, n],
             name: format!("adapter {n}"),
-            networks: vec![Ipv4Network { addr: Ipv4Addr::new(192, 168, 1, n), prefix_len: 24 }],
+            networks: vec![Ipv4Network { addr: Ipv4Addr::new(198, 51, 100, n), prefix_len: 24 }],
             virtual_adapter,
         }
     }

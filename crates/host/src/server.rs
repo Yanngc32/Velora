@@ -1049,7 +1049,8 @@ enum Auth {
 /// a device this host knows needs no password (the password protects the screen, and a client that
 /// dials a relay holds only the password of the host it wants to reach, not this one's). Known means
 /// a paired client, or a computer whose *host* this one's user paired with (it is in
-/// `known_hosts.json` of the client side, see `reach::relay::trusts`): that registers with a relay
+/// `known_hosts.json` of the client side) or allowed from the launcher (`relay_hosts.json`; see
+/// `reach::relay::trusts`): that registers with a relay
 /// under its host identity, which is not in the list of client devices, and may open a link and
 /// nothing else. Any other hello of such a device, and any link from one nobody knows, is judged
 /// as it always was.

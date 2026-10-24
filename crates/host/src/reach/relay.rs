@@ -2802,8 +2802,9 @@ mod tests {
         assert!(candidates[0].explicit);
         assert_eq!(candidates[0].addresses, ["203.0.113.10:7420", "198.51.100.20:7420"]);
 
-        // The same fingerprint replaces the entry, whatever else it had; a name that is a host name is fine.
-        add_relay(&ctx, "Office", "office.example.net:7420", &[], &office).unwrap();
+        // The same fingerprint replaces the entry, whatever else it had (and spaces around it, from a
+        // paste, do not make it another); a name that is a host name is fine.
+        add_relay(&ctx, "Office", "office.example.net:7420", &[], &format!(" {office}\n")).unwrap();
         let list = relay_list(&ctx);
         assert_eq!(list.len(), 1);
         assert_eq!(
@@ -3026,6 +3027,9 @@ mod tests {
         assert_eq!(reason_of("Office PC"), (false, Some("it does not relay for other devices".to_string())));
         let entry = RelayEntry { fingerprint: Fingerprint([21; 32]), name: "Office PC".into(), addresses: Vec::new() };
         let _listed = Listed::new(&ctx, &state, entry);
+        assert_eq!(reason_of("Office PC"), (true, None));
+        // A reason left over from before is not shown next to a registration.
+        lock(&state.reasons).insert(Fingerprint([21; 32]), "left over".to_string());
         assert_eq!(reason_of("Office PC"), (true, None));
         assert_eq!(reason_of("Studio"), (false, None));
         let relays = configured(&ctx);
