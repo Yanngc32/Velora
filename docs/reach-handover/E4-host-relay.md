@@ -140,6 +140,10 @@ service the hosts its user allowed (for example a control request that stores th
 source because the brief said trust comes only from the client side's `known_hosts.json`). A relay run by the user (`velora-host run`,
 including `--relay-only` on a VPS) has the same config folder for both sides and works.
 
+**E4b removes this limit** (`E4b-relay-management.md`): the launcher hands the service the computers its user allowed with
+`Request::AllowRelayHost` (kept in `relay_hosts.json`, which `relay::trusts` reads too), and a host service learns its relays from
+`Request::AddRelay`, so neither needs a hand-written file.
+
 ## Packet size through a relay (`26a4ebb`)
 
 The host's path MTU discovery grows packets to 1452 bytes, but an inner packet travels as a datagram of the connection to the relay,

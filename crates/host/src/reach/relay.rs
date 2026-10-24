@@ -54,15 +54,16 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{anyhow, bail, Context as _, Result};
+use anyhow::{anyhow, bail, ensure, Context as _, Result};
 use serde::{Deserialize, Serialize};
 use tokio::{
-    sync::{mpsc, watch, Semaphore},
+    sync::{mpsc, watch, Notify, Semaphore},
     task::{JoinHandle, JoinSet},
     time::{sleep, timeout, timeout_at},
 };
 use velora_nat::wake::{format_mac, parse_mac, Mac};
 use velora_protocol::{
+    control,
     identity::{AuthorizedClient, KnownHost, StateDir},
     tls::{self, Fingerprint},
     wire::{self, AddressKind, ClientMsg, HelloExt, HostMsg, MAX_NAME_LEN, PROTOCOL_VERSION},
@@ -82,6 +83,14 @@ use super::{
 const KNOWN_FILE: &str = "relay_known.json";
 /// Relays to register with whether or not the host has a public address, shaped like `known_hosts.json`.
 const RELAYS_FILE: &str = "relays.json";
+/// Computers allowed to register here though they are not paired devices (`AllowRelayHost`).
+const HOSTS_FILE: &str = "relay_hosts.json";
+/// Most relays a host is set to register with, and most computers allowed to register with it.
+pub const MAX_LISTED_RELAYS: usize = 16;
+pub const MAX_ALLOWED_HOSTS: usize = 64;
+/// Longest name kept in the lists, and most addresses of a relay besides its first.
+const MAX_LIST_NAME: usize = 64;
+const MAX_EXTRA_ADDRESSES: usize = 8;
 /// How often the serving task saves what the forwarder remembers and drops what is no longer allowed.
 const SAVE_EVERY: Duration = Duration::from_secs(30);
 
@@ -170,6 +179,13 @@ struct RelayState {
     saved: Mutex<Vec<KnownRecord>>,
     /// The relays this host is registered with now, by the relay's raw fingerprint.
     live: Mutex<BTreeMap<[u8; 32], RelayEntry>>,
+    /// Held while a request of the launcher changes `relays.json` or `relay_hosts.json`, so that two
+    /// at once cannot undo each other.
+    editing: Mutex<()>,
+    /// Tells the registering task to read its lists now, not at its next half minute.
+    rescan: Notify,
+    /// Why a relay of the user's list is not registered, as its supervisor last said.
+    reasons: Mutex<HashMap<Fingerprint, String>>,
 }
 
 /// One host the forwarder remembers, as the state file writes it.
@@ -334,11 +350,13 @@ fn reconcile(ctx: &ReachContext, state: &RelayState) {
     }
 }
 
-/// The fingerprints (base64url) of the devices this host relays for: those paired with it, and the
-/// hosts its user paired with from here (see [`trusts`]). `None` when either list cannot be read.
+/// The fingerprints (base64url) of the devices this host relays for: those paired with it, the
+/// computers its user allowed and the hosts its user paired with from here (see [`trusts`]). `None`
+/// when any of the lists cannot be read.
 fn allowed(ctx: &ReachContext) -> Option<HashSet<String>> {
     let clients: Vec<AuthorizedClient> = ctx.state_dir.load(StateDir::AUTHORIZED_CLIENTS).ok()?;
     let mut allowed: HashSet<String> = clients.into_iter().map(|client| client.fingerprint).collect();
+    allowed.extend(allowed_list(ctx)?.into_iter().map(|host| host.fingerprint));
     allowed.extend(client_side_hosts(ctx)?.into_iter().map(|host| host.fingerprint));
     Some(allowed)
 }
@@ -425,17 +443,21 @@ pub fn busy(ctx: &ReachContext) -> bool {
     ctx.ext::<RelayState>().relay.registered().iter().any(|host| host.client.is_some())
 }
 
-/// Whether the host `fingerprint` is one this computer's user paired with as a client (it is in
-/// `known_hosts.json` of the client side, beside the host's state directory). Such a host may open
-/// a *link* to this relay without being in `authorized_clients.json`: it registers under its host
-/// identity, which only a pairing in this direction can have put there. A blocking file read.
+/// Whether the host `fingerprint` is one this computer's user let register here: it is in
+/// `relay_hosts.json` of the host's state directory (`Request::AllowRelayHost`, from the launcher,
+/// which works under the Windows service too), or in `known_hosts.json` of the client side, beside
+/// the host's state directory (this computer's user paired with it as a client). Such a host may
+/// open a *link* to this relay without being in `authorized_clients.json`: it registers under its
+/// host identity, which is not a client's. A blocking file read; a file that cannot be read trusts
+/// nobody.
 ///
 /// The host's `authorize` asks this for a link hello (`files_only` and `reach`, no pairing secret)
 /// from a fingerprint it does not know, and lets it in as a link only: no session, no files, and no
 /// access password, since a link reaches no screen. Nothing else is trusted because of it.
 pub fn trusts(ctx: &ReachContext, fingerprint: &Fingerprint) -> bool {
     let wanted = fingerprint.to_base64();
-    client_side_hosts(ctx).is_some_and(|hosts| hosts.iter().any(|host| host.fingerprint == wanted))
+    allowed_list(ctx).is_some_and(|hosts| hosts.iter().any(|host| host.fingerprint == wanted))
+        || client_side_hosts(ctx).is_some_and(|hosts| hosts.iter().any(|host| host.fingerprint == wanted))
 }
 
 /// The hosts the client side of this computer is paired with: none if it has no list, `None` if it
@@ -463,6 +485,239 @@ fn read_hosts(path: &Path) -> Option<Vec<KnownHost>> {
             None
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Managed from the launcher
+// ---------------------------------------------------------------------------------------------
+
+// The launcher edits two lists of the host through the control channel (`Request::AddRelay` and
+// the like, handled in `server.rs`, which calls these): the relays this host registers with, in
+// `relays.json` (the registering task reads it every half minute, and at once when it is told),
+// and the computers allowed to register here, in `relay_hosts.json` (read at each link). Under the
+// Windows service the host cannot see the user's files, so this is how a user sets either up.
+
+/// A computer allowed to register here, as `relay_hosts.json` keeps it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct AllowedHost {
+    #[serde(default)]
+    name: String,
+    /// Its host fingerprint (base64url).
+    fingerprint: String,
+}
+
+/// The computers the user allowed: empty when there is no file, `None` when there is one that
+/// cannot be read.
+fn allowed_list(ctx: &ReachContext) -> Option<Vec<AllowedHost>> {
+    match ctx.state_dir.load(HOSTS_FILE) {
+        Ok(list) => Some(list),
+        Err(e) => {
+            tracing::debug!("cannot read {HOSTS_FILE}: {e:#}");
+            None
+        }
+    }
+}
+
+/// The fingerprint in a request, or why it is not one.
+fn fingerprint_of(text: &str) -> Result<Fingerprint> {
+    Fingerprint::from_base64(text.trim()).map_err(|_| anyhow!("that is not a device fingerprint (32 bytes, base64url)"))
+}
+
+/// A name for the lists: control characters out, at most [`MAX_LIST_NAME`] characters, and the short
+/// fingerprint when nothing is left.
+fn list_name(name: &str, fingerprint: &Fingerprint) -> String {
+    let name: String = name.chars().filter(|c| !c.is_control()).take(MAX_LIST_NAME).collect();
+    let name = name.trim();
+    if name.is_empty() {
+        fingerprint.short()
+    } else {
+        name.to_string()
+    }
+}
+
+/// An address for the lists: `ip:port` or `name:port`.
+fn check_address(text: &str) -> Result<String> {
+    let text = text.trim();
+    ensure!(!text.is_empty(), "an address is missing");
+    if let Ok(addr) = text.parse::<SocketAddr>() {
+        ensure!(addr.port() != 0, "the port of {text} is 0");
+        return Ok(text.to_string());
+    }
+    let (host, port) = text.rsplit_once(':').with_context(|| format!("{text} is not ip:port or name:port"))?;
+    let port: u16 =
+        port.parse().ok().filter(|port| *port != 0).with_context(|| format!("the port of {text} is not 1 to 65535"))?;
+    ensure!(is_host_name(host), "{host} is not a host name");
+    Ok(format!("{host}:{port}"))
+}
+
+/// A DNS name: labels of letters, digits and hyphens, none starting or ending with one, at most 63
+/// characters each and 253 in all.
+fn is_host_name(name: &str) -> bool {
+    name.len() <= 253
+        && name.split('.').all(|label| {
+            (1..=63).contains(&label.len())
+                && label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+        })
+}
+
+/// `Request::AddRelay`: this computer registers with the relay `fingerprint`, dialed at `address`
+/// and `also`. A relay with the same fingerprint is replaced. Blocking.
+pub fn add_relay(ctx: &ReachContext, name: &str, address: &str, also: &[String], fingerprint: &str) -> Result<()> {
+    let fingerprint = fingerprint_of(fingerprint)?;
+    ensure!(fingerprint != ctx.fingerprint, "a computer cannot be its own relay");
+    let address = check_address(address)?;
+    ensure!(also.len() <= MAX_EXTRA_ADDRESSES, "a relay has at most {MAX_EXTRA_ADDRESSES} more addresses");
+    let also = also.iter().map(|address| check_address(address)).collect::<Result<Vec<_>>>()?;
+    let entry = KnownHost {
+        name: list_name(name, &fingerprint),
+        address,
+        also,
+        fingerprint: fingerprint.to_base64(),
+        ..Default::default()
+    };
+
+    let state = ctx.ext::<RelayState>();
+    let _editing = lock(&state.editing);
+    // A list that cannot be read is the user's own work: it is refused, not written over.
+    let mut list: Vec<KnownHost> =
+        ctx.state_dir.load(RELAYS_FILE).with_context(|| format!("{RELAYS_FILE} cannot be read; fix or remove it"))?;
+    let named = entry.name.clone();
+    match list.iter_mut().find(|known| Fingerprint::from_base64(&known.fingerprint).ok() == Some(fingerprint)) {
+        Some(existing) => *existing = entry,
+        None => {
+            ensure!(
+                list.len() < MAX_LISTED_RELAYS,
+                "this computer is set to register with {MAX_LISTED_RELAYS} relays already"
+            );
+            list.push(entry);
+        }
+    }
+    ctx.state_dir.save(RELAYS_FILE, &list)?;
+    tracing::info!("will register with the relay '{named}' ({fingerprint})");
+    state.rescan.notify_one();
+    Ok(())
+}
+
+/// `Request::RemoveRelay`: this computer stops registering with the relay `fingerprint`, and the
+/// registration it has is dropped within a moment. One that is not in the list changes nothing.
+/// Blocking.
+pub fn remove_relay(ctx: &ReachContext, fingerprint: &str) -> Result<()> {
+    let fingerprint = fingerprint_of(fingerprint)?;
+    let state = ctx.ext::<RelayState>();
+    let _editing = lock(&state.editing);
+    let mut list: Vec<KnownHost> =
+        ctx.state_dir.load(RELAYS_FILE).with_context(|| format!("{RELAYS_FILE} cannot be read; fix or remove it"))?;
+    let before = list.len();
+    list.retain(|known| Fingerprint::from_base64(&known.fingerprint).ok() != Some(fingerprint));
+    if list.len() != before {
+        ctx.state_dir.save(RELAYS_FILE, &list)?;
+        tracing::info!("will no longer register with the relay {fingerprint}");
+    }
+    state.rescan.notify_one();
+    Ok(())
+}
+
+/// `Request::AllowRelayHost`: the computer with this host fingerprint may register here. An entry
+/// with the same fingerprint is replaced. Blocking.
+pub fn allow_host(ctx: &ReachContext, name: &str, fingerprint: &str) -> Result<()> {
+    let fingerprint = fingerprint_of(fingerprint)?;
+    ensure!(fingerprint != ctx.fingerprint, "a computer cannot register with itself");
+    let entry = AllowedHost { name: list_name(name, &fingerprint), fingerprint: fingerprint.to_base64() };
+
+    let state = ctx.ext::<RelayState>();
+    let _editing = lock(&state.editing);
+    let mut list: Vec<AllowedHost> =
+        ctx.state_dir.load(HOSTS_FILE).with_context(|| format!("{HOSTS_FILE} cannot be read; fix or remove it"))?;
+    let named = entry.name.clone();
+    match list.iter_mut().find(|known| Fingerprint::from_base64(&known.fingerprint).ok() == Some(fingerprint)) {
+        Some(existing) => *existing = entry,
+        None => {
+            ensure!(
+                list.len() < MAX_ALLOWED_HOSTS,
+                "{MAX_ALLOWED_HOSTS} computers are allowed to register here already"
+            );
+            list.push(entry);
+        }
+    }
+    ctx.state_dir.save(HOSTS_FILE, &list)?;
+    tracing::info!("'{named}' ({fingerprint}) may register here as a client of this relay");
+    Ok(())
+}
+
+/// `Request::RemoveRelayHost`: that computer may no longer register here, and its registration, if
+/// it has one, is dropped (and what is remembered of it for waking). One that is not in the list
+/// changes nothing else; a computer this one's user paired with from here is still trusted through
+/// `known_hosts.json`. Blocking.
+pub fn remove_host(ctx: &ReachContext, fingerprint: &str) -> Result<()> {
+    let fingerprint = fingerprint_of(fingerprint)?;
+    let state = ctx.ext::<RelayState>();
+    {
+        let _editing = lock(&state.editing);
+        let mut list: Vec<AllowedHost> =
+            ctx.state_dir.load(HOSTS_FILE).with_context(|| format!("{HOSTS_FILE} cannot be read; fix or remove it"))?;
+        let before = list.len();
+        list.retain(|known| Fingerprint::from_base64(&known.fingerprint).ok() != Some(fingerprint));
+        if list.len() != before {
+            ctx.state_dir.save(HOSTS_FILE, &list)?;
+            tracing::info!("{fingerprint} may no longer register here");
+        }
+    }
+    on_revoked(ctx, &fingerprint);
+    Ok(())
+}
+
+/// The relays this host is set to register with, for the launcher: each with whether its
+/// registration is up and, when it is not, why. Blocking.
+pub fn configured(ctx: &ReachContext) -> Vec<control::RelayEntry> {
+    let list: Vec<KnownHost> = ctx.state_dir.load(RELAYS_FILE).unwrap_or_default();
+    let (standalone, relay_only, registered): (bool, bool, HashSet<Fingerprint>) = {
+        let reach = ctx.reach.read();
+        (reach.switches.standalone, reach.relay_only, reach.relays.iter().map(|relay| relay.fingerprint).collect())
+    };
+    let reasons = lock(&ctx.ext::<RelayState>().reasons).clone();
+    list.iter()
+        .filter_map(|known| {
+            let fingerprint = Fingerprint::from_base64(&known.fingerprint).ok()?;
+            let up = registered.contains(&fingerprint);
+            let reason = if up {
+                None
+            } else if relay_only {
+                Some("this computer only relays".to_string())
+            } else if !standalone {
+                Some("standalone reach is off".to_string())
+            } else {
+                reasons.get(&fingerprint).cloned()
+            };
+            Some(control::RelayEntry {
+                name: list_name(&known.name, &fingerprint),
+                fingerprint: fingerprint.to_base64(),
+                address: known.address.clone(),
+                registered: up,
+                reason,
+            })
+        })
+        .collect()
+}
+
+/// The computers the user allowed to register here, for the launcher, with whether each is
+/// registered now. Blocking.
+pub fn allowed_hosts(ctx: &ReachContext) -> Vec<control::RelayHostEntry> {
+    let registered: HashSet<Fingerprint> =
+        ctx.ext::<RelayState>().relay.registered().into_iter().map(|host| host.fingerprint).collect();
+    allowed_list(ctx)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|known| {
+            let fingerprint = Fingerprint::from_base64(&known.fingerprint).ok()?;
+            Some(control::RelayHostEntry {
+                name: list_name(&known.name, &fingerprint),
+                fingerprint: fingerprint.to_base64(),
+                registered: registered.contains(&fingerprint),
+            })
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -584,7 +839,10 @@ async fn run_registration(ctx: ReachContext, started: Instant) -> Result<()> {
     let mut running: HashMap<Fingerprint, Running> = HashMap::new();
     let mut leaving: Vec<AbortOnDrop> = Vec::new();
     // The computer's name goes in the hello; finding it may read a file.
-    let named = ctx.ext::<RelayState>();
+    let state = ctx.ext::<RelayState>();
+    // What an earlier run of this task said about a relay is not about now.
+    lock(&state.reasons).clear();
+    let named = state.clone();
     let _ = tokio::task::spawn_blocking(move || named.name.get_or_init(crate::hostname).len()).await;
     loop {
         let scanning = ctx.clone();
@@ -593,7 +851,12 @@ async fn run_registration(ctx: ReachContext, started: Instant) -> Result<()> {
             Ok(None) => {}
             Err(e) => tracing::warn!("relay registration: could not read the lists of relays: {e}"),
         }
-        if ctx.stop.sleep(RESCAN_EVERY).await {
+        // Half a minute, or sooner when the launcher changed the list.
+        let stopped = tokio::select! {
+            stopped = ctx.stop.sleep(RESCAN_EVERY) => stopped,
+            () = state.rescan.notified() => ctx.stop.is_stopped(),
+        };
+        if stopped {
             break;
         }
     }
@@ -627,6 +890,7 @@ fn supervise_all(
             tracing::info!("relay {fingerprint} is not listed any more; leaving it");
             let _ = supervisor.cancel.send(true);
             leaving.push(supervisor.handle);
+            lock(&ctx.ext::<RelayState>().reasons).remove(&fingerprint);
         }
     }
     for candidate in wanted {
@@ -694,6 +958,8 @@ async fn supervise(
         if registered {
             told = None;
         }
+        // What the launcher shows next to the relay until it is registered again.
+        lock(&ctx.ext::<RelayState>().reasons).insert(current.fingerprint, why.clone());
         let message =
             format!("relay '{}' ({}): {why}; trying again in {} s", current.name, current.fingerprint, wait.as_secs());
         if told.as_deref() == Some(why.as_str()) {
@@ -944,6 +1210,7 @@ struct Listed {
 impl Listed {
     fn new(ctx: &ReachContext, state: &Arc<RelayState>, entry: RelayEntry) -> Listed {
         let key = entry.fingerprint.0;
+        lock(&state.reasons).remove(&entry.fingerprint);
         let mut live = lock(&state.live);
         live.insert(key, entry);
         ctx.reach.update(|reach| reach.set_relays(live.values().cloned().collect()));
@@ -2501,5 +2768,308 @@ mod tests {
         assert_eq!(clean("two\nlines\u{7}\u{1b}[31m"), "twolines[31m");
         assert_eq!(clean(&"x".repeat(1000)).len(), MAX_LOGGED);
         assert_eq!(clean("plain"), "plain");
+    }
+
+    // Managed from the launcher ----------------------------------------------------------------
+
+    fn relay_list(ctx: &ReachContext) -> Vec<KnownHost> {
+        ctx.state_dir.load(RELAYS_FILE).unwrap()
+    }
+
+    fn host_list(ctx: &ReachContext) -> Vec<AllowedHost> {
+        ctx.state_dir.load(HOSTS_FILE).unwrap()
+    }
+
+    fn b64(n: u8) -> String {
+        Fingerprint([n; 32]).to_base64()
+    }
+
+    #[tokio::test]
+    async fn relays_are_added_replaced_and_removed_in_the_list_the_host_reads() {
+        let (ctx, _scratch) = testing::context("relay-add");
+        let (office, studio) = (b64(21), b64(22));
+        add_relay(&ctx, "Office PC", "203.0.113.10:7420", &["198.51.100.20:7420".to_string()], &office).unwrap();
+        let list = relay_list(&ctx);
+        assert_eq!(list.len(), 1);
+        assert_eq!(
+            (list[0].name.as_str(), list[0].address.as_str(), &list[0].also, list[0].fingerprint.as_str()),
+            ("Office PC", "203.0.113.10:7420", &vec!["198.51.100.20:7420".to_string()], office.as_str())
+        );
+
+        // What the registering task reads is a relay the user listed, dialed at those addresses.
+        let candidates = gather(&ctx).unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert!(candidates[0].explicit);
+        assert_eq!(candidates[0].addresses, ["203.0.113.10:7420", "198.51.100.20:7420"]);
+
+        // The same fingerprint replaces the entry, whatever else it had (and spaces around it, from a
+        // paste, do not make it another); a name that is a host name is fine.
+        add_relay(&ctx, "Office", "office.example.net:7420", &[], &format!(" {office}\n")).unwrap();
+        let list = relay_list(&ctx);
+        assert_eq!(list.len(), 1);
+        assert_eq!(
+            (list[0].name.as_str(), list[0].address.as_str(), list[0].also.len()),
+            ("Office", "office.example.net:7420", 0)
+        );
+
+        // Another relay, with no name (nothing but spaces counts as none): it is shown under its
+        // short fingerprint. IPv6 is an address too.
+        add_relay(&ctx, " \t ", "[2001:db8::7]:7420", &[], &studio).unwrap();
+        let list = relay_list(&ctx);
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[1].name, Fingerprint([22; 32]).short());
+
+        // Removing one leaves the other; removing it again changes nothing and is not an error.
+        remove_relay(&ctx, &office).unwrap();
+        remove_relay(&ctx, &office).unwrap();
+        let list = relay_list(&ctx);
+        assert_eq!(list.iter().map(|known| known.fingerprint.as_str()).collect::<Vec<_>>(), [studio.as_str()]);
+    }
+
+    #[tokio::test]
+    async fn requests_that_are_not_valid_are_refused_and_change_nothing() {
+        let (ctx, _scratch) = testing::context("relay-invalid");
+        let good = b64(21);
+        let good_address = "203.0.113.10:7420";
+
+        // A fingerprint is 32 bytes of base64url; a computer is not its own relay.
+        let own = ctx.fingerprint.to_base64();
+        let short = Fingerprint([1; 32]).to_base64()[..40].to_string();
+        for bad in ["", "not a fingerprint", "AAAA", short.as_str(), own.as_str()] {
+            assert!(add_relay(&ctx, "x", good_address, &[], bad).is_err(), "{bad:?}");
+            assert!(allow_host(&ctx, "x", bad).is_err(), "{bad:?}");
+            assert!(remove_relay(&ctx, bad).is_err() || bad == own, "{bad:?}");
+        }
+
+        // An address is ip:port or name:port, with a port from 1 to 65535.
+        let bad_addresses = [
+            "",
+            "203.0.113.10",
+            "203.0.113.10:0",
+            "203.0.113.10:99999",
+            "example.net:0",
+            "host name:7420",
+            "-bad.example:7420",
+            "bad-.example:7420",
+            "a..b:7420",
+            "[::1]",
+            ":7420",
+            "example.net:port",
+            "http://example.net:7420",
+        ];
+        for bad in bad_addresses {
+            assert!(add_relay(&ctx, "x", bad, &[], &good).is_err(), "{bad:?}");
+            assert!(add_relay(&ctx, "x", good_address, &[bad.to_string()], &good).is_err(), "also {bad:?}");
+        }
+        let nine = vec!["198.51.100.20:7420".to_string(); MAX_EXTRA_ADDRESSES + 1];
+        assert!(add_relay(&ctx, "x", good_address, &nine, &good).is_err());
+        assert!(!ctx.state_dir.path(RELAYS_FILE).exists() && !ctx.state_dir.path(HOSTS_FILE).exists());
+
+        // A name loses its control characters and is cut at 64 characters. A relay may have as many
+        // more addresses as that allows.
+        let long = format!("Of\u{7}fice\n{}", "x".repeat(100));
+        let eight = vec!["198.51.100.20:7420".to_string(); MAX_EXTRA_ADDRESSES];
+        add_relay(&ctx, &long, good_address, &eight, &good).unwrap();
+        assert_eq!(relay_list(&ctx)[0].also.len(), MAX_EXTRA_ADDRESSES);
+        allow_host(&ctx, &long, &good).unwrap();
+        for name in [relay_list(&ctx)[0].name.clone(), host_list(&ctx)[0].name.clone()] {
+            assert!(
+                !name.chars().any(char::is_control)
+                    && name.starts_with("Office")
+                    && name.chars().count() == MAX_LIST_NAME
+            );
+        }
+    }
+
+    #[test]
+    fn a_name_in_an_address_is_a_dns_name() {
+        for good in ["example.net", "a-b.example", "a1", "xn--bcher-kva.example", "UPPER.example"] {
+            assert!(is_host_name(good), "{good}");
+        }
+        for bad in ["", ".", "a.", ".a", "a..b", "-a", "a-", "a.-b", "a-.b", "a b", "a_b", "é.example"] {
+            assert!(!is_host_name(bad), "{bad:?}");
+        }
+        // Labels of 63 characters at most, and 253 in all.
+        let label = |n: usize| "a".repeat(n);
+        assert!(is_host_name(&label(63)) && !is_host_name(&label(64)));
+        let all = [label(63), label(63), label(63), label(61)].join(".");
+        assert_eq!(all.len(), 253);
+        assert!(is_host_name(&all) && !is_host_name(&format!("{all}a")));
+    }
+
+    #[tokio::test]
+    async fn the_lists_have_a_size_and_a_replacement_fits_in_a_full_one() {
+        let (ctx, _scratch) = testing::context("relay-caps");
+        for n in 1..=MAX_LISTED_RELAYS as u8 {
+            add_relay(&ctx, "relay", "203.0.113.10:7420", &[], &b64(n)).unwrap();
+        }
+        let error = add_relay(&ctx, "one more", "203.0.113.10:7420", &[], &b64(200)).unwrap_err();
+        assert!(format!("{error:#}").contains("16 relays already"), "{error:#}");
+        add_relay(&ctx, "renamed", "203.0.113.11:7420", &[], &b64(1)).unwrap();
+        assert_eq!(relay_list(&ctx).len(), MAX_LISTED_RELAYS);
+
+        for n in 1..=MAX_ALLOWED_HOSTS as u8 {
+            allow_host(&ctx, "host", &b64(n)).unwrap();
+        }
+        let error = allow_host(&ctx, "one more", &b64(200)).unwrap_err();
+        assert!(format!("{error:#}").contains("64 computers"), "{error:#}");
+        allow_host(&ctx, "renamed", &b64(1)).unwrap();
+        assert_eq!(host_list(&ctx).len(), MAX_ALLOWED_HOSTS);
+    }
+
+    #[tokio::test]
+    async fn a_list_that_cannot_be_read_is_refused_and_left_as_it_is() {
+        let (ctx, _scratch) = testing::context("relay-damaged");
+        for (file, damaged) in [(RELAYS_FILE, &b"[ not json"[..]), (HOSTS_FILE, &b"{ nor this"[..])] {
+            std::fs::write(ctx.state_dir.path(file), damaged).unwrap();
+        }
+        let wanted = b64(21);
+        let errors = [
+            add_relay(&ctx, "x", "203.0.113.10:7420", &[], &wanted),
+            remove_relay(&ctx, &wanted),
+            allow_host(&ctx, "x", &wanted),
+            remove_host(&ctx, &wanted),
+        ];
+        for error in errors {
+            let error = error.unwrap_err();
+            assert!(format!("{error:#}").contains("cannot be read"), "{error:#}");
+        }
+        assert_eq!(std::fs::read(ctx.state_dir.path(RELAYS_FILE)).unwrap(), b"[ not json");
+        assert_eq!(std::fs::read(ctx.state_dir.path(HOSTS_FILE)).unwrap(), b"{ nor this");
+    }
+
+    #[tokio::test]
+    async fn a_computer_the_user_allowed_is_trusted_and_so_is_one_the_user_paired_with() {
+        let (ctx, _scratch) = testing::context("relay-allow");
+        let (allowed, paired, stranger) = (Fingerprint([31; 32]), Fingerprint([32; 32]), Fingerprint([33; 32]));
+        allow_host(&ctx, "Home PC", &allowed.to_base64()).unwrap();
+        trust_host(ctx.state_dir.dir(), paired, ctx.socket.local_addr());
+        assert!(trusts(&ctx, &allowed) && trusts(&ctx, &paired) && !trusts(&ctx, &stranger));
+        // An entry with the same fingerprint replaces the first; it is not listed twice.
+        allow_host(&ctx, "Home", &allowed.to_base64()).unwrap();
+        assert_eq!(host_list(&ctx).len(), 1);
+
+        // The listed file that cannot be read trusts nobody from it, but the other source stands.
+        std::fs::write(ctx.state_dir.path(HOSTS_FILE), b"damaged").unwrap();
+        assert!(!trusts(&ctx, &allowed) && trusts(&ctx, &paired));
+    }
+
+    #[tokio::test]
+    async fn removing_an_allowed_computer_drops_its_registration() {
+        let (ctx, _scratch) = testing::context("relay-forget");
+        let (host_link, host, mut outbox) = unpaired_device(&ctx, "home PC").await;
+        allow_host(&ctx, "Home PC", &host.fingerprint.to_base64()).unwrap();
+        handle_message(&ctx, &host, ClientMsg::RelayRegister { mac: Some(MAC) }).await.unwrap();
+        assert!(answer(&mut outbox).await.0);
+
+        let listed = allowed_hosts(&ctx);
+        assert_eq!(
+            listed,
+            [control::RelayHostEntry {
+                name: "Home PC".into(),
+                fingerprint: host.fingerprint.to_base64(),
+                registered: true
+            }]
+        );
+        let serving = ctx.ext::<RelayState>();
+        assert_eq!(serving.relay.known().len(), 1, "the relay remembers it for waking");
+
+        remove_host(&ctx, &host.fingerprint.to_base64()).unwrap();
+        assert_eq!(closed_with(host_link.client()).await, u64::from(CLOSE_REMOVED));
+        assert!(allowed_hosts(&ctx).is_empty() && !trusts(&ctx, &host.fingerprint));
+        assert!(serving.relay.registered().is_empty() && serving.relay.known().is_empty());
+        // Removing it again is not an error.
+        remove_host(&ctx, &host.fingerprint.to_base64()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_serving_task_keeps_a_computer_the_user_allowed_and_drops_it_once_it_is_not() {
+        let (ctx, _scratch) = testing::context("relay-allowed-reconcile");
+        let state = ctx.ext::<RelayState>();
+        let (host_link, host, mut outbox) = unpaired_device(&ctx, "home PC").await;
+        let fingerprint = host.fingerprint;
+        handle_message(&ctx, &host, ClientMsg::RelayRegister { mac: None }).await.unwrap();
+        assert!(answer(&mut outbox).await.0);
+
+        // Nobody allowed it: the tick drops it. Allowed, it stays.
+        allow_host(&ctx, "Home PC", &fingerprint.to_base64()).unwrap();
+        reconcile(&ctx, &state);
+        assert_eq!(state.relay.registered().len(), 1);
+        ctx.state_dir.save(HOSTS_FILE, &Vec::<AllowedHost>::new()).unwrap();
+        reconcile(&ctx, &state);
+        assert!(state.relay.registered().is_empty());
+        assert_eq!(closed_with(host_link.client()).await, u64::from(CLOSE_REMOVED));
+        // A file that cannot be read changes nothing.
+        std::fs::write(ctx.state_dir.path(HOSTS_FILE), b"damaged").unwrap();
+        assert!(allowed(&ctx).is_none());
+    }
+
+    #[tokio::test]
+    async fn the_launcher_sees_each_relay_registered_or_why_not() {
+        let (ctx, _scratch) = testing::context("relay-status");
+        let (office, studio) = (b64(21), b64(22));
+        add_relay(&ctx, "Office PC", "203.0.113.10:7420", &[], &office).unwrap();
+        add_relay(&ctx, "Studio", "studio.example.net:7420", &[], &studio).unwrap();
+        let reason_of = |name: &str| {
+            let relays = configured(&ctx);
+            let relay = relays.iter().find(|relay| relay.name == name).unwrap().clone();
+            (relay.registered, relay.reason)
+        };
+
+        // The switch is off: that is the reason, whatever else was tried.
+        assert_eq!(reason_of("Office PC"), (false, Some("standalone reach is off".to_string())));
+        ctx.reach.update(|state| state.switches.standalone = true);
+        assert_eq!(reason_of("Office PC"), (false, None), "nothing has been tried yet");
+
+        // What the supervisor last said is the reason; a registration clears it and is shown.
+        let state = ctx.ext::<RelayState>();
+        lock(&state.reasons).insert(Fingerprint([21; 32]), "it does not relay for other devices".to_string());
+        assert_eq!(reason_of("Office PC"), (false, Some("it does not relay for other devices".to_string())));
+        let entry = RelayEntry { fingerprint: Fingerprint([21; 32]), name: "Office PC".into(), addresses: Vec::new() };
+        let _listed = Listed::new(&ctx, &state, entry);
+        assert_eq!(reason_of("Office PC"), (true, None));
+        // A reason left over from before is not shown next to a registration.
+        lock(&state.reasons).insert(Fingerprint([21; 32]), "left over".to_string());
+        assert_eq!(reason_of("Office PC"), (true, None));
+        assert_eq!(reason_of("Studio"), (false, None));
+        let relays = configured(&ctx);
+        assert_eq!(relays[0].address, "203.0.113.10:7420");
+        assert_eq!(relays[1].address, "studio.example.net:7420");
+
+        // A computer that only relays does not register anywhere, and says so.
+        ctx.reach.update(|state| state.relay_only = true);
+        assert_eq!(reason_of("Studio"), (false, Some("this computer only relays".to_string())));
+    }
+
+    #[tokio::test]
+    async fn a_relay_added_while_the_task_runs_is_registered_at_once_and_dropped_when_removed() {
+        let (ctx, _scratch) = testing::context("relay-live");
+        let relay = prepare("live-relay");
+        let [relay_addr] = free_addrs();
+        relay.trust(ctx.fingerprint, ctx.socket.local_addr());
+        let relay = relay.start(relay_addr, true).await;
+
+        // The task has read an empty list and sleeps for half a minute. What an earlier run said
+        // about a relay is gone by then.
+        lock(&ctx.ext::<RelayState>().reasons).insert(Fingerprint([21; 32]), "it was away".to_string());
+        let registering = AbortOnDrop(tokio::spawn({
+            let ctx = ctx.clone();
+            async move {
+                let _ = run_registration(ctx, Instant::now()).await;
+            }
+        }));
+        sleep(Duration::from_millis(500)).await;
+        assert!(ctx.reach.read().relays.is_empty());
+        assert!(lock(&ctx.ext::<RelayState>().reasons).is_empty());
+
+        // Asked from the launcher, it does not wait for the half minute (`until` gives up in 20 s).
+        add_relay(&ctx, "Office PC", &relay_addr.to_string(), &[], &relay.fingerprint.to_base64()).unwrap();
+        until("the registration", || !ctx.reach.read().relays.is_empty()).await;
+        assert!(configured(&ctx)[0].registered);
+
+        // And asked to forget the relay, it lets go of it just as soon.
+        remove_relay(&ctx, &relay.fingerprint.to_base64()).unwrap();
+        until("the registration to end", || ctx.reach.read().relays.is_empty()).await;
+        drop(registering);
     }
 }
