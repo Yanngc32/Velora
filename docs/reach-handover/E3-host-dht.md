@@ -93,8 +93,9 @@ that another one makes redundant, a blob that comes out the same either way, a b
 5. **15 s between puts, 3 s of quiet, 30 s to 10 min of backoff**: the ticket's "never twice in one second" is a floor far below what a
    flapping relay link would cost (about 600 datagrams a put). All in `Timing`.
 6. **The test-util stanza.** `crates/host/Cargo.toml` is E1's frozen file; the ticket's "paused clock" needs `tokio` with `test-util` as a
-   dev-dependency (F1 has the same in client-core). One stanza, tests only, no `Cargo.lock` change; the coordinator was asked twice and has
-   not said no. Without it the 15 loop tests would need millisecond-scaled intervals on the real clock.
+   dev-dependency (F1 has the same in client-core). One line in a new `[dev-dependencies]` block at the end of the manifest's dependencies,
+   tests only, no `Cargo.lock` change, in a commit of its own (`3264806`); the coordinator approved it. Without it the 15 loop tests would
+   need millisecond-scaled intervals on the real clock.
 7. **A secret is told to a device only once it is saved,** so a host that restarts never has lost what a device holds. The price: while
    the state directory cannot be written no device is given a new secret (the ones that have one go on).
 8. **The write happens under the lock,** with its `fsync`, the first time a device is given a secret (`reach_message` is a sync hook called
