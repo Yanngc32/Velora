@@ -83,7 +83,36 @@ them in `known_hosts.json`. A files-only connection neither asks for this nor st
 reaches a device that cannot connect, so after you change a switch each device has to open a
 session once to hear about it.
 
-**Which way won** is shown in three places: **This PC** says *The last connection came in through*
+### Connection mode, reconnecting and moving to a better way
+
+Each paired computer has a **connection mode**, on its card in **Devices** (*Connection · …*) and,
+on Android, in the options a long press on it opens:
+
+| Mode | The race tries |
+|---|---|
+| **Automatic** (the default) | Everything above. |
+| **Local network** | Only the PC's LAN addresses. |
+| **Tailscale / VPN** | Only its VPN mesh addresses (Tailscale, Netbird). |
+| **Velora** | Only Velora's own ways from other networks: public address, IPv6, hole punch, relays. |
+
+A mode none of the stored addresses fits fails at once and says so. It is kept in
+`known_hosts.json` (`"mode"`, absent for Automatic) and applies from the next connection.
+
+A session keeps its connection up by itself:
+
+- **Lost connection** (Wi-Fi to 4G, a router restart, a timeout): it connects again, by the same
+  race, for up to 90 s, backing off from 0.5 to 8 s between attempts. The session window's title
+  and the Android app say *reconnecting…* meanwhile. A session the PC ends (another device took
+  over, the host stopped) or that you close is not connected again.
+- **A better way appears** (you came home, or a direct way opened while a relay carried the
+  session): in Automatic mode a session that is not on the LAN looks every 30 s (first after 10 s)
+  for a way of a better rank (LAN, then anything direct, then a relay) and moves to it. The PC
+  gives the screen to the newest connection of a device, so the move costs a keyframe, not the
+  session. In Velora mode a relay can give way to a direct way the same way; the LAN and VPN modes
+  never move.
+
+**Which way won** is shown in four places: the session window's title (the way, or *reconnecting…*);
+**This PC** says *The last connection came in through*
 and the kind and address; `velora connect` prints *Connected to 'X' through: Public address · …*;
 the host's log has *'Phone' reached this computer at its public address (…)*.
 
@@ -702,6 +731,11 @@ Missing, as opposed to limits of the approach:
 - **A NAT that could not be classified** (too few DHT nodes told the host where it is: *unknown
   NAT*) is not offered for a punch until the next measurement, up to 10 minutes later.
 - **The DHT and the punch are IPv4 only.**
+- **The relay lock of the desktop window follows the first way in only**: a window that moved away
+  from a relay keeps the lock until it closes, and one that reconnected through a relay does not
+  take it, so the Files page may not wait for it.
+- **Moving to a better way reuses what was stored when the session began**: addresses the PC
+  announces during the session are used from the next session on.
 
 ## Status
 

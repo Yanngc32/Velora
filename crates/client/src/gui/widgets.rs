@@ -47,6 +47,33 @@ pub fn card<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> egui::InnerRespon
         })
 }
 
+/// A card that is one setting: its title and note on the left, wrapping before the switch on the right. Whether the
+/// switch changed.
+pub fn switch_setting(ui: &mut Ui, title: &str, note: &str, on: &mut bool, enabled: bool) -> bool {
+    switch_row(ui, RichText::new(title).font(font(15.0, semibold())), note, 4.0, on, enabled)
+}
+
+/// A title and a note with a switch at their right, centered on them. The note wraps before the switch, so the row keeps
+/// the width it is given. Whether the switch changed.
+pub fn switch_row(ui: &mut Ui, title: RichText, note: &str, gap: f32, on: &mut bool, enabled: bool) -> bool {
+    let width = ui.available_width();
+    let text = ui
+        .allocate_ui_with_layout(vec2(width - 64.0, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+            ui.spacing_mut().item_spacing.y = gap;
+            ui.label(title);
+            ui.add(egui::Label::new(RichText::new(note).color(WEAK)).wrap());
+        })
+        .response
+        .rect;
+    let area = Rect::from_min_max(
+        egui::pos2(text.left() + width - 64.0, text.top()),
+        egui::pos2(text.left() + width, text.bottom()),
+    );
+    let mut switch =
+        ui.new_child(egui::UiBuilder::new().max_rect(area).layout(egui::Layout::right_to_left(egui::Align::Center)));
+    toggle(&mut switch, on, enabled).changed()
+}
+
 pub fn card_title(ui: &mut Ui, text: &str) {
     ui.label(RichText::new(text).font(font(15.0, semibold())));
 }

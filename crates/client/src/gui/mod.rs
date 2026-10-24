@@ -805,40 +805,22 @@ impl Launcher {
         ui.add_space(16.0);
         card(ui, |ui| {
             let release = velora_update::is_release_build();
-            ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing.y = 4.0;
-                    card_title(ui, s.auto_update);
-                    let note = if release { s.auto_update_text } else { s.auto_update_source_build };
-                    ui.label(RichText::new(note).color(WEAK));
-                });
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let mut on = self.settings.auto_update && release;
-                    if toggle(ui, &mut on, release).changed() {
-                        let mut next = self.settings.clone();
-                        next.auto_update = on;
-                        self.store(next);
-                    }
-                });
-            });
+            let note = if release { s.auto_update_text } else { s.auto_update_source_build };
+            let mut on = self.settings.auto_update && release;
+            if switch_setting(ui, s.auto_update, note, &mut on, release) {
+                let mut next = self.settings.clone();
+                next.auto_update = on;
+                self.store(next);
+            }
         });
         ui.add_space(16.0);
         card(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing.y = 4.0;
-                    card_title(ui, s.clipboard_title);
-                    ui.add(egui::Label::new(RichText::new(s.clipboard_text).color(WEAK)).wrap());
-                });
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let mut on = self.settings.share_clipboard;
-                    if toggle(ui, &mut on, true).changed() {
-                        let mut next = self.settings.clone();
-                        next.share_clipboard = on;
-                        self.store(next);
-                    }
-                });
-            });
+            let mut on = self.settings.share_clipboard;
+            if switch_setting(ui, s.clipboard_title, s.clipboard_text, &mut on, true) {
+                let mut next = self.settings.clone();
+                next.share_clipboard = on;
+                self.store(next);
+            }
         });
         ui.add_space(16.0);
         self.startup_card(ui);
@@ -863,17 +845,7 @@ impl Launcher {
             card_title(ui, s.startup_title);
             ui.add_space(6.0);
             let row = |ui: &mut egui::Ui, title: &str, note: &str, on: &mut bool, enabled: bool| {
-                ui.horizontal(|ui| {
-                    // Leave room for the switch so a long note wraps before it.
-                    let text_width = ui.available_width() - 64.0;
-                    ui.allocate_ui_with_layout(egui::vec2(text_width, 0.0), Layout::top_down(Align::Min), |ui| {
-                        ui.spacing_mut().item_spacing.y = 2.0;
-                        ui.label(RichText::new(title).font(font(14.0, medium())));
-                        ui.add(egui::Label::new(RichText::new(note).color(WEAK)).wrap());
-                    });
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| toggle(ui, on, enabled).changed()).inner
-                })
-                .inner
+                switch_row(ui, RichText::new(title).font(font(14.0, medium())), note, 2.0, on, enabled)
             };
             let tray = self.has_tray();
             let open_note = if tray { s.open_at_login_tray_text } else { s.open_at_login_text };
@@ -1308,7 +1280,9 @@ fn hold_to_forget(ui: &mut egui::Ui, s: &Strings) -> bool {
     }
     let galley = if hover > 0.5 { hint } else { rest };
     let color = FAINT.lerp_to_gamma(ERROR, hover).lerp_to_gamma(TEXT, progress);
-    painter.galley(rect.center() - galley.size() / 2.0, galley, color);
+    // At rest the word lines up with the card's edge; held, the hint fills the button.
+    let at = egui::pos2(rect.left() + 12.0 * hover, rect.center().y - galley.size().y / 2.0);
+    painter.galley(at, galley, color);
     response.on_hover_cursor(egui::CursorIcon::PointingHand);
 
     if held {
