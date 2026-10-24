@@ -16,6 +16,12 @@
 //!    the client's endpoint from the listening port, which makes its NAT expect the client's
 //!    packets, and the client's own Initial, which it keeps retransmitting, gets through.
 //!
+//! The endpoint [`run`] measures is only good while the NAT keeps the mapping it describes. A NAT forgets a mapping that has
+//! seen no packet leave for anything from 30 seconds to a few minutes, and makes the next one with the port it likes, which
+//! may be another. Nothing else sends from the listening port while no client is connected, so [`run`] does, while the
+//! endpoint is advertised: one DHT ping to one node every [`KEEPALIVE`] (a registered relay needs none: its connection
+//! leaves from the same socket and keeps the mapping by itself).
+//!
 //! A request is untrusted: whoever holds a paired device's secret (or a relay) can make one for any
 //! endpoint, and the host would send a 1200-byte packet there, once per attempt. So [`respond`]
 //! serves only paired devices, only toward unicast internet addresses, each nonce once, within a
@@ -55,6 +61,17 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// Answers after which waiting longer tells nothing new (as in `velora_nat::observe`).
 const ENOUGH_ANSWERS: usize = 3;
 
+/// How often a datagram goes from the QUIC socket to a DHT node while the endpoint is advertised, so that the NAT's mapping of
+/// the socket does not expire between measurements. A UDP mapping lasts from 30 seconds (Linux's default for a flow nobody has
+/// answered, and many routers) to a few minutes, and a packet that leaves renews it (some NATs count the ones that arrive too,
+/// which only helps): 20 seconds is inside the shortest. Three packets a minute, each a DHT ping of 65 bytes that the node
+/// answers with a pong.
+const KEEPALIVE: Duration = Duration::from_secs(20);
+
+/// How long a keepalive keeps its probe on the socket for the node's answer, so that the answer never reaches quinn. One that
+/// comes later reaches quinn, which drops it.
+const KEEPALIVE_REPLY: Duration = Duration::from_secs(2);
+
 /// How the observation is paced. The defaults are the product's; tests shorten them through
 /// [`Observing`].
 #[derive(Debug, Clone)]
@@ -75,6 +92,10 @@ struct Timing {
     debounce: Duration,
     /// How long the resolved DHT node addresses are kept.
     renew_nodes: Duration,
+    /// How often a datagram keeps the NAT's mapping of the QUIC socket alive between two measurements.
+    keepalive: Duration,
+    /// How long a keepalive waits for the node's answer, which the probe keeps away from quinn.
+    keepalive_reply: Duration,
 }
 
 impl Default for Timing {
@@ -88,6 +109,8 @@ impl Default for Timing {
             retry_max: Duration::from_secs(5 * 60),
             debounce: Duration::from_secs(2),
             renew_nodes: Duration::from_secs(30 * 60),
+            keepalive: KEEPALIVE,
+            keepalive_reply: KEEPALIVE_REPLY,
         }
     }
 }
@@ -98,6 +121,8 @@ pub struct Observing {
     timing: Mutex<Timing>,
     /// The DHT nodes to ask; the public bootstrap names when unset.
     nodes: Mutex<Option<Vec<SocketAddr>>>,
+    /// Keepalive datagrams sent so far (the tests count them).
+    keepalives: AtomicU64,
 }
 
 impl Observing {
@@ -107,6 +132,11 @@ impl Observing {
 
     fn nodes(&self) -> Option<Vec<SocketAddr>> {
         lock(&self.nodes).clone()
+    }
+
+    /// How many keepalive datagrams the host has sent from its QUIC socket.
+    pub fn keepalives(&self) -> u64 {
+        self.keepalives.load(Ordering::Relaxed)
     }
 }
 
@@ -144,6 +174,15 @@ fn network_signature(state: &ReachState) -> Signature {
 /// published again for it), and is dropped if the new network teaches nothing, since it describes
 /// a network the host has left. Only an endpoint on the internet is published as `observed`: a
 /// private one is the inner side of a second NAT. When the task ends both fields are cleared.
+///
+/// A node inside a provider's network says a private address (S0 saw two in 136 replies), and one such vote would make a
+/// cone NAT look symmetric: while any vote names an address on the internet, only those count, for what is classified and for
+/// when the round is done. With none public they all count (a host behind two NATs still gets its NAT classified).
+///
+/// Between two measurements it keeps the mapping alive (see the module docs and [`keepalive_wanted`]): one DHT ping to one
+/// node every [`KEEPALIVE`] while the record sends clients to punch toward the endpoint, the DHT switch is on and no relay is
+/// registered. When that begins after a pause the host measures at once instead, since what the mapping did meanwhile is not
+/// known.
 pub async fn run(ctx: ReachContext) -> Result<()> {
     let observing = ctx.ext::<Observing>();
     let timing = observing.timing();
@@ -155,6 +194,7 @@ pub async fn run(ctx: ReachContext) -> Result<()> {
     let mut shown: (Option<SocketAddr>, Option<NatType>) = (None, None);
     // The addresses changed since the last result was taken.
     let mut moved = false;
+    let mut keeper = Keeper::new();
 
     while !ctx.stop.is_stopped() {
         if nodes.is_empty() || nodes_from.elapsed() >= timing.renew_nodes {
@@ -202,13 +242,17 @@ pub async fn run(ctx: ReachContext) -> Result<()> {
                 wait
             }
         };
+        // The pings of the round left from the socket and renewed the mapping, whatever came of them (a round that could send
+        // none means no network, and a keepalive could send none either).
+        keeper.measured(&ctx, &timing);
         moved = false;
-        match pause(&ctx, &mut changes, &mut signature, wait, timing.debounce).await {
+        match pause(&ctx, &mut changes, &mut signature, wait, &timing, &mut keeper, &nodes).await {
             Pause::Elapsed => {}
             Pause::Moved => {
                 moved = true;
                 retry = timing.retry_min;
             }
+            Pause::Resumed => retry = timing.retry_min,
             Pause::Stopped => break,
         }
     }
@@ -226,22 +270,38 @@ enum Pause {
     Elapsed,
     /// The network addresses changed (and the debounce passed).
     Moved,
+    /// The keepalive became wanted after a time when it was not: measure again.
+    Resumed,
     Stopped,
 }
 
-/// Waits `wait`, or until the network addresses change, or the task is told to stop.
+/// Waits `wait`, or until the network addresses change, or the keepalive becomes wanted again, or the task is told to stop;
+/// and sends the keepalive datagrams that fall due meanwhile.
 async fn pause(
     ctx: &ReachContext,
     changes: &mut tokio::sync::watch::Receiver<u64>,
     signature: &mut Signature,
     wait: Duration,
-    debounce: Duration,
+    timing: &Timing,
+    keeper: &mut Keeper,
+    nodes: &[SocketAddr],
 ) -> Pause {
+    let observing = ctx.ext::<Observing>();
     let deadline = tokio::time::Instant::now() + wait;
     loop {
+        let wanted = keepalive_wanted(&ctx.reach.read());
+        if wanted && !keeper.was_wanted {
+            // It was off while the host went on (the DHT switch, a relay), so nobody knows what the mapping did meanwhile:
+            // a measurement says, and renews it.
+            return Pause::Resumed;
+        }
+        keeper.was_wanted = wanted;
         tokio::select! {
             () = ctx.stop.stopped() => return Pause::Stopped,
             () = tokio::time::sleep_until(deadline) => return Pause::Elapsed,
+            () = tokio::time::sleep_until(keeper.next), if wanted => {
+                keeper.keep(ctx, nodes, timing, &observing.keepalives).await;
+            }
             changed = changes.changed() => {
                 if changed.is_err() {
                     return Pause::Stopped;
@@ -249,10 +309,100 @@ async fn pause(
                 let now = network_signature(&ctx.reach.read());
                 if now != *signature {
                     *signature = now;
-                    return if ctx.stop.sleep(debounce).await { Pause::Stopped } else { Pause::Moved };
+                    return if ctx.stop.sleep(timing.debounce).await { Pause::Stopped } else { Pause::Moved };
                 }
             }
         }
+    }
+}
+
+/// Whether the mapping of the QUIC socket should be kept alive: standalone reach is on, the DHT switch is on (it is what puts
+/// the record in the DHT for clients to read), the record sends clients to punch toward `observed`, and no relay is
+/// registered. A registered relay is a QUIC connection from this very socket, with keepalives of its own every 2 s, which hold
+/// the mapping as well as any datagram of ours when the connection crosses the NAT (the host dials a relay at the first
+/// address that answers, so one on the same LAN or over IPv6 may be the one that wins, and holds nothing; the ticket's rule
+/// is kept all the same).
+fn keepalive_wanted(state: &ReachState) -> bool {
+    state.switches.standalone && state.switches.dht && state.relays.is_empty() && advertises_punch_endpoint(state)
+}
+
+/// Whether the host's record makes clients punch toward `observed` (the case `ReachState::record_addresses` adds a `Public`
+/// entry for): the NAT keeps one endpoint per socket (an `Open` host has no mapping to keep, and nobody punches through a
+/// symmetric one) and no `Public` address is advertised that clients would dial instead (a router's mapping).
+fn advertises_punch_endpoint(state: &ReachState) -> bool {
+    use velora_protocol::wire::AddressKind::Public;
+    state.observed.is_some()
+        && state.nat == Some(NatType::EndpointIndependent)
+        && state.addresses_of(&Public).is_empty()
+}
+
+/// What keeps the NAT's mapping of the QUIC socket alive between two measurements.
+struct Keeper {
+    /// When the next datagram is due.
+    next: tokio::time::Instant,
+    /// Whether the keepalive was wanted the last time the state was looked at.
+    was_wanted: bool,
+    /// Which of the nodes the next datagram goes to: they take turns.
+    turn: usize,
+}
+
+impl Keeper {
+    fn new() -> Keeper {
+        Keeper { next: tokio::time::Instant::now(), was_wanted: false, turn: 0 }
+    }
+
+    /// A measurement was made: its pings left from the socket and renewed the mapping, so the next datagram is due a full
+    /// interval from now, and `wanted` is what the state says now.
+    fn measured(&mut self, ctx: &ReachContext, timing: &Timing) {
+        self.next = tokio::time::Instant::now() + timing.keepalive;
+        self.was_wanted = keepalive_wanted(&ctx.reach.read());
+    }
+
+    /// Sends one DHT ping to one node from the QUIC socket, and keeps the probe on the socket for the answer so that quinn
+    /// never sees it. Whatever happens the next one is due a full interval from now.
+    async fn keep(&mut self, ctx: &ReachContext, nodes: &[SocketAddr], timing: &Timing, sent: &AtomicU64) {
+        self.next = tokio::time::Instant::now() + timing.keepalive;
+        let Some(node) = nodes.get(self.turn % nodes.len().max(1)).copied() else { return };
+        self.turn = self.turn.wrapping_add(1);
+
+        let asked = Arc::new(Mutex::new(DhtProbe::new(&[node])));
+        let answered = Arc::new(tokio::sync::Notify::new());
+        // The handler runs on quinn's receive path: it only looks at the datagram.
+        let probe = ctx.socket.probe({
+            let (asked, answered) = (asked.clone(), answered.clone());
+            move |from, datagram| {
+                let taken = lock(&asked).handle(from, datagram);
+                if taken {
+                    answered.notify_one();
+                }
+                taken
+            }
+        });
+        let ping = lock(&asked).pending().next().map(|(_, ping)| ping.to_vec());
+        let Some(ping) = ping else { return };
+        if let Err(e) = probe.send_to(node, &ping).await {
+            tracing::debug!("the keepalive toward {node} could not be sent: {e}");
+            return;
+        }
+        sent.fetch_add(1, Ordering::Relaxed);
+        tokio::select! {
+            () = answered.notified() => {}
+            () = tokio::time::sleep(timing.keepalive_reply) => {}
+            () = ctx.stop.stopped() => {}
+        }
+    }
+}
+
+/// The votes that count: those that name an address on the internet, while there are any. A node inside a provider's network
+/// says a private address (S0 saw two in 136 replies), and one such vote would make a cone NAT look symmetric and end a round
+/// too soon. With no public vote they all count, so a host behind two NATs still has its NAT classified (and `observed` stays
+/// unset, as [`usable`] says).
+fn counted(votes: &[Observation]) -> Vec<Observation> {
+    let public: Vec<Observation> = votes.iter().copied().filter(|vote| usable(vote.endpoint)).collect();
+    if public.is_empty() {
+        votes.to_vec()
+    } else {
+        public
     }
 }
 
@@ -300,11 +450,15 @@ async fn observe(ctx: &ReachContext, nodes: &[SocketAddr], timing: &Timing) -> i
         let (all_answered, seen) = {
             let asked = lock(&asked);
             let all_answered = asked.pending().next().is_none();
-            (all_answered, asked.observations().to_vec())
+            (all_answered, counted(asked.observations()))
         };
         let now = Instant::now();
-        if second_server.is_none() && distinct_servers(&seen) >= 2 {
-            second_server = Some(now);
+        // Two different servers among the votes that count. A first public vote can displace private ones, and then there is
+        // one again.
+        if distinct_servers(&seen) >= 2 {
+            second_server.get_or_insert(now);
+        } else {
+            second_server = None;
         }
         let settled = second_server.is_some_and(|at| now >= at + timing.settle);
         if all_answered || seen.len() >= ENOUGH_ANSWERS || settled || now >= started + timing.wait {
@@ -721,7 +875,8 @@ async fn attempt(
 /// gets from the NAT's public socket to the peer, as a real NAT rewrites the source address, and
 /// remembers the peer so that its answers are let in. What arrives on the public socket is let in
 /// or dropped by the NAT's filtering, and delivered to the device from the gateway port of its
-/// sender, so the device sees every peer at the address it sends to. The device never learns the
+/// sender, so the device sees every peer at the address it sends to (with the peer's own IP when that is a loopback alias such as
+/// 127.0.0.2, so that peers on different IPs count as different servers). The device never learns the
 /// peer's real address, and everything it does with the gateway address (dial it, tell it to another
 /// host as "the client's endpoint") works as it would with a public one.
 ///
@@ -734,6 +889,9 @@ async fn attempt(
 /// let client_dials = client_nat.gateway_to(host_public)?;
 /// let host_punches = host_nat.gateway_to(client_public)?;
 /// ```
+///
+/// [`SimNat::expiring`] makes an endpoint-independent NAT that forgets its mapping when the device has sent nothing for a
+/// while, and makes another, on another port, with the next packet.
 #[cfg(test)]
 pub(crate) mod nat_sim {
     use std::{
@@ -744,6 +902,7 @@ pub(crate) mod nat_sim {
             atomic::{AtomicU64, Ordering},
             Arc, Mutex, MutexGuard, PoisonError,
         },
+        time::{Duration, Instant},
     };
 
     use tokio::{net::UdpSocket, task::JoinHandle};
@@ -787,28 +946,34 @@ pub(crate) mod nat_sim {
         device: SocketAddr,
         mapping: Mapping,
         filtering: Filtering,
-        /// The public socket of an endpoint-independent NAT, shared by every flow. With dependent
-        /// mapping nothing leaves from it and nothing arriving at it is let in.
-        public: Arc<UdpSocket>,
+        /// How long a mapping lives without a packet from the device (RFC 4787, section 4.3), or `None` for one that never
+        /// ends. Only an endpoint-independent NAT has one mapping to end.
+        lifetime: Option<Duration>,
         state: Mutex<State>,
         sent: AtomicU64,
         delivered: AtomicU64,
         filtered: AtomicU64,
     }
 
-    #[derive(Default)]
     struct State {
         gateways: HashMap<SocketAddr, Arc<Gateway>>,
-        /// Peers the device has sent to.
+        /// Peers the device has sent to since the mapping was made.
         sent_to: HashSet<SocketAddr>,
+        /// The public socket of an endpoint-independent NAT, shared by every flow. With dependent mapping nothing leaves from
+        /// it and nothing arriving at it is let in.
+        public: Arc<UdpSocket>,
+        /// Which mapping `public` is: it goes up when an expired mapping is made again, on another socket and so another port.
+        generation: u64,
+        /// When the device last sent anything out.
+        refreshed: Instant,
         tasks: Vec<JoinHandle<()>>,
     }
 
     struct Gateway {
         /// The private side: the device sends here and is sent from here.
         private: Arc<UdpSocket>,
-        /// The public socket this flow leaves from.
-        public: Arc<UdpSocket>,
+        /// The public socket of this flow alone (dependent mapping); `None` when the mapping's own public socket carries it.
+        own: Option<Arc<UdpSocket>>,
     }
 
     fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -816,7 +981,13 @@ pub(crate) mod nat_sim {
     }
 
     fn bind() -> io::Result<Arc<UdpSocket>> {
-        let socket = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))?;
+        bind_on(Ipv4Addr::LOCALHOST)
+    }
+
+    /// A socket on `ip`, or on the plain loopback address where this machine has no such address (a macOS has only 127.0.0.1).
+    fn bind_on(ip: Ipv4Addr) -> io::Result<Arc<UdpSocket>> {
+        let socket =
+            std::net::UdpSocket::bind((ip, 0)).or_else(|_| std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)))?;
         socket.set_nonblocking(true)?;
         Ok(Arc::new(UdpSocket::from_std(socket)?))
     }
@@ -833,33 +1004,62 @@ pub(crate) mod nat_sim {
     impl SimNat {
         /// A NAT in front of the UDP socket at `device`. Needs a Tokio runtime.
         pub fn new(device: SocketAddr, mapping: Mapping, filtering: Filtering) -> io::Result<SimNat> {
+            SimNat::build(device, mapping, filtering, None)
+        }
+
+        /// An endpoint-independent NAT whose mapping ends when the device sends nothing for `lifetime`. The next packet then
+        /// makes a mapping again on another port (as a NAT that picks its ports at random does) with an empty filter, and
+        /// what arrives meanwhile for the old port is dropped. Only packets that leave renew a mapping. Time is the real
+        /// clock: tests make `lifetime` short instead (a paused Tokio clock jumps while real sockets wait, so it cannot be used).
+        pub fn expiring(device: SocketAddr, filtering: Filtering, lifetime: Duration) -> io::Result<SimNat> {
+            SimNat::build(device, Mapping::EndpointIndependent, filtering, Some(lifetime))
+        }
+
+        fn build(
+            device: SocketAddr,
+            mapping: Mapping,
+            filtering: Filtering,
+            lifetime: Option<Duration>,
+        ) -> io::Result<SimNat> {
             let public = bind()?;
             let shared = Arc::new(Shared {
                 device,
                 mapping,
                 filtering,
-                public: public.clone(),
-                state: Mutex::default(),
+                lifetime,
+                state: Mutex::new(State {
+                    gateways: HashMap::new(),
+                    sent_to: HashSet::new(),
+                    public: public.clone(),
+                    generation: 0,
+                    refreshed: Instant::now(),
+                    tasks: Vec::new(),
+                }),
                 sent: AtomicU64::new(0),
                 delivered: AtomicU64::new(0),
                 filtered: AtomicU64::new(0),
             });
-            let task = tokio::spawn(from_outside(shared.clone(), public, None));
+            let task = tokio::spawn(from_outside(shared.clone(), public, None, 0));
             lock(&shared.state).tasks.push(task);
             Ok(SimNat { shared })
         }
 
         /// The endpoint the NAT shows the world for the device: what a DHT node or a STUN server
         /// would report, and what a peer is told to dial. For dependent mapping it is the endpoint
-        /// of no flow in particular (use [`SimNat::public_endpoint_toward`]).
+        /// of no flow in particular (use [`SimNat::public_endpoint_toward`]). For an expiring NAT
+        /// it is the mapping of the moment: after it expires, the next packet from the device
+        /// makes another.
         pub fn public_endpoint(&self) -> SocketAddr {
-            self.shared.public.local_addr().unwrap_or(self.shared.device)
+            lock(&self.shared.state).public.local_addr().unwrap_or(self.shared.device)
         }
 
         /// The endpoint the NAT shows `peer` for the device: [`SimNat::public_endpoint`], or with
         /// dependent mapping the port of the flow toward `peer`.
         pub fn public_endpoint_toward(&self, peer: SocketAddr) -> io::Result<SocketAddr> {
-            gateway(&self.shared, peer)?.public.local_addr()
+            match &gateway(&self.shared, peer)?.own {
+                Some(own) => own.local_addr(),
+                None => Ok(self.public_endpoint()),
+            }
         }
 
         /// Where the device sends to reach `peer` (the peer's public endpoint) through the NAT.
@@ -890,19 +1090,49 @@ pub(crate) mod nat_sim {
         if let Some(gateway) = state.gateways.get(&peer) {
             return Ok(gateway.clone());
         }
-        let private = bind()?;
-        let public = match shared.mapping {
-            Mapping::EndpointIndependent => shared.public.clone(),
+        // A peer on a loopback alias (127.0.0.2, ...) is heard from its own IP, so that peers on different IPs look like
+        // different servers to the device, as they do on the internet.
+        let private = match peer {
+            SocketAddr::V4(v4) if v4.ip().is_loopback() => bind_on(*v4.ip())?,
+            _ => bind()?,
+        };
+        let own = match shared.mapping {
+            Mapping::EndpointIndependent => None,
             Mapping::Dependent => {
                 let own = bind()?;
-                state.tasks.push(tokio::spawn(from_outside(shared.clone(), own.clone(), Some(peer))));
-                own
+                state.tasks.push(tokio::spawn(from_outside(shared.clone(), own.clone(), Some(peer), 0)));
+                Some(own)
             }
         };
-        let gateway = Arc::new(Gateway { private, public });
+        let gateway = Arc::new(Gateway { private, own });
         state.tasks.push(tokio::spawn(from_device(shared.clone(), gateway.clone(), peer)));
         state.gateways.insert(peer, gateway.clone());
         Ok(gateway)
+    }
+
+    /// A packet leaves the device toward `peer`: the mapping and the filter exist before it goes, as in a real NAT, so an
+    /// answer that comes back at once is let in. Returns the socket it leaves from. A mapping that lived out its lifetime
+    /// without a packet is made again first, on another socket, with an empty filter.
+    fn outbound(shared: &Arc<Shared>, gateway: &Gateway, peer: SocketAddr) -> Arc<UdpSocket> {
+        let mut state = lock(&shared.state);
+        if let Some(own) = &gateway.own {
+            state.sent_to.insert(peer);
+            return own.clone();
+        }
+        if let Some(lifetime) = shared.lifetime {
+            if state.refreshed.elapsed() > lifetime {
+                if let Ok(public) = bind() {
+                    state.generation += 1;
+                    let task = tokio::spawn(from_outside(shared.clone(), public.clone(), None, state.generation));
+                    state.tasks.push(task);
+                    state.public = public;
+                    state.sent_to.clear();
+                }
+            }
+            state.refreshed = Instant::now();
+        }
+        state.sent_to.insert(peer);
+        state.public.clone()
     }
 
     /// What the device sends to a gateway goes out to the gateway's peer from the public socket.
@@ -918,10 +1148,8 @@ pub(crate) mod nat_sim {
             if from != shared.device {
                 continue;
             }
-            // The mapping and the filter exist before the packet leaves, as in a real NAT, so an
-            // answer that comes back at once is let in.
-            lock(&shared.state).sent_to.insert(peer);
-            if gateway.public.send_to(&buffer[..len], peer).await.is_ok() {
+            let public = outbound(&shared, &gateway, peer);
+            if public.send_to(&buffer[..len], peer).await.is_ok() {
                 shared.sent.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -929,8 +1157,9 @@ pub(crate) mod nat_sim {
 
     /// What arrives on a public socket is let in or dropped, and delivered to the device from the
     /// gateway of whoever sent it. `only` is the one peer a flow's own socket (dependent mapping)
-    /// takes packets from.
-    async fn from_outside(shared: Arc<Shared>, socket: Arc<UdpSocket>, only: Option<SocketAddr>) {
+    /// takes packets from; `generation` is the mapping the socket belongs to, which no longer
+    /// takes anything once the NAT has made another.
+    async fn from_outside(shared: Arc<Shared>, socket: Arc<UdpSocket>, only: Option<SocketAddr>, generation: u64) {
         let mut buffer = vec![0u8; 65_536];
         loop {
             let (len, from) = match socket.recv_from(&mut buffer).await {
@@ -942,7 +1171,10 @@ pub(crate) mod nat_sim {
                 (Mapping::Dependent, Some(peer)) => from == peer && lock(&shared.state).sent_to.contains(&from),
                 (Mapping::Dependent, None) => false,
                 (Mapping::EndpointIndependent, _) => {
-                    shared.filtering == Filtering::Open || lock(&shared.state).sent_to.contains(&from)
+                    let state = lock(&shared.state);
+                    let alive = generation == state.generation
+                        && shared.lifetime.is_none_or(|lifetime| state.refreshed.elapsed() <= lifetime);
+                    alive && (shared.filtering == Filtering::Open || state.sent_to.contains(&from))
                 }
             };
             if !allowed {
@@ -1048,7 +1280,7 @@ mod tests {
         test_support::{configure, dual_stack, eventually, host, nobody, pair, request},
         *,
     };
-    use crate::reach::{testing, Stop};
+    use crate::reach::{testing, RelayEntry, Stop};
 
     fn refusal(result: Result<()>) -> Refusal {
         result.expect_err("the request should have been refused").downcast::<Refusal>().expect("a Refusal")
@@ -1293,18 +1525,29 @@ mod tests {
         addr: SocketAddr,
         /// Where the pings it got came from.
         sources: Arc<Mutex<Vec<SocketAddr>>>,
+        /// How long each of them was.
+        sizes: Arc<Mutex<Vec<usize>>>,
         task: JoinHandle<()>,
     }
 
     impl FakeNode {
         fn spawn(ip: Ipv4Addr, claim: impl Fn(SocketAddr) -> Option<SocketAddr> + Send + 'static) -> FakeNode {
+            FakeNode::spawn_slow(ip, Duration::ZERO, claim)
+        }
+
+        /// One that waits `delay` before it answers a ping.
+        fn spawn_slow(
+            ip: Ipv4Addr,
+            delay: Duration,
+            claim: impl Fn(SocketAddr) -> Option<SocketAddr> + Send + 'static,
+        ) -> FakeNode {
             let socket = std::net::UdpSocket::bind((ip, 0)).unwrap();
             socket.set_nonblocking(true).unwrap();
             let socket = UdpSocket::from_std(socket).unwrap();
             let addr = socket.local_addr().unwrap();
-            let sources = Arc::new(Mutex::new(Vec::new()));
+            let (sources, sizes) = (Arc::new(Mutex::new(Vec::new())), Arc::new(Mutex::new(Vec::new())));
             let task = tokio::spawn({
-                let sources = sources.clone();
+                let (sources, sizes) = (sources.clone(), sizes.clone());
                 async move {
                     let mut buffer = vec![0u8; 2048];
                     loop {
@@ -1314,14 +1557,21 @@ mod tests {
                             Err(_) => return,
                         };
                         lock(&sources).push(from);
+                        lock(&sizes).push(len);
                         let reply = claim(from).and_then(|seen| reply_to_ping(&buffer[..len], seen));
                         if let Some(reply) = reply {
+                            tokio::time::sleep(delay).await;
                             let _ = socket.send_to(&reply, from).await;
                         }
                     }
                 }
             });
-            FakeNode { addr, sources, task }
+            FakeNode { addr, sources, sizes, task }
+        }
+
+        /// How many pings it has heard.
+        fn heard(&self) -> usize {
+            lock(&self.sources).len()
         }
     }
 
@@ -1346,13 +1596,25 @@ mod tests {
             retry_max: Duration::from_millis(400),
             debounce: Duration::from_millis(50),
             renew_nodes: Duration::from_secs(60),
+            // Out of the way of every test that is not about it.
+            keepalive: Duration::from_secs(3600),
+            keepalive_reply: Duration::from_millis(300),
         }
     }
 
     fn ask(ctx: &ReachContext, nodes: &[FakeNode]) {
+        ask_with(ctx, nodes, fast());
+    }
+
+    fn ask_with(ctx: &ReachContext, nodes: &[FakeNode], timing: Timing) {
         let observing = ctx.ext::<Observing>();
-        *lock(&observing.timing) = fast();
+        *lock(&observing.timing) = timing;
         *lock(&observing.nodes) = Some(nodes.iter().map(|node| node.addr).collect());
+    }
+
+    /// The pings all the nodes have heard.
+    fn heard(nodes: &[FakeNode]) -> usize {
+        nodes.iter().map(FakeNode::heard).sum()
     }
 
     #[tokio::test]
@@ -1415,6 +1677,112 @@ mod tests {
         task.abort();
     }
 
+    #[test]
+    fn the_votes_that_count_are_the_public_ones_while_there_are_any() {
+        let vote = |node: u8, shown: &str| Observation {
+            from: SocketAddr::from(([127, 0, 0, node], 6881)),
+            endpoint: shown.parse().unwrap(),
+        };
+        let (inside, a, b) = (vote(2, "10.1.2.3:4000"), vote(3, "8.8.8.8:40123"), vote(4, "8.8.8.8:40123"));
+        assert_eq!(counted(&[inside, a, b]), vec![a, b], "the private vote does not count");
+        assert_eq!(counted(&[a, inside]), vec![a]);
+        // Nothing public: the NAT is still classified from what there is.
+        assert_eq!(counted(&[inside]), vec![inside]);
+        let (other, third) = (vote(5, "10.9.9.9:1"), vote(6, "192.168.7.7:2"));
+        assert_eq!(counted(&[inside, other, third]), vec![inside, other, third]);
+        assert!(counted(&[]).is_empty());
+        // Loopback, shared (carrier) and the other kinds that are no address of the internet are private votes too.
+        let (loopback, shared) = (vote(7, "127.0.0.1:9"), vote(8, "100.64.1.2:9"));
+        assert_eq!(counted(&[loopback, shared, a]), vec![a]);
+    }
+
+    #[tokio::test]
+    async fn one_vote_from_inside_a_providers_network_does_not_make_a_cone_nat_look_symmetric() {
+        let (ctx, _scratch) = host("observe-inside");
+        let (public, private): (SocketAddr, SocketAddr) =
+            ("8.8.8.8:40123".parse().unwrap(), "10.1.2.3:4000".parse().unwrap());
+        let nodes = vec![
+            FakeNode::spawn(Ipv4Addr::new(127, 0, 0, 2), move |_| Some(private)),
+            FakeNode::spawn(Ipv4Addr::new(127, 0, 0, 3), move |_| Some(public)),
+            FakeNode::spawn(Ipv4Addr::new(127, 0, 0, 4), move |_| Some(public)),
+        ];
+        ask(&ctx, &nodes);
+        let task = tokio::spawn(run(ctx.clone()));
+
+        eventually("the NAT to be classified", || ctx.reach.read().nat.is_some()).await;
+        let state = ctx.reach.read().clone();
+        assert_eq!((state.observed, state.nat), (Some(public), Some(NatType::EndpointIndependent)));
+        assert!(
+            state.record_addresses().contains(&(AddressKind::Public, public.to_string())),
+            "and the record lists it"
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_round_does_not_end_on_a_private_vote_and_one_public_one() {
+        // The private and the first public answer come at once, the second public one a moment later, past the time two
+        // servers would have ended the round if the private vote counted as one of them.
+        let (ctx, _scratch) = host("observe-slow");
+        let (public, private): (SocketAddr, SocketAddr) =
+            ("8.8.8.8:40123".parse().unwrap(), "10.1.2.3:4000".parse().unwrap());
+        let nodes = vec![
+            FakeNode::spawn(Ipv4Addr::new(127, 0, 0, 2), move |_| Some(private)),
+            FakeNode::spawn(Ipv4Addr::new(127, 0, 0, 3), move |_| Some(public)),
+            FakeNode::spawn_slow(Ipv4Addr::new(127, 0, 0, 4), Duration::from_millis(350), move |_| Some(public)),
+        ];
+        ask(&ctx, &nodes);
+        let task = tokio::spawn(run(ctx.clone()));
+
+        eventually("the NAT to be classified", || ctx.reach.read().nat.is_some()).await;
+        let state = ctx.reach.read().clone();
+        assert_eq!((state.observed, state.nat), (Some(public), Some(NatType::EndpointIndependent)));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_public_vote_that_displaces_two_private_ones_does_not_leave_the_round_settled() {
+        // Two private votes (two servers: the round would end once the settle time has gone by), then a public one that
+        // displaces them (one server again), then a second public one long after the settle time would have gone by.
+        let (ctx, _scratch) = host("observe-displaced");
+        let (public, private): (SocketAddr, SocketAddr) =
+            ("8.8.8.8:40123".parse().unwrap(), "10.1.2.3:4000".parse().unwrap());
+        let nodes = vec![
+            FakeNode::spawn(Ipv4Addr::new(127, 0, 0, 2), move |_| Some(private)),
+            FakeNode::spawn(Ipv4Addr::new(127, 0, 0, 3), move |_| Some(private)),
+            FakeNode::spawn_slow(Ipv4Addr::new(127, 0, 0, 4), Duration::from_millis(150), move |_| Some(public)),
+            FakeNode::spawn_slow(Ipv4Addr::new(127, 0, 0, 5), Duration::from_millis(800), move |_| Some(public)),
+        ];
+        ask_with(&ctx, &nodes, Timing { settle: Duration::from_millis(400), wait: Duration::from_secs(2), ..fast() });
+        let task = tokio::spawn(run(ctx.clone()));
+
+        eventually("the NAT to be classified", || ctx.reach.read().nat.is_some()).await;
+        let state = ctx.reach.read().clone();
+        assert_eq!((state.observed, state.nat), (Some(public), Some(NatType::EndpointIndependent)));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn one_public_vote_is_an_endpoint_and_no_classification() {
+        let (ctx, _scratch) = host("observe-one");
+        let (public, private): (SocketAddr, SocketAddr) =
+            ("8.8.8.8:40123".parse().unwrap(), "10.1.2.3:4000".parse().unwrap());
+        let nodes = vec![
+            FakeNode::spawn(Ipv4Addr::new(127, 0, 0, 2), move |_| Some(private)),
+            FakeNode::spawn(Ipv4Addr::new(127, 0, 0, 3), move |_| Some(public)),
+            FakeNode::spawn(Ipv4Addr::new(127, 0, 0, 4), |_| None),
+        ];
+        ask(&ctx, &nodes);
+        let task = tokio::spawn(run(ctx.clone()));
+
+        eventually("the endpoint to be seen", || ctx.reach.read().observed.is_some()).await;
+        // One server on the internet cannot say whether the NAT maps ports by destination: the record does not list it.
+        let state = ctx.reach.read().clone();
+        assert_eq!((state.observed, state.nat), (Some(public), Some(NatType::Unknown)));
+        assert!(!state.record_addresses().iter().any(|(kind, _)| *kind == AddressKind::Public));
+        task.abort();
+    }
+
     #[tokio::test]
     async fn a_host_that_nothing_translates_is_open() {
         // Nodes that report the address they really saw: there is no NAT.
@@ -1427,6 +1795,274 @@ mod tests {
         // The loopback is not an internet address, so there is no endpoint to publish.
         assert_eq!((ctx.reach.read().nat, ctx.reach.read().observed), (Some(NatType::Open), None));
         task.abort();
+    }
+
+    // ---- keeping the mapping alive -----------------------------------------------------------
+
+    fn relay_entry() -> RelayEntry {
+        RelayEntry {
+            fingerprint: Fingerprint([7; 32]),
+            name: "relay".into(),
+            addresses: vec!["198.51.100.9:7420".into()],
+        }
+    }
+
+    /// A host whose mapping should be kept: everything on, a cone NAT showing `8.8.8.8:40123`, no relay, no mapped address.
+    fn keeping() -> ReachState {
+        let mut state = ReachState::default();
+        state.switches.standalone = true;
+        state.switches.dht = true;
+        state.observed = Some("8.8.8.8:40123".parse().unwrap());
+        state.nat = Some(NatType::EndpointIndependent);
+        state
+    }
+
+    /// What `keepalive_wanted` says once `change` has been made to the state of [`keeping`].
+    fn wanted_after(change: impl FnOnce(&mut ReachState)) -> bool {
+        let mut state = keeping();
+        change(&mut state);
+        keepalive_wanted(&state)
+    }
+
+    #[test]
+    fn the_mapping_is_kept_while_the_record_sends_clients_to_punch_and_no_relay_holds_the_socket() {
+        assert!(keepalive_wanted(&keeping()));
+        assert!(!wanted_after(|state| state.switches.standalone = false), "standalone reach is off");
+        assert!(!wanted_after(|state| state.switches.dht = false), "the DHT switch is off: nobody reads the record");
+        assert!(!wanted_after(|state| state.set_relays(vec![relay_entry()])), "a registered relay holds the mapping");
+        assert!(!wanted_after(|state| state.observed = None), "there is no endpoint to keep");
+        // The record sends no one to punch toward it: no cone NAT to keep a mapping of...
+        for nat in [None, Some(NatType::Unknown), Some(NatType::Dependent), Some(NatType::Open)] {
+            assert!(!wanted_after(|state| state.nat = nat), "{nat:?}");
+        }
+        // ...or an address that is dialled instead (a router's mapping).
+        let mapped = vec!["203.0.113.5:7420".to_string()];
+        assert!(!wanted_after(|state| state.set_addresses(AddressKind::Public, mapped)), "a mapped address is dialled");
+        // An address of another kind changes nothing.
+        assert!(wanted_after(|state| state.set_addresses(AddressKind::Lan, vec!["192.168.1.5:7420".into()])));
+    }
+
+    #[test]
+    fn the_keepalive_follows_what_the_record_says_about_the_endpoint() {
+        // `advertises_punch_endpoint` and `record_addresses` must not drift apart: the record lists `observed` as a `Public`
+        // address exactly when there is a mapping to keep (an `Open` host is listed too, and has none).
+        let listed = (AddressKind::Public, "8.8.8.8:40123".to_string());
+        for nat in [None, Some(NatType::EndpointIndependent), Some(NatType::Dependent), Some(NatType::Unknown)] {
+            for mapped in [false, true] {
+                let mut state = keeping();
+                state.nat = nat;
+                if mapped {
+                    state.set_addresses(AddressKind::Public, vec!["203.0.113.5:7420".into()]);
+                }
+                let (kept, said) = (advertises_punch_endpoint(&state), state.record_addresses().contains(&listed));
+                assert_eq!(kept, said, "{nat:?}, mapped: {mapped}");
+            }
+        }
+    }
+
+    /// A host with the DHT switch on and nodes that answer, measured once; the keepalive is `every`.
+    async fn kept(
+        tag: &str,
+        every: Duration,
+    ) -> (ReachContext, testing::Scratch, Vec<FakeNode>, JoinHandle<Result<()>>) {
+        let (ctx, scratch) = host(tag);
+        ctx.reach.update(|state| state.switches.dht = true);
+        let nodes = agreeing("8.8.8.8:40123".parse().unwrap());
+        ask_with(&ctx, &nodes, Timing { keepalive: every, ..fast() });
+        let task = tokio::spawn(run(ctx.clone()));
+        eventually("the endpoint to be seen", || ctx.reach.read().observed.is_some()).await;
+        (ctx, scratch, nodes, task)
+    }
+
+    #[tokio::test]
+    async fn the_keepalive_is_one_small_datagram_to_one_node_an_interval_and_quinn_never_sees_the_answers() {
+        let (ctx, _scratch, nodes, task) = kept("keepalive-count", Duration::from_millis(100)).await;
+        let (pings, sent, taken) =
+            (heard(&nodes), ctx.ext::<Observing>().keepalives(), ctx.socket.stats().probe_replies);
+
+        tokio::time::sleep(Duration::from_millis(1050)).await;
+        let kept = ctx.ext::<Observing>().keepalives() - sent;
+        assert!((6..=12).contains(&kept), "{kept} datagrams in 1.05 s at one every 100 ms");
+        // Each went to one node (not to all of them), and the nodes took turns.
+        let reached = (heard(&nodes) - pings) as u64;
+        assert!(reached.abs_diff(kept) <= 1, "{kept} sent, {reached} heard");
+        assert!(nodes.iter().all(|node| node.heard() > 1), "the same node every time");
+        // Small: a DHT ping.
+        assert!(nodes.iter().all(|node| lock(&node.sizes).iter().all(|len| *len <= 100)));
+        // The answers were taken by the probe, and quinn never heard of them.
+        let answered = ctx.socket.stats().probe_replies - taken;
+        assert!(answered.abs_diff(kept) <= 1, "{kept} sent, {answered} answers kept from quinn");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn the_keepalive_is_off_while_the_dht_switch_is_off_and_while_a_relay_is_registered() {
+        let (ctx, _scratch) = host("keepalive-switches");
+        let nodes = agreeing("8.8.8.8:40123".parse().unwrap());
+        // The interval is short and the measurement long past, so only the rules keep it quiet.
+        ask_with(&ctx, &nodes, Timing { keepalive: Duration::from_millis(80), ..fast() });
+        let task = tokio::spawn(run(ctx.clone()));
+        eventually("the endpoint to be seen", || ctx.reach.read().observed.is_some()).await;
+        let observing = ctx.ext::<Observing>();
+
+        // The DHT switch is off: nobody is told this endpoint, so nothing keeps it.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(observing.keepalives(), 0);
+
+        // On: the keepalive goes.
+        ctx.reach.update(|state| state.switches.dht = true);
+        eventually("the keepalive to go", || observing.keepalives() >= 3).await;
+
+        // A relay registers: its connection from the socket does the job.
+        ctx.reach.update(|state| state.set_relays(vec![relay_entry()]));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let sent = observing.keepalives();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(observing.keepalives(), sent, "it went on after a relay registered");
+
+        // The relay goes: the keepalive is back.
+        ctx.reach.update(|state| state.set_relays(Vec::new()));
+        eventually("the keepalive to come back", || observing.keepalives() >= sent + 3).await;
+
+        // The DHT switch goes off again.
+        ctx.reach.update(|state| state.switches.dht = false);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let sent = observing.keepalives();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(observing.keepalives(), sent, "it went on after the DHT switch went off");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn when_the_keepalive_begins_after_a_pause_the_host_measures_at_once() {
+        // The interval is longer than the test: a burst of pings can only be a measurement.
+        let (ctx, _scratch) = host("keepalive-resume");
+        let nodes = agreeing("8.8.8.8:40123".parse().unwrap());
+        ask_with(&ctx, &nodes, Timing { keepalive: Duration::from_secs(3600), ..fast() });
+        let task = tokio::spawn(run(ctx.clone()));
+        eventually("the endpoint to be seen", || ctx.reach.read().observed.is_some()).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let before: Vec<usize> = nodes.iter().map(FakeNode::heard).collect();
+
+        // What the mapping did while the keepalive was off is not known: the DHT switch comes on, and the host asks again.
+        ctx.reach.update(|state| state.switches.dht = true);
+        eventually("every node to be asked again", || {
+            nodes.iter().zip(&before).all(|(node, before)| node.heard() > *before)
+        })
+        .await;
+        assert_eq!(ctx.ext::<Observing>().keepalives(), 0, "that was a measurement, not a keepalive");
+        // A measurement that changes nothing leaves the state as it was.
+        assert_eq!(ctx.reach.read().observed, Some("8.8.8.8:40123".parse().unwrap()));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn when_the_last_relay_goes_the_host_measures_at_once() {
+        // The interval is longer than the test: a burst of pings can only be a measurement.
+        let (ctx, _scratch, nodes, task) = kept("keepalive-relay-gone", Duration::from_secs(3600)).await;
+        ctx.reach.update(|state| state.set_relays(vec![relay_entry()]));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let before: Vec<usize> = nodes.iter().map(FakeNode::heard).collect();
+
+        // What the mapping did while the relay was there is not known: the relay goes, and the host asks again.
+        ctx.reach.update(|state| state.set_relays(Vec::new()));
+        eventually("every node to be asked again", || {
+            nodes.iter().zip(&before).all(|(node, before)| node.heard() > *before)
+        })
+        .await;
+        assert_eq!(ctx.ext::<Observing>().keepalives(), 0, "that was a measurement, not a keepalive");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn the_keepalive_ends_with_the_task() {
+        let (ctx, _scratch) = host("keepalive-stop");
+        ctx.reach.update(|state| state.switches.dht = true);
+        let nodes = agreeing("8.8.8.8:40123".parse().unwrap());
+        ask_with(&ctx, &nodes, Timing { keepalive: Duration::from_millis(80), ..fast() });
+        let (stop, stopped) = watch::channel(false);
+        let task = tokio::spawn(run(ReachContext { stop: Stop::new(stopped), ..ctx.clone() }));
+        let observing = ctx.ext::<Observing>();
+        eventually("the keepalive to go", || observing.keepalives() >= 2).await;
+
+        stop.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), task).await.expect("the task did not end").unwrap().unwrap();
+        let sent = observing.keepalives();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(observing.keepalives(), sent);
+    }
+
+    #[tokio::test]
+    async fn a_keepalive_that_cannot_be_sent_is_no_error_and_the_next_one_is_a_full_interval_away() {
+        // An IPv6 node and an IPv4 socket: not one datagram can be sent.
+        let (ctx, _scratch) = host("keepalive-unreachable");
+        let mut keeper = Keeper::new();
+        let timing = Timing { keepalive: Duration::from_millis(200), ..fast() };
+        let sent = AtomicU64::new(0);
+        let started = tokio::time::Instant::now();
+        keeper.keep(&ctx, &["[2001:db8::1]:6881".parse().unwrap()], &timing, &sent).await;
+        assert_eq!(sent.load(Ordering::Relaxed), 0);
+        assert!(keeper.next >= started + timing.keepalive, "the next one must not be due at once");
+        // No nodes at all: nothing to send to, and the same pace.
+        let started = tokio::time::Instant::now();
+        keeper.keep(&ctx, &[], &timing, &sent).await;
+        assert_eq!(sent.load(Ordering::Relaxed), 0);
+        assert!(keeper.next >= started + timing.keepalive);
+    }
+
+    #[tokio::test]
+    async fn a_keepalive_waiting_for_a_node_that_stopped_answering_ends_with_the_task() {
+        // The answer is waited for much longer than the test lasts.
+        let (ctx, _scratch) = host("keepalive-silent-stop");
+        ctx.reach.update(|state| state.switches.dht = true);
+        let answering = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let nodes = changing(&Arc::new(Mutex::new("8.8.8.8:40123".parse().unwrap())), &answering);
+        let timing =
+            Timing { keepalive: Duration::from_millis(80), keepalive_reply: Duration::from_secs(30), ..fast() };
+        ask_with(&ctx, &nodes, timing);
+        let (stop, stopped) = watch::channel(false);
+        let task = tokio::spawn(run(ReachContext { stop: Stop::new(stopped), ..ctx.clone() }));
+        eventually("the endpoint to be seen", || ctx.reach.read().observed.is_some()).await;
+
+        // The nodes go quiet: the next keepalive goes out and waits.
+        answering.store(false, Ordering::Relaxed);
+        let observing = ctx.ext::<Observing>();
+        let sent = observing.keepalives();
+        eventually("a keepalive to wait for its answer", || observing.keepalives() > sent).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        stop.send(true).unwrap();
+        let ended = tokio::time::timeout(Duration::from_secs(2), task).await;
+        assert!(ended.expect("the task went on waiting for the answer").unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_measurement_puts_the_next_keepalive_a_full_interval_away_and_notes_whether_one_is_wanted() {
+        let (ctx, _scratch) = host("keepalive-measured");
+        let timing = Timing { keepalive: Duration::from_secs(20), ..fast() };
+        let mut keeper = Keeper::new();
+        let before = tokio::time::Instant::now();
+        keeper.measured(&ctx, &timing);
+        assert!(keeper.next >= before + timing.keepalive, "the pings of the round just renewed the mapping");
+        assert!(!keeper.was_wanted, "nothing is advertised yet");
+
+        ctx.reach.update(|state| *state = keeping());
+        keeper.measured(&ctx, &timing);
+        assert!(keeper.was_wanted);
+        ctx.reach.update(|state| state.switches.dht = false);
+        keeper.measured(&ctx, &timing);
+        assert!(!keeper.was_wanted);
+    }
+
+    #[test]
+    fn the_keepalive_the_product_uses_is_three_datagrams_a_minute_inside_the_shortest_mapping_lifetime() {
+        let product = Timing::default();
+        assert_eq!((product.keepalive, product.keepalive_reply), (KEEPALIVE, KEEPALIVE_REPLY));
+        assert_eq!(KEEPALIVE, Duration::from_secs(20));
+        assert_eq!(Duration::from_secs(60).as_secs() / KEEPALIVE.as_secs(), 3);
+        // A UDP mapping may end after 30 seconds without a packet that leaves.
+        assert!(KEEPALIVE < Duration::from_secs(30));
+        assert!(KEEPALIVE_REPLY < KEEPALIVE, "an answer is waited for less than the interval");
     }
 
     #[tokio::test]
@@ -1726,6 +2362,69 @@ mod tests {
         assert!(toward_one != symmetric.public_endpoint() && toward_two != symmetric.public_endpoint());
     }
 
+    /// Where a peer hears a device behind `nat` come from, when the device sends one datagram to `peer` through it.
+    async fn source_of_one_datagram(device: &UdpSocket, nat: &SimNat, peer: &UdpSocket) -> SocketAddr {
+        device.send_to(b"hello", nat.gateway_to(peer.local_addr().unwrap()).unwrap()).await.unwrap();
+        receive(peer).await.expect("the peer should hear the device").1
+    }
+
+    #[tokio::test]
+    async fn an_expiring_nat_forgets_a_mapping_that_saw_no_packet_leave_and_makes_another_on_another_port() {
+        let lifetime = Duration::from_millis(600);
+        let device = nobody().await;
+        let nat = SimNat::expiring(device.local_addr().unwrap(), Filtering::PortRestricted, lifetime).unwrap();
+        let peer = nobody().await;
+        let first = source_of_one_datagram(&device, &nat, &peer).await;
+        assert_eq!(first, nat.public_endpoint());
+
+        // The peer can answer while the mapping lives.
+        peer.send_to(b"back", first).await.unwrap();
+        assert_eq!(receive(&device).await.map(|(data, _)| data), Some(b"back".to_vec()));
+
+        // The device is quiet for longer than the mapping lives: what comes for it now is dropped...
+        tokio::time::sleep(lifetime * 2).await;
+        let filtered = nat.stats().filtered;
+        peer.send_to(b"too late", first).await.unwrap();
+        assert!(receive(&device).await.is_none(), "the old mapping let a packet in");
+        assert_eq!(nat.stats().filtered, filtered + 1);
+        // ...and the next packet that leaves gets a mapping again, on another port, and the old port stays dead.
+        let other = nobody().await;
+        let second = source_of_one_datagram(&device, &nat, &other).await;
+        assert_ne!(second.port(), first.port());
+        assert_eq!(second, nat.public_endpoint());
+        other.send_to(b"to the new one", second).await.unwrap();
+        assert_eq!(receive(&device).await.map(|(data, _)| data), Some(b"to the new one".to_vec()));
+        // The new mapping starts with an empty filter: the peer of the old one is a stranger to it.
+        peer.send_to(b"from the old peer", second).await.unwrap();
+        assert!(receive(&device).await.is_none(), "the new mapping remembered whom the old one let in");
+        // The old port stays dead even for a peer the new mapping lets in (the filter would not stop that one).
+        other.send_to(b"to the old port", first).await.unwrap();
+        assert!(receive(&device).await.is_none(), "the old port took a packet after the NAT made another mapping");
+    }
+
+    #[tokio::test]
+    async fn packets_that_leave_keep_the_mapping_of_an_expiring_nat() {
+        let lifetime = Duration::from_millis(1000);
+        let device = nobody().await;
+        let nat = SimNat::expiring(device.local_addr().unwrap(), Filtering::PortRestricted, lifetime).unwrap();
+        let peer = nobody().await;
+        let first = source_of_one_datagram(&device, &nat, &peer).await;
+
+        // Longer than the lifetime, with a packet out every 100 ms (to the same peer; to another one is the same to a cone).
+        for _ in 0..12 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(source_of_one_datagram(&device, &nat, &peer).await, first);
+        }
+        // Only what leaves renews it. A packet that arrives half a lifetime later is let in and does not put the end off...
+        tokio::time::sleep(lifetime / 2).await;
+        peer.send_to(b"still there", first).await.unwrap();
+        assert!(receive(&device).await.is_some(), "a mapping inside its lifetime lets the peer in");
+        // ...so a quarter of a lifetime after the end, counted from the last packet that left, it is gone.
+        tokio::time::sleep(lifetime * 3 / 4).await;
+        peer.send_to(b"gone", first).await.unwrap();
+        assert!(receive(&device).await.is_none(), "a packet that arrived put the end of the mapping off");
+    }
+
     // ---- punching through it -------------------------------------------------------------------
 
     const CONE: (Mapping, Filtering) = (Mapping::EndpointIndependent, Filtering::PortRestricted);
@@ -1772,6 +2471,11 @@ mod tests {
 
     impl World {
         async fn new(client_nat: (Mapping, Filtering), host_nat: (Mapping, Filtering)) -> World {
+            World::with(client_nat, |device| SimNat::new(device, host_nat.0, host_nat.1).unwrap()).await
+        }
+
+        /// A world whose host NAT is whatever `host_nat` makes of the address of the host's socket.
+        async fn with(client_nat: (Mapping, Filtering), host_nat: impl FnOnce(SocketAddr) -> SimNat) -> World {
             let (ctx, scratch) = host("punch-world");
             configure(&ctx, |settings| settings.attempt_for = Duration::from_secs(8));
             let client = Identity::generate().unwrap();
@@ -1783,7 +2487,7 @@ mod tests {
                 quinn::Endpoint::new(quinn::EndpointConfig::default(), None, socket, Arc::new(quinn::TokioRuntime))
                     .unwrap();
             World {
-                host_nat: SimNat::new(ctx.socket.local_addr(), host_nat.0, host_nat.1).unwrap(),
+                host_nat: host_nat(ctx.socket.local_addr()),
                 client_nat: SimNat::new(client_addr, client_nat.0, client_nat.1).unwrap(),
                 ctx,
                 _scratch: scratch,
@@ -1848,6 +2552,87 @@ mod tests {
         let punching = world.punching();
         eventually("the host's attempt to end", || punching.attempts() == 0).await;
         assert_eq!(punching.stats(), PunchStats { started: 1, arrived: 1, ..Default::default() });
+    }
+
+    /// How long the host's NAT keeps a mapping nobody renews, in the tests that watch it forget.
+    const LIFETIME: Duration = Duration::from_millis(1200);
+
+    /// A host behind a NAT that forgets its mapping after `LIFETIME`, with the DHT switch on and the nodes reached through
+    /// the NAT, so that what it sends is what the NAT sees. The nodes answer with what they saw come in (BEP 42): 8.8.8.8
+    /// and the port of the mapping of the moment. Returns once the endpoint is measured.
+    async fn forgetful_host(keepalive: Duration) -> (World, Vec<FakeNode>, JoinHandle<Result<()>>) {
+        let world =
+            World::with(CONE, |device| SimNat::expiring(device, Filtering::PortRestricted, LIFETIME).unwrap()).await;
+        world.ctx.reach.update(|state| state.switches.dht = true);
+        let nodes: Vec<FakeNode> = (2..=4)
+            .map(|n| {
+                FakeNode::spawn(Ipv4Addr::new(127, 0, 0, n), |from| {
+                    Some(SocketAddr::new(Ipv4Addr::new(8, 8, 8, 8).into(), from.port()))
+                })
+            })
+            .collect();
+        let observing = world.ctx.ext::<Observing>();
+        *lock(&observing.timing) = Timing { keepalive, ..fast() };
+        *lock(&observing.nodes) =
+            Some(nodes.iter().map(|node| world.host_nat.gateway_to(node.addr).unwrap()).collect());
+        let task = tokio::spawn(run(world.ctx.clone()));
+        eventually("the endpoint to be seen", || world.ctx.reach.read().observed.is_some()).await;
+        // The nodes are on different IPs, so the host sees a cone NAT and its record sends clients to punch toward the endpoint.
+        assert_eq!(world.ctx.reach.read().nat, Some(NatType::EndpointIndependent));
+        (world, nodes, task)
+    }
+
+    /// The endpoint the host published, as a client in this world dials it: the port is the mapping's, on the loopback.
+    fn published_by(world: &World) -> SocketAddr {
+        let observed = world.ctx.reach.read().observed.expect("the host measured its endpoint");
+        SocketAddr::new(Ipv4Addr::LOCALHOST.into(), observed.port())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_mapping_that_expires_between_two_measurements_breaks_the_punch_without_a_keepalive() {
+        let (world, _nodes, task) = forgetful_host(Duration::from_secs(3600)).await;
+        let published = published_by(&world);
+        // Nothing leaves the host's socket for longer than its mapping lives (the next measurement is a minute away).
+        tokio::time::sleep(LIFETIME * 3 / 2).await;
+
+        // A client dials what the host published, and the host, asked to, punches toward the client.
+        let dialing = world.dial(published);
+        world.punch(1).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(3), dialing).await.is_err(),
+            "the client got through to a mapping that was gone"
+        );
+        // The host's NAT made another mapping for its packet, on another port, which is not what the client dials.
+        assert_ne!(world.host_nat.public_endpoint().port(), published.port());
+        assert!(world.host_nat.stats().filtered > 0, "the client's packets died at the host's NAT");
+        task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_keepalive_holds_the_mapping_and_the_same_punch_gets_through() {
+        let (mut world, nodes, task) = forgetful_host(Duration::from_millis(150)).await;
+        let published = published_by(&world);
+        // The same quiet time, the same punch.
+        tokio::time::sleep(LIFETIME * 3 / 2).await;
+        assert!(world.ctx.ext::<Observing>().keepalives() >= 5, "the keepalive did not run");
+        assert!(heard(&nodes) > 3, "and the nodes heard it");
+
+        let dialing = world.dial(published);
+        world.punch(1).await.unwrap();
+        let connection = tokio::time::timeout(Duration::from_secs(10), dialing)
+            .await
+            .expect("the handshake did not complete through the hole")
+            .unwrap()
+            .expect("the handshake failed");
+        let (fingerprint, _server_side) = tokio::time::timeout(Duration::from_secs(5), world.arrivals.recv())
+            .await
+            .expect("the host saw nobody")
+            .unwrap();
+        assert_eq!(fingerprint, world.client.fingerprint());
+        assert_eq!(tls::peer_fingerprint(&connection).unwrap(), world.ctx.fingerprint);
+        // The mapping the host published is the one its NAT still shows.
+        assert_eq!(world.host_nat.public_endpoint().port(), published.port());
+        task.abort();
     }
 
     #[tokio::test]
