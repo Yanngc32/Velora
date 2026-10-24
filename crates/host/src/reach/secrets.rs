@@ -55,7 +55,7 @@ use velora_protocol::{
 use super::{dht, lock, ReachContext};
 
 /// Where the secrets are kept, in the host's state directory.
-const FILE: &str = "reach_secrets.json";
+pub(super) const FILE: &str = "reach_secrets.json";
 
 type Bytes = [u8; DEVICE_SECRET_LEN];
 
