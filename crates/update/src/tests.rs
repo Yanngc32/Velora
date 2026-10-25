@@ -189,5 +189,20 @@ fn corrupted_download_changes_nothing() {
     let err = updater.install(&update).unwrap_err();
     assert!(format!("{err:#}").contains("does not match"), "{err:#}");
     assert_eq!(fs::read_to_string(dir.join("velora-host")).unwrap(), "host v1");
-    assert!(!dir.join("velora-host.new").exists() && !dir.join(LOCK_FILE).exists());
+    assert!(!dir.join("velora-host.new").exists());
+    // The failed install let go of the lock.
+    Lock::acquire(&dir).unwrap();
+}
+
+#[test]
+fn update_lock_is_exclusive_and_released_on_close() {
+    let dir = temp_dir("lock");
+    // A lock file left by an update that was killed (or by a version that deleted it on exit)
+    // does not block: only a lock held by a live process does.
+    fs::write(dir.join(LOCK_FILE), "").unwrap();
+    let held = Lock::acquire(&dir).unwrap();
+    let err = Lock::acquire(&dir).err().expect("a second lock while the first is held");
+    assert_eq!(err.to_string(), "another update is in progress");
+    drop(held);
+    Lock::acquire(&dir).unwrap();
 }
