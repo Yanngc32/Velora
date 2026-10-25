@@ -34,7 +34,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      # ffmpeg-sys-next generates its bindings from the system headers and does not notice when
+      # they change, so the cache is keyed on the FFmpeg version: cached 6.1 bindings linked
+      # against 8.0 crashed the tests when ubuntu-latest moved to 26.04.
+      - id: ffmpeg
+        run: echo "version=$(dpkg-query -W -f='${Version}' libavcodec-dev | tr ':' '-')" >> "$GITHUB_OUTPUT"
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ffmpeg-${{ steps.ffmpeg.outputs.version }}
       - run: cargo clippy -p velora-host -p velora --all-targets --features velora-host/ffmpeg,velora/ffmpeg -- -D warnings
       - run: cargo test -p velora-host -p velora-client-core --features velora-host/ffmpeg,velora-client-core/ffmpeg
 
