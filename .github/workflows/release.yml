@@ -93,7 +93,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.target }}
+          # The FFmpeg build is part of the key: ffmpeg-sys-next does not regenerate its cached
+          # bindings when the headers change, and stale ones crash at run time.
+          key: ${{ matrix.target }}-${{ matrix.ffmpeg }}
 
       - name: Install bindgen dependencies
         if: runner.os == 'Linux'
