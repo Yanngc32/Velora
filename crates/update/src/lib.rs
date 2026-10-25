@@ -16,7 +16,7 @@ use std::{
     io::{self, Read, Write},
     path::{Component, Path, PathBuf},
     str::FromStr,
-    time::{Duration, SystemTime},
+    time::Duration,
 };
 
 use anyhow::{bail, ensure, Context, Result};
@@ -28,7 +28,6 @@ pub const MANIFEST: &str = "manifest.json";
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 const MAX_FILE_BYTES: u64 = 512 * 1024 * 1024;
 const LOCK_FILE: &str = ".velora-update.lock";
-const STALE_LOCK: Duration = Duration::from_secs(30 * 60);
 
 /// Official release builds set `VELORA_RELEASE_BUILD=1` at compile time. Source builds never update
 /// themselves, so a developer's binary is not silently replaced by a release.
@@ -369,42 +368,26 @@ pub fn cleanup(dir: &Path) {
     }
 }
 
-/// Exclusive update lock so a host and a client sharing an install never update at once.
-struct Lock(PathBuf);
+/// Exclusive update lock so a host and a client sharing an install never update at once. The
+/// operating system holds it on the open file and releases it when the file is closed, which
+/// also happens when the process is killed or crashes mid-update, so it is never left taken.
+/// The file itself stays: deleting it could let a second process lock a fresh file while a
+/// first one still holds the old one.
+struct Lock {
+    _file: File,
+}
 
 impl Lock {
     fn acquire(dir: &Path) -> Result<Self> {
         let path = dir.join(LOCK_FILE);
-        for _ in 0..2 {
-            match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
-                Ok(_) => return Ok(Self(path)),
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                    let stale = fs::metadata(&path)
-                        .and_then(|m| m.modified())
-                        .map(|t| SystemTime::now().duration_since(t).unwrap_or_default() > STALE_LOCK)
-                        .unwrap_or(true);
-                    if !stale {
-                        bail!("another update is in progress");
-                    }
-                    let _ = fs::remove_file(&path);
-                }
-                Err(e) => {
-                    return Err(e).with_context(|| {
-                        format!(
-                            "{} is not writable; install in a user-writable directory to get updates",
-                            dir.display()
-                        )
-                    })
-                }
-            }
+        let file = fs::OpenOptions::new().write(true).create(true).truncate(false).open(&path).with_context(|| {
+            format!("{} is not writable; install in a user-writable directory to get updates", dir.display())
+        })?;
+        match file.try_lock() {
+            Ok(()) => Ok(Self { _file: file }),
+            Err(fs::TryLockError::WouldBlock) => bail!("another update is in progress"),
+            Err(fs::TryLockError::Error(e)) => Err(e).with_context(|| format!("could not lock {}", path.display())),
         }
-        bail!("could not lock {}", path.display())
-    }
-}
-
-impl Drop for Lock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
     }
 }
 
