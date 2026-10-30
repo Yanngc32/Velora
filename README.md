@@ -212,6 +212,18 @@ lists both under Velora. A closed laptop lid still puts it to sleep.
 Client shortcuts: <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>F</kbd> toggles
 fullscreen, <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>Q</kbd> quits.
 
+**Zoom:** <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>+</kbd> / <kbd>-</kbd> (or the
+mouse wheel) zooms in and out, up to 6×, and <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>0</kbd>
+goes back to the whole screen. Zoomed in, the picture slides with the mouse: at the window's
+edge you see the remote screen's edge, so all of it stays within reach.
+
+**Keys stay with the remote computer.** On Windows, while the session window is in front,
+Alt+Tab, the Windows key and its shortcuts (Win+D, Win+E…), Alt+F4, Ctrl+Esc and Print Screen
+act on the remote computer, not on yours. Click another window, or press
+<kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>K</kbd> to keep them here (the title says
+so; the same keys switch back). Ctrl+Alt+Del and Win+L always stay with Windows, which lets no
+program take them. On Linux, the window manager still gets its shortcuts.
+
 When a Windows host has several displays, a session starts on the main one and its window
 title says which is shown ("Display 2 of 3").
 <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>M</kbd> moves to the next display and
@@ -321,6 +333,7 @@ your finger with no network delay:
 | Tap, then touch again and drag | Hold the left button (drag and drop, select text) |
 | Two-finger tap | Right click |
 | Two-finger drag | Scroll |
+| Pinch / spread two fingers | Zoom out / in (up to 4×); zoomed in, the view follows the cursor |
 
 The toolbar shows or hides the keyboard and has Esc, Tab, the arrows and Del. Ctrl, Alt, Win
 and Shift latch: tap Ctrl, then `c`, to send Ctrl+C. Text from the soft keyboard is typed in
@@ -616,7 +629,7 @@ With [standalone reach](#reaching-this-pc-from-anywhere) on, what changes:
 2. **Zero-copy decoding on Linux.** Windows decodes and shows pictures without leaving the
    GPU; VA-API still copies them back. Next: import the VA-API surface into EGL (dma-buf).
 3. **Mobile:** an iOS app (Swift + VideoToolbox) on the same `velora-mobile` core. On Android:
-   pinch to zoom, a direct-touch mode, and Play Store publishing.
+   a direct-touch mode and Play Store publishing.
 4. **Standalone reach in the field.** It is built and tested against simulated routers and NATs;
    next come real routers and carriers (see
    [Status](docs/standalone-reach.md#status)). Known gaps: no Wake button in the Android app, no

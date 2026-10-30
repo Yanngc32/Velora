@@ -3,6 +3,8 @@
 
 mod autostart;
 mod gpu;
+#[cfg(windows)]
+mod grab;
 mod gui;
 #[cfg(all(windows, feature = "ffmpeg"))]
 mod interop;
@@ -13,7 +15,7 @@ mod send_to;
 mod settings;
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     fs::TryLockError,
     num::NonZeroU32,
     path::PathBuf,
@@ -539,7 +541,10 @@ fn run_window(
             let _ = proxy.send_event(());
         }));
     }
-    println!("Shortcuts, with Ctrl+Alt+Shift: F fullscreen, M next display, 1-9 a display, A sound on/off, Q quit");
+    println!(
+        "Shortcuts, with Ctrl+Alt+Shift: F fullscreen, + and - (or the wheel) zoom, 0 no zoom, M next display, \
+         1-9 a display, A sound on/off, K Windows keys here/there, Q quit"
+    );
     let mut app = App {
         input: session.input.clone(),
         frames,
@@ -556,9 +561,14 @@ fn run_window(
         window: None,
         renderer: None,
         current: None,
-        viewport: render::Viewport::default(),
+        fit: render::Viewport::default(),
+        size: (0, 0),
+        zoom: 0,
         cursor: (0.0, 0.0),
         modifiers: ModifiersState::empty(),
+        grab: None,
+        captured: true,
+        held: HashSet::new(),
     };
     event_loop.run_app(&mut app)?;
     Ok(())
@@ -660,14 +670,40 @@ struct App {
     window: Option<Rc<Window>>,
     renderer: Option<Renderer>,
     current: Option<VideoFrame>,
-    viewport: render::Viewport,
+    /// Where the picture sits unzoomed in the window, and the window's size, at the last draw.
+    fit: render::Viewport,
+    size: (u32, u32),
+    /// Index in `render::ZOOMS`.
+    zoom: usize,
     cursor: (f64, f64),
     modifiers: ModifiersState,
+    /// Takes the keys Windows keeps for itself while the window is in front (see `grab`).
+    #[cfg(windows)]
+    grab: Option<grab::Grab>,
+    #[cfg(not(windows))]
+    grab: Option<std::convert::Infallible>,
+    /// Those keys go to the host (Ctrl+Alt+Shift+K switches).
+    captured: bool,
+    /// Keys down that came through `grab`, to tell repeats.
+    held: HashSet<KeyCode>,
 }
 
 impl App {
     fn pointer(&self) -> (u16, u16) {
-        self.viewport.normalize(self.cursor.0, self.cursor.1)
+        let zoom = render::ZOOMS[self.zoom];
+        self.fit.zoomed(zoom, self.cursor, self.size.0, self.size.1).normalize(self.cursor.0, self.cursor.1)
+    }
+
+    /// Zooms one step in (`1`) or out (`-1`), or back to the fitted picture (`0`).
+    fn zoom(&mut self, step: i32) {
+        self.zoom = match step {
+            0 => 0,
+            _ => self.zoom.saturating_add_signed(step as isize).min(render::ZOOMS.len() - 1),
+        };
+        self.refresh_title();
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
     }
 
     /// Sends a file or folder dropped on the window to the host's Downloads folder.
@@ -712,8 +748,14 @@ impl App {
             let (n, of) = ((d.current as usize + 1).to_string(), d.list.len().to_string());
             title = format!("{title} · {}", gui::strings::fill(s.session_display, &[&n, &of]));
         }
+        if self.zoom > 0 {
+            title = format!("{title} · zoom {}%", (render::ZOOMS[self.zoom] * 100.0).round());
+        }
         if self.muted {
             title = format!("{title} · {}", gui::strings::current().session_muted);
+        }
+        if self.grab.is_some() && !self.captured {
+            title = format!("{title} · {}", gui::strings::current().session_keys_here);
         }
         if let Some(summary) = self.transfers.lock().unwrap().summary() {
             title = format!("{title} · {summary}");
@@ -731,6 +773,8 @@ impl App {
         let fresh = self.frames.take();
         let size = window.inner_size();
         let (Some(w), Some(h)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) else { return Ok(()) };
+        self.size = (w.get(), h.get());
+        let zoom = render::ZOOMS[self.zoom];
         match renderer {
             Renderer::Gpu(gpu) => {
                 // The textures hold the picture now: its buffers can go back to the decoder.
@@ -741,7 +785,7 @@ impl App {
                     }
                     self.frames.recycle(frame);
                 }
-                self.viewport = gpu.draw(w.get(), h.get())?;
+                self.fit = gpu.draw(w.get(), h.get(), zoom, self.cursor)?;
             }
             Renderer::Cpu(surface, rgb) => {
                 if let Some(frame) = fresh {
@@ -753,7 +797,11 @@ impl App {
                 surface.resize(w, h).map_err(|e| anyhow::anyhow!("{e}"))?;
                 let mut buffer = surface.buffer_mut().map_err(|e| anyhow::anyhow!("{e}"))?;
                 match &self.current {
-                    Some(f) => self.viewport = render::draw(rgb, f.width, f.height, &mut buffer, w.get(), h.get()),
+                    Some(f) => {
+                        self.fit = render::Viewport::fit(f.width, f.height, w.get(), h.get());
+                        let vp = self.fit.zoomed(zoom, self.cursor, w.get(), h.get());
+                        render::draw(rgb, f.width, f.height, &mut buffer, w.get(), h.get(), vp);
+                    }
                     None => buffer.fill(0),
                 }
                 buffer.present().map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -762,10 +810,15 @@ impl App {
         Ok(())
     }
 
+    /// Ctrl+Alt+Shift, which client-side shortcuts start with, is held.
+    fn shortcut_held(&self) -> bool {
+        let m = self.modifiers;
+        m.control_key() && m.alt_key() && m.shift_key()
+    }
+
     /// Client-side shortcuts; returns true when the key was consumed.
     fn shortcut(&mut self, event_loop: &ActiveEventLoop, key: KeyCode) -> bool {
-        let m = self.modifiers;
-        if !(m.control_key() && m.alt_key() && m.shift_key()) {
+        if !self.shortcut_held() {
             return false;
         }
         match key {
@@ -778,6 +831,18 @@ impl App {
             KeyCode::KeyQ => {
                 self.session.close();
                 event_loop.exit();
+            }
+            KeyCode::Equal | KeyCode::NumpadAdd => self.zoom(1),
+            KeyCode::Minus | KeyCode::NumpadSubtract => self.zoom(-1),
+            KeyCode::Digit0 | KeyCode::Numpad0 => self.zoom(0),
+            #[cfg(windows)]
+            KeyCode::KeyK if self.grab.is_some() => {
+                self.captured = !self.captured;
+                if let Some(grab) = &self.grab {
+                    grab.set_on(self.captured);
+                }
+                self.held.clear();
+                self.refresh_title();
             }
             KeyCode::KeyA if self.session.has_audio() => {
                 self.muted = !self.muted;
@@ -802,6 +867,38 @@ impl App {
         // The modifiers already reached the host; don't leave them held there.
         self.input.release_all();
         true
+    }
+
+    /// A key pressed or released in the window, whichever way it came.
+    fn key(&mut self, event_loop: &ActiveEventLoop, code: KeyCode, pressed: bool, repeat: bool) {
+        if pressed && self.shortcut(event_loop, code) {
+            return;
+        }
+        let Some(evdev) = keymap::to_evdev(code) else { return };
+        let state = match (pressed, repeat) {
+            (false, _) => KeyState::Up,
+            (true, false) => KeyState::Down,
+            (true, true) => KeyState::Repeat,
+        };
+        self.input.key(evdev, state);
+    }
+
+    /// A key taken from Windows by `grab`: winit saw none of them, so the modifiers and
+    /// repeats are told from the keys held.
+    #[cfg(windows)]
+    fn grabbed_key(&mut self, event_loop: &ActiveEventLoop, code: KeyCode, pressed: bool) {
+        let repeat = pressed && !self.held.insert(code);
+        if !pressed {
+            self.held.remove(&code);
+        }
+        let held = |keys: [KeyCode; 2]| keys.iter().any(|k| self.held.contains(k));
+        let mut m = ModifiersState::empty();
+        m.set(ModifiersState::CONTROL, held([KeyCode::ControlLeft, KeyCode::ControlRight]));
+        m.set(ModifiersState::ALT, held([KeyCode::AltLeft, KeyCode::AltRight]));
+        m.set(ModifiersState::SHIFT, held([KeyCode::ShiftLeft, KeyCode::ShiftRight]));
+        m.set(ModifiersState::SUPER, held([KeyCode::SuperLeft, KeyCode::SuperRight]));
+        self.modifiers = m;
+        self.key(event_loop, code, pressed, repeat);
     }
 }
 
@@ -858,10 +955,20 @@ impl ApplicationHandler for App {
                 return;
             }
         }
+        #[cfg(windows)]
+        {
+            self.grab = grab::Grab::new(&window, self.proxy.clone());
+        }
         self.window = Some(window);
     }
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: ()) {
+        #[cfg(windows)]
+        if let Some(keys) = self.grab.as_ref().map(grab::Grab::take) {
+            for (code, pressed) in keys {
+                self.grabbed_key(_event_loop, code, pressed);
+            }
+        }
         self.refresh_title();
         if let Some(w) = &self.window {
             w.request_redraw();
@@ -884,11 +991,20 @@ impl ApplicationHandler for App {
                     w.request_redraw();
                 }
             }
-            WindowEvent::Focused(false) => self.input.release_all(),
+            WindowEvent::Focused(false) => {
+                self.input.release_all();
+                self.held.clear();
+            }
             WindowEvent::DroppedFile(path) => self.send_dropped(path),
             WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = (position.x, position.y);
+                // Zoomed in, the picture follows the pointer.
+                if self.zoom > 0 {
+                    if let Some(w) = &self.window {
+                        w.request_redraw();
+                    }
+                }
                 let (x, y) = self.pointer();
                 self.input.mouse_move(x, y);
             }
@@ -904,6 +1020,13 @@ impl ApplicationHandler for App {
                 let (x, y) = self.pointer();
                 self.input.mouse_button(button, state == ElementState::Pressed, x, y);
             }
+            // A wheel's notch zooms a step (a touchpad's stream of small moves would race through them).
+            WindowEvent::MouseWheel { delta: MouseScrollDelta::LineDelta(_, y), .. }
+                if self.shortcut_held() && y != 0.0 =>
+            {
+                self.zoom(if y > 0.0 { 1 } else { -1 });
+                self.input.release_all();
+            }
             WindowEvent::MouseWheel { delta, .. } => {
                 // winit: positive x = content moves right (scroll left), positive y = scroll up.
                 let (dx, dy) = match delta {
@@ -916,16 +1039,7 @@ impl ApplicationHandler for App {
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 let PhysicalKey::Code(code) = event.physical_key else { return };
-                if event.state == ElementState::Pressed && self.shortcut(event_loop, code) {
-                    return;
-                }
-                let Some(evdev) = keymap::to_evdev(code) else { return };
-                let state = match (event.state, event.repeat) {
-                    (ElementState::Released, _) => KeyState::Up,
-                    (ElementState::Pressed, false) => KeyState::Down,
-                    (ElementState::Pressed, true) => KeyState::Repeat,
-                };
-                self.input.key(evdev, state);
+                self.key(event_loop, code, event.state == ElementState::Pressed, event.repeat);
             }
             _ => {}
         }

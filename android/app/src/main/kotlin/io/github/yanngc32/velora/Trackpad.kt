@@ -12,6 +12,11 @@ interface PointerSink {
     fun button(button: PointerButton, down: Boolean, x: Int, y: Int)
     /** Wheel units (120 per notch); positive dy scrolls up. */
     fun scroll(dx: Int, dy: Int)
+    /**
+     * Two fingers spread or pinched: zoom the view [scale] times around [focusX]/[focusY]
+     * (view pixels) and move it by [dx]/[dy] with the fingers.
+     */
+    fun pinch(scale: Float, focusX: Float, focusY: Float, dx: Float, dy: Float) {}
 }
 
 enum class PointerButton { LEFT, RIGHT }
@@ -20,7 +25,8 @@ enum class PointerButton { LEFT, RIGHT }
  * Turns touches into a laptop-style trackpad, independent of Android so it can be unit tested:
  * - one finger moves the cursor (relative, with acceleration);
  * - tap clicks; tap then drag holds the button (drag and drop);
- * - two-finger tap right-clicks; two-finger drag scrolls (natural direction).
+ * - two-finger tap right-clicks; two-finger drag scrolls (natural direction);
+ * - two fingers spreading or pinching zoom the view (the remote computer sees nothing).
  *
  * Coordinates are view pixels; [viewWidth]/[viewHeight] is the area showing the remote screen.
  */
@@ -46,8 +52,12 @@ class Trackpad(private val sink: PointerSink, private val clock: () -> Long = Sy
     private var lastTapUp = -1L
     private var scrollRemainderX = 0f
     private var scrollRemainderY = 0f
+    /** Distance between the fingers when two touched, and at the last move. */
+    private var startSpan = 0f
+    private var lastSpan = 0f
 
-    private enum class Mode { IDLE, MOVE, DRAG, SCROLL }
+    /** TWO: two fingers down, not yet told whether they scroll or zoom. */
+    private enum class Mode { IDLE, MOVE, DRAG, TWO, SCROLL, PINCH }
 
     fun down(x: Float, y: Float) {
         val now = clock()
@@ -66,24 +76,45 @@ class Trackpad(private val sink: PointerSink, private val clock: () -> Long = Sy
         moved = false
     }
 
-    /** A second finger touched: switch to scrolling. [x]/[y] is the fingers' centroid. */
-    fun secondFingerDown(x: Float, y: Float) {
+    /**
+     * A second finger touched: scroll or zoom, as the fingers go on to tell. [x]/[y] is the
+     * fingers' centroid, [span] the distance between them.
+     */
+    fun secondFingerDown(x: Float, y: Float, span: Float = 0f) {
         maxPointers = 2
         if (mode == Mode.DRAG) return
-        mode = Mode.SCROLL
+        mode = Mode.TWO
         lastX = x; lastY = y
+        startSpan = span; lastSpan = span
     }
 
-    /** Fingers were added or lifted mid-gesture: continue from [x]/[y] without a jump. */
-    fun reanchor(x: Float, y: Float) {
+    /** Fingers were added or lifted mid-gesture: continue from [x]/[y] and [span] without a jump. */
+    fun reanchor(x: Float, y: Float, span: Float = 0f) {
         lastX = x; lastY = y
+        startSpan = span; lastSpan = span
     }
 
-    fun move(x: Float, y: Float) {
+    fun move(x: Float, y: Float, span: Float = 0f) {
         val now = clock()
         val dx = x - lastX
         val dy = y - lastY
         if (!moved && hypot(x - downX, y - downY) > TOUCH_SLOP_PX) moved = true
+        if (mode == Mode.TWO) {
+            // Fingers moving apart or together zoom; moving along together, they scroll. Until
+            // one is clear, nothing happens and the travel so far counts for whichever wins.
+            when {
+                startSpan > 0f && span > 0f && abs(span - startSpan) > PINCH_SLOP_PX -> {
+                    // Zooming starts from here, without a jump by the slop.
+                    mode = Mode.PINCH
+                    moved = true
+                    lastSpan = span
+                    lastX = x; lastY = y
+                    return
+                }
+                hypot(dx, dy) > TOUCH_SLOP_PX -> mode = Mode.SCROLL
+                else -> return
+            }
+        }
         when (mode) {
             Mode.MOVE, Mode.DRAG -> {
                 val dt = (now - lastMoveTime).coerceAtLeast(1)
@@ -105,7 +136,12 @@ class Trackpad(private val sink: PointerSink, private val clock: () -> Long = Sy
                     sink.scroll(sx, sy)
                 }
             }
-            Mode.IDLE -> {}
+            Mode.PINCH -> {
+                val scale = if (lastSpan > 0f && span > 0f) span / lastSpan else 1f
+                sink.pinch(scale, x, y, x - lastX, y - lastY)
+                lastSpan = span
+            }
+            Mode.IDLE, Mode.TWO -> {}
         }
         lastX = x; lastY = y
         lastMoveTime = now
@@ -147,5 +183,7 @@ class Trackpad(private val sink: PointerSink, private val clock: () -> Long = Sy
         /** 120 wheel units (one notch) per 40 px of finger travel. */
         const val WHEEL_UNITS_PER_PX = 3f
         const val MIN_SCROLL = 10
+        /** How much the fingers must spread or close before it counts as zooming. */
+        const val PINCH_SLOP_PX = 40f
     }
 }

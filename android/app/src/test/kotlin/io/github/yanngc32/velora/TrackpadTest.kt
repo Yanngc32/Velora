@@ -13,6 +13,9 @@ class TrackpadTest {
             events += "${button.name.lowercase()}${if (down) "Down" else "Up"}"
         }
         override fun scroll(dx: Int, dy: Int) { events += "scroll($dx,$dy)" }
+        override fun pinch(scale: Float, focusX: Float, focusY: Float, dx: Float, dy: Float) {
+            events += "pinch(${"%.2f".format(java.util.Locale.ROOT, scale)},${dx.toInt()},${dy.toInt()})"
+        }
     }
     private val pad = Trackpad(sink) { now }.apply { viewWidth = 1000f; viewHeight = 500f }
 
@@ -76,5 +79,22 @@ class TrackpadTest {
     fun slowTapIsNotAClick() {
         pad.down(100f, 100f); now += 500; pad.up()
         assertTrue(events.isEmpty())
+    }
+
+    @Test
+    fun spreadingTwoFingersZoomsWithoutScrollingOrClicking() {
+        pad.down(100f, 300f); pad.secondFingerDown(150f, 300f, span = 100f)
+        now += 16; pad.move(150f, 300f, span = 150f) // past the slop: zooming starts here
+        now += 16; pad.move(160f, 300f, span = 300f) // twice as far apart, and 10 px right
+        now += 16; pad.up()
+        assertEquals(listOf("pinch(2.00,10,0)"), events)
+    }
+
+    @Test
+    fun twoFingersMovingTogetherStillScroll() {
+        pad.down(100f, 300f); pad.secondFingerDown(125f, 300f, span = 50f)
+        now += 16; pad.move(125f, 260f, span = 55f)
+        now += 16; pad.up()
+        assertEquals(listOf("scroll(0,-120)"), events)
     }
 }

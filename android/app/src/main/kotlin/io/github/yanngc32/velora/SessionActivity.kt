@@ -2,6 +2,7 @@ package io.github.yanngc32.velora
 
 import android.content.Context
 import android.content.Intent
+import android.graphics.RectF
 import android.os.Build
 import android.os.Bundle
 import android.util.Log
@@ -60,7 +61,9 @@ import uniffi.velora_mobile.Session
 import uniffi.velora_mobile.SessionListener
 import uniffi.velora_mobile.VideoFrame
 import kotlin.concurrent.thread
+import kotlin.math.hypot
 import kotlin.math.min
+import kotlin.math.roundToInt
 import uniffi.velora_mobile.Button as RemoteButton
 
 /** Full-screen remote session: video, trackpad, keyboard. */
@@ -83,6 +86,11 @@ class SessionActivity : ComponentActivity(), SessionListener, SurfaceHolder.Call
     private var videoHeight = 0
     private var finished = false
 
+    /** The video fitted to its area, and where it is shown: [zoom] times larger, moved by pinching. */
+    private val fit = RectF()
+    private val shown = RectF()
+    private var zoom = 1f
+
     /** Modifiers latched from the toolbar, released after the next key. */
     private val latched = linkedSetOf<Int>()
     private val modifierButtons = mutableListOf<Button>()
@@ -90,6 +98,7 @@ class SessionActivity : ComponentActivity(), SessionListener, SurfaceHolder.Call
     private val trackpad = Trackpad(object : PointerSink {
         override fun move(x: Int, y: Int) {
             session?.mouseMove(x.toUShort(), y.toUShort())
+            followCursor()
             updateCursor()
         }
 
@@ -100,6 +109,15 @@ class SessionActivity : ComponentActivity(), SessionListener, SurfaceHolder.Call
 
         override fun scroll(dx: Int, dy: Int) {
             session?.scroll(dx.coerceIn(-32768, 32767).toShort(), dy.coerceIn(-32768, 32767).toShort())
+        }
+
+        override fun pinch(scale: Float, focusX: Float, focusY: Float, dx: Float, dy: Float) {
+            val next = (zoom * scale).coerceIn(1f, MAX_ZOOM)
+            val k = next / zoom
+            // The point under the fingers stays under them, and the picture moves with them.
+            shown.offsetTo(focusX - (focusX - shown.left) * k + dx, focusY - (focusY - shown.top) * k + dy)
+            zoom = next
+            placeVideo()
         }
     })
 
@@ -136,7 +154,7 @@ class SessionActivity : ComponentActivity(), SessionListener, SurfaceHolder.Call
         videoArea = FrameLayout(this)
         surfaceView = SurfaceView(this).also { it.holder.addCallback(this) }
         cursorView = CursorView(this)
-        videoArea.addView(surfaceView, FrameLayout.LayoutParams(1, 1, Gravity.CENTER))
+        videoArea.addView(surfaceView, FrameLayout.LayoutParams(1, 1, Gravity.TOP or Gravity.START))
         videoArea.addView(cursorView, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
         videoArea.setOnTouchListener { _, event -> onTouch(event) }
         videoArea.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> layoutVideo() }
@@ -393,18 +411,57 @@ class SessionActivity : ComponentActivity(), SessionListener, SurfaceHolder.Call
         val scale = min(areaW.toFloat() / videoWidth, areaH.toFloat() / videoHeight)
         val w = (videoWidth * scale).toInt()
         val h = (videoHeight * scale).toInt()
-        val params = surfaceView.layoutParams as FrameLayout.LayoutParams
-        if (params.width != w || params.height != h) {
-            params.width = w
-            params.height = h
-            surfaceView.layoutParams = params
-        }
         val left = (areaW - w) / 2f
         val top = (areaH - h) / 2f
-        cursorView.videoRect.set(left, top, left + w, top + h)
-        trackpad.viewWidth = w.toFloat()
-        trackpad.viewHeight = h.toFloat()
+        fit.set(left, top, left + w, top + h)
+        if (zoom == 1f) shown.set(fit)
+        placeVideo()
+    }
+
+    /**
+     * Shows the video [zoom] times the fitted size at [shown]'s corner, kept from leaving a gap
+     * where it is larger than the area and centred where it is not. The trackpad follows: a swipe
+     * across the shown video crosses it, so zoomed in, the cursor is more precise.
+     */
+    private fun placeVideo() {
+        val areaW = videoArea.width.toFloat()
+        val areaH = videoArea.height.toFloat()
+        if (fit.isEmpty) return
+        val w = fit.width() * zoom
+        val h = fit.height() * zoom
+        val left = if (w <= areaW) (areaW - w) / 2 else shown.left.coerceIn(areaW - w, 0f)
+        val top = if (h <= areaH) (areaH - h) / 2 else shown.top.coerceIn(areaH - h, 0f)
+        shown.set(left, top, left + w, top + h)
+        val params = surfaceView.layoutParams as FrameLayout.LayoutParams
+        val pw = w.roundToInt()
+        val ph = h.roundToInt()
+        val pl = left.roundToInt()
+        val pt = top.roundToInt()
+        if (params.width != pw || params.height != ph || params.leftMargin != pl || params.topMargin != pt) {
+            params.width = pw
+            params.height = ph
+            params.leftMargin = pl
+            params.topMargin = pt
+            surfaceView.layoutParams = params
+        }
+        cursorView.videoRect.set(shown)
+        trackpad.viewWidth = w
+        trackpad.viewHeight = h
         updateCursor()
+    }
+
+    /** Zoomed in, moves the video so the cursor stays a margin away from the area's edges. */
+    private fun followCursor() {
+        if (zoom == 1f) return
+        val margin = CURSOR_MARGIN_DP * resources.displayMetrics.density
+        val x = shown.left + trackpad.cursorX / 65535f * shown.width()
+        val y = shown.top + trackpad.cursorY / 65535f * shown.height()
+        val dx = (margin - x).coerceAtLeast(0f) + (videoArea.width - margin - x).coerceAtMost(0f)
+        val dy = (margin - y).coerceAtLeast(0f) + (videoArea.height - margin - y).coerceAtMost(0f)
+        if (dx != 0f || dy != 0f) {
+            shown.offset(dx, dy)
+            placeVideo()
+        }
     }
 
     private fun updateCursor() {
@@ -417,22 +474,40 @@ class SessionActivity : ComponentActivity(), SessionListener, SurfaceHolder.Call
 
     private fun onTouch(event: MotionEvent): Boolean {
         val n = event.pointerCount
+        val lifted = if (event.actionMasked == MotionEvent.ACTION_POINTER_UP) event.actionIndex else -1
         var cx = 0f
         var cy = 0f
         for (i in 0 until n) {
-            if (event.actionMasked == MotionEvent.ACTION_POINTER_UP && i == event.actionIndex) continue
+            if (i == lifted) continue
             cx += event.getX(i)
             cy += event.getY(i)
         }
-        val active = if (event.actionMasked == MotionEvent.ACTION_POINTER_UP) n - 1 else n
+        val active = if (lifted >= 0) n - 1 else n
         cx /= active.coerceAtLeast(1)
         cy /= active.coerceAtLeast(1)
+        // How far apart the fingers are: twice their mean distance from the centroid (for two,
+        // the distance between them).
+        var span = 0f
+        if (active >= 2) {
+            for (i in 0 until n) {
+                if (i != lifted) span += hypot(event.getX(i) - cx, event.getY(i) - cy)
+            }
+            span = span * 2 / active
+        }
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> trackpad.down(cx, cy)
-            MotionEvent.ACTION_POINTER_DOWN -> if (n == 2) trackpad.secondFingerDown(cx, cy) else trackpad.reanchor(cx, cy)
-            MotionEvent.ACTION_POINTER_UP -> trackpad.reanchor(cx, cy)
-            MotionEvent.ACTION_MOVE -> trackpad.move(cx, cy)
-            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> trackpad.up()
+            MotionEvent.ACTION_POINTER_DOWN ->
+                if (n == 2) trackpad.secondFingerDown(cx, cy, span) else trackpad.reanchor(cx, cy, span)
+            MotionEvent.ACTION_POINTER_UP -> trackpad.reanchor(cx, cy, span)
+            MotionEvent.ACTION_MOVE -> trackpad.move(cx, cy, span)
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                trackpad.up()
+                // Pinched back to about the fitted size: exactly that.
+                if (zoom != 1f && zoom < ZOOM_SNAP) {
+                    zoom = 1f
+                    placeVideo()
+                }
+            }
         }
         return true
     }
@@ -500,6 +575,10 @@ class SessionActivity : ComponentActivity(), SessionListener, SurfaceHolder.Call
 
     companion object {
         private const val TAG = "SessionActivity"
+        private const val MAX_ZOOM = 4f
+        private const val ZOOM_SNAP = 1.1f
+        /** Zoomed in, the video moves to keep the cursor this far from the edges. */
+        private const val CURSOR_MARGIN_DP = 48f
         private const val EXTRA_HOST = "host"
         private const val EXTRA_ADDRESS = "address"
         private const val EXTRA_CODE = "code"
