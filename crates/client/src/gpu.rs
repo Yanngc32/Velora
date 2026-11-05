@@ -239,16 +239,18 @@ impl Gpu {
         Ok(())
     }
 
-    /// Draws the picture letterboxed into a `width` × `height` window and shows it. Returns
-    /// where the picture landed, for mapping the pointer.
-    pub fn draw(&mut self, width: u32, height: u32) -> Result<Viewport> {
+    /// Draws the picture letterboxed into a `width` × `height` window, enlarged `zoom` times
+    /// around the pointer at `focus` (see `Viewport::zoomed`), and shows it. Returns where the
+    /// picture sits unzoomed, for mapping the pointer.
+    pub fn draw(&mut self, width: u32, height: u32, zoom: f64, focus: (f64, f64)) -> Result<Viewport> {
         let (width, height) = (width.max(1), height.max(1));
         if self.drawable != (width, height) {
             self.surface.resize(&self.context, nonzero(width), nonzero(height));
             self.drawable = (width, height);
         }
         let (pw, ph) = self.picture;
-        let vp = Viewport::fit(pw, ph, width, height);
+        let fit = Viewport::fit(pw, ph, width, height);
+        let vp = fit.zoomed(zoom, focus, width, height);
         // SAFETY: GL calls on the current context, with this presenter's objects.
         unsafe {
             let gl = &self.gl;
@@ -257,8 +259,8 @@ impl Gpu {
             gl.clear(glow::COLOR_BUFFER_BIT);
             if pw > 0 && ph > 0 {
                 // GL counts rows from the bottom.
-                let y = height - vp.y - vp.height;
-                gl.viewport(vp.x as i32, y as i32, vp.width as i32, vp.height as i32);
+                let y = height as i32 - vp.y - vp.height as i32;
+                gl.viewport(vp.x, y, vp.width as i32, vp.height as i32);
                 gl.use_program(Some(self.program));
                 gl.bind_vertex_array(Some(self.vao));
                 for (unit, texture) in self.textures.iter().enumerate() {
@@ -282,13 +284,13 @@ impl Gpu {
                         gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
                     })?;
                     self.surface.swap_buffers(&self.context)?;
-                    return Ok(vp);
+                    return Ok(fit);
                 }
                 gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
             }
         }
         self.surface.swap_buffers(&self.context)?;
-        Ok(vp)
+        Ok(fit)
     }
 }
 
